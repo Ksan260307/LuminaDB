@@ -1500,13 +1500,15 @@
         }},
 
         // Fix#6: 相関サブクエリは黙って誤答せず明示的なエラーになる
-        { name: "Fix6: Correlated Subquery Clear Error", fn: () => {
-            const r = db.executeQuery("SELECT * FROM users u WHERE u.age > (SELECT AVG(o.amount) FROM orders o WHERE o.user_id = u.id)");
-            return r.error !== undefined && r.error.includes('Correlated');
+        // v1.2: 相関サブクエリは行単位評価でサポートされた（旧: 明示エラー）
+        { name: "Fix6: Correlated Scalar Subquery Now Works", fn: () => {
+            // AVG は空グループで 0 を返すため、注文のないユーザーも age > 0 で全員一致する
+            const r = db.executeQuery("SELECT COUNT(*) AS c FROM users u WHERE u.age > (SELECT AVG(o.amount) FROM orders o WHERE o.user_id = u.id)");
+            return !r.error && r.data[0].c === 10;
         }},
-        { name: "Fix6: Correlated EXISTS Clear Error", fn: () => {
+        { name: "Fix6: Correlated EXISTS Now Works", fn: () => {
             const r = db.executeQuery("SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)");
-            return r.error !== undefined && r.error.includes('Correlated');
+            return !r.error && r.data.length === 4;
         }},
         { name: "Fix6: Non-Correlated Qualified Subquery OK", fn: () => {
             db.executeQuery("CREATE TABLE fix6_a (id INTEGER)");
@@ -1776,19 +1778,24 @@
         }},
 
         // Rev#4: 不正な制約構文が偽カラムを作らず構文エラーになる
-        { name: "Rev4: Multi-Column ADD UNIQUE Rejected", fn: () => {
+        // v1.2: 複数列の ADD UNIQUE / PRIMARY KEY は複合キーとしてサポートされた（旧: 構文エラー）
+        { name: "Rev4: Multi-Column ADD UNIQUE Now Supported", fn: () => {
             db.executeQuery("CREATE TABLE rev4_t (a INTEGER, b INTEGER)");
             const r = db.executeQuery("ALTER TABLE rev4_t ADD UNIQUE (a, b)");
             const noBogusCol = !db.tables['rev4_t'].cols['unique'];
+            db.executeQuery("INSERT INTO rev4_t (a, b) VALUES (1, 1)");
+            const dup = db.executeQuery("INSERT INTO rev4_t (a, b) VALUES (1, 1)");
             db.executeQuery("DROP TABLE rev4_t");
-            return r.error !== undefined && noBogusCol;
+            return !r.error && noBogusCol && dup.error !== undefined && dup.error.includes('UNIQUE');
         }},
-        { name: "Rev4: Multi-Column ADD PRIMARY KEY Rejected", fn: () => {
+        { name: "Rev4: Multi-Column ADD PRIMARY KEY Now Supported", fn: () => {
             db.executeQuery("CREATE TABLE rev4_u (a INTEGER, b INTEGER)");
             const r = db.executeQuery("ALTER TABLE rev4_u ADD PRIMARY KEY (a, b)");
             const noBogus = !db.tables['rev4_u'].cols['primary'];
+            db.executeQuery("INSERT INTO rev4_u (a, b) VALUES (1, 1)");
+            const dup = db.executeQuery("INSERT INTO rev4_u (a, b) VALUES (1, 1)");
             db.executeQuery("DROP TABLE rev4_u");
-            return r.error !== undefined && noBogus;
+            return !r.error && noBogus && dup.error !== undefined && dup.error.includes('PRIMARY KEY');
         }},
 
         // Rev#5: サブクエリ内の非修飾同一識別子比較（相関の意図）が明示エラーになる
@@ -2238,6 +2245,57 @@
         // 定義は js/tests/test-suite-fixes.js の getFixTests()
         // ============================================================
         ...getFixTests(),
+
+        // ============================================================
+        // v1.1 機能テスト群（追加関数 / JSON / RETURNING / NULLS順序 /
+        // 新集計・ウィンドウ関数 / DDL拡張 / 外部API拡張）
+        // 定義は js/tests/test-suite-v2.js の getV2Tests()
+        // ============================================================
+        ...getV2Tests(),
+
+        // ============================================================
+        // v1.2 機能テスト群（相関サブクエリ / WITH RECURSIVE / VALUES式 /
+        // 複合キー / TEMPORARY TABLE / 集計・関数拡張 / API CRUD）
+        // 定義は js/tests/test-suite-v3.js の getV3Tests()
+        // ============================================================
+        ...getV3Tests(),
+
+        // ============================================================
+        // v1.3 機能テスト群（トリガー / ユーザー変数 / ウィンドウフレーム /
+        // upsert×SELECT / CHANGE COLUMN / TABLE文 / API拡張）
+        // 定義は js/tests/test-suite-v4.js の getV4Tests()
+        // ============================================================
+        ...getV4Tests(),
+
+        // ============================================================
+        // v1.4 機能テスト群（DEFAULT CURRENT_TIMESTAMP / JOIN USING・NATURAL /
+        // INTERSECT・EXCEPT ALL / Did-you-mean / UI改善）
+        // 定義は js/tests/test-suite-v5.js の getV5Tests()
+        // ============================================================
+        ...getV5Tests(),
+
+        // ============================================================
+        // v1.5 機能テスト群（ハッシュ・エンコード関数 / MIN_BY・PERCENTILE 等の新集計 /
+        // ROLLUP / VALUES文 / FROM DUAL / CTE列リスト / CHECK・ANALYZE TABLE /
+        // SHOW FUNCTIONS / API拡張）
+        // 定義は js/tests/test-suite-v6.js の getV6Tests()
+        // ============================================================
+        ...getV6Tests(),
+
+        // ============================================================
+        // v1.6 機能テスト群（式左辺の関数呼び出し / LIKE ESCAPE / QUALIFY / GROUPING /
+        // STRING_AGG・CORR 等の新集計 / シーケンス / PREPARE・EXECUTE / EXPLAIN ANALYZE /
+        // ALTER IF EXISTS / API prepare・イベント）
+        // 定義は js/tests/test-suite-v7.js の getV7Tests()
+        // ============================================================
+        ...getV7Tests(),
+
+        // ============================================================
+        // v1.7 機能テスト群（FILTER(WHERE)集計 / GENERATE_SERIES / named window /
+        // 生成列 / API explain・each / SQL整形 formatSql）
+        // 定義は js/tests/test-suite-v8.js の getV8Tests()
+        // ============================================================
+        ...getV8Tests(),
 
         // Cleanup (New Features)
         { name: "Drop View Stats", sql: "DROP VIEW v_stats", check: r => true },

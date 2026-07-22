@@ -231,3 +231,16 @@
         a.click();
         URL.revokeObjectURL(url);
     });
+
+    // 結果セットを JSON ファイルとしてダウンロードする（行オブジェクトの配列 / 整形出力）
+    document.getElementById('exportJsonBtn').addEventListener('click', () => {
+        if (!currentResultData || currentResultData.length === 0) return;
+        const json = JSON.stringify(currentResultData, null, 2);
+        const blob = new Blob([json], { type: 'application/json;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `luminadb_export.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+    });

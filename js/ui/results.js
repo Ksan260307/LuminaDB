@@ -108,6 +108,16 @@
        }
     }
 
+    // データセルのクリックでその値をクリップボードへコピーする（ヘッダーのソートとは別経路）
+    els.resArea.addEventListener('click', (e) => {
+        const td = e.target.closest('td');
+        if (!td) return;
+        const text = td.textContent === 'null' ? '' : td.textContent;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => showToast('セルの値をコピーしました。')).catch(() => {});
+        }
+    });
+
     els.dispLimit.addEventListener('change', () => renderDisplay(true));
 
     document.getElementById('resultsContainer').addEventListener('scroll', function(e) {

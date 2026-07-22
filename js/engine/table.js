@@ -21,6 +21,12 @@
             this.autoIncrementCol = null;
             // CHECK 制約: [{ name, expr }]（expr は復元済みの真偽式テキスト）
             this.checks = [];
+            // 複合 UNIQUE / PRIMARY KEY: [{ cols: [...], isPK }]
+            this.compositeKeys = [];
+            // 生成列 (GENERATED ALWAYS AS): col -> 式テキスト（STORED相当。INSERT/UPDATE時に評価）
+            this.generatedCols = Object.create(null);
+            // CREATE TEMPORARY TABLE で作られたテーブル（IDB保存・SQLエクスポート対象外）
+            this.isTemp = false;
         }
 
         addColumn(col, type = 'ANY') {
@@ -68,6 +74,13 @@
                 delete this.defaults[oldCol];
             }
             if (this.autoIncrementCol === oldCol) this.autoIncrementCol = newCol;
+            if (this.generatedCols && oldCol in this.generatedCols) {
+                this.generatedCols[newCol] = this.generatedCols[oldCol];
+                delete this.generatedCols[oldCol];
+            }
+            (this.compositeKeys || []).forEach(ck => {
+                ck.cols = ck.cols.map(c => c === oldCol ? newCol : c);
+            });
         }
 
         dropColumn(col) {
@@ -83,6 +96,9 @@
             this.notNullCols = (this.notNullCols || []).filter(c => c !== col);
             if (this.defaults) delete this.defaults[col];
             if (this.autoIncrementCol === col) this.autoIncrementCol = null;
+            if (this.generatedCols) delete this.generatedCols[col];
+            // 列を含む複合キー制約は列ごと削除する（部分キーとして残すと意味が変わるため）
+            this.compositeKeys = (this.compositeKeys || []).filter(ck => !ck.cols.includes(col));
         }
 
         changeColumnType(col, newType) {
@@ -225,6 +241,9 @@
                 let sIdx = this.strMaps[col][s];
                 if (sIdx === undefined) {
                     sIdx = this.strPools[col].length;
+                    // meta の文字列インデックスは 24bit 幅。超過すると別の文字列を指して
+                    // データが静かに壊れるため、上限到達時は明示的にエラーにする
+                    if (sIdx > 0xFFFFFF) throw new Error(`String pool overflow: column '${col}' exceeds 16,777,215 distinct strings. Run VACUUM to reclaim unused entries.`);
                     this.strPools[col].push(s);
                     this.strMaps[col][s] = sIdx;
                 }
@@ -353,6 +372,9 @@
             t.defaults = Object.assign(Object.create(null), this.defaults || {});
             t.autoIncrementCol = this.autoIncrementCol;
             t.checks = JSON.parse(JSON.stringify(this.checks || []));
+            t.compositeKeys = JSON.parse(JSON.stringify(this.compositeKeys || []));
+            t.generatedCols = Object.assign(Object.create(null), this.generatedCols || {});
+            t.isTemp = !!this.isTemp;
             Object.keys(this.indices).forEach(c => t.createIndex(c));
             return t;
         }

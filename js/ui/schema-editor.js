@@ -140,21 +140,10 @@
             return;
         }
 
-        // バックアップ（ロールバック用）
-        const backupTableObj = new Table(t.capacity);
-        backupTableObj.rowCount = t.rowCount;
-        backupTableObj.foreignKeys = JSON.parse(JSON.stringify(t.foreignKeys || []));
-        backupTableObj.primaryKey = t.primaryKey;
-        backupTableObj.uniqueCols = [...(t.uniqueCols || [])];
-        backupTableObj.colTypes = JSON.parse(JSON.stringify(t.colTypes));
-        backupTableObj.strPools = JSON.parse(JSON.stringify(t.strPools));
-        backupTableObj.strMaps = JSON.parse(JSON.stringify(t.strMaps));
-        for (let c in t.cols) {
-            backupTableObj.cols[c] = {
-                num: new Float64Array(t.cols[c].num),
-                meta: new Uint32Array(t.cols[c].meta)
-            };
-        }
+        // バックアップ（ロールバック用）。cloneFull は列データに加え型・制約
+        // （NOT NULL / DEFAULT / AUTO_INCREMENT / CHECK / 複合キー / FK / インデックス）まで
+        // 完全複製するため、保存失敗時に元のスキーマを漏れなく差し戻せる
+        const backupTableObj = t.cloneFull();
 
         try {
             editingSchema.cols.filter(c => !c.isNew && c.isDeleted).forEach(c => t.dropColumn(c.oldName));

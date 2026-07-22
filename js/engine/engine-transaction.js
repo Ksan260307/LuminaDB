@@ -73,6 +73,7 @@
               foreignKeys: JSON.parse(JSON.stringify(t.foreignKeys || [])),
               autoIncrementCol: t.autoIncrementCol,
               checks: JSON.parse(JSON.stringify(t.checks || [])),
+              compositeKeys: JSON.parse(JSON.stringify(t.compositeKeys || [])),
               indexCols: Object.keys(t.indices)
           });
       },
@@ -109,6 +110,22 @@
           this.undoLog.push({ type: 'PROC_STATE', name, prev: cur ? [...cur] : undefined });
       },
 
+      // CREATE/DROP TRIGGER の undo ログ（変更前の定義を保存）
+      _logTriggerState(name) {
+          name = name.toLowerCase();
+          if (!this.inTransaction) return;
+          const cur = this.triggers[name];
+          this.undoLog.push({ type: 'TRIGGER_STATE', name, prev: cur ? JSON.parse(JSON.stringify(cur)) : undefined });
+      },
+
+      // CREATE/DROP SEQUENCE の undo ログ（定義のみ。NEXTVAL の採番値は非トランザクション）
+      _logSeqState(name) {
+          name = name.toLowerCase();
+          if (!this.inTransaction) return;
+          const cur = this.sequences[name];
+          this.undoLog.push({ type: 'SEQ_STATE', name, prev: cur ? { ...cur } : undefined });
+      },
+
       // Undo ログ 1 エントリを逆再生する（ROLLBACK / ROLLBACK TO SAVEPOINT 共用）
       _applyUndoEntry(log) {
           if (log.type === 'TABLE_COW') {
@@ -143,6 +160,7 @@
                   table.foreignKeys = JSON.parse(JSON.stringify(log.foreignKeys));
                   table.autoIncrementCol = log.autoIncrementCol;
                   table.checks = JSON.parse(JSON.stringify(log.checks || []));
+                  table.compositeKeys = JSON.parse(JSON.stringify(log.compositeKeys || []));
                   // ADD PK/UNIQUE / CREATE INDEX で追加されたインデックスを巻き戻す
                   Object.keys(table.indices).forEach(c => {
                       if (!log.indexCols.includes(c)) delete table.indices[c];
@@ -160,6 +178,12 @@
           } else if (log.type === 'PROC_STATE') {
               if (log.prev === undefined) delete this.procedures[log.name];
               else this.procedures[log.name] = [...log.prev];
+          } else if (log.type === 'TRIGGER_STATE') {
+              if (log.prev === undefined) delete this.triggers[log.name];
+              else this.triggers[log.name] = JSON.parse(JSON.stringify(log.prev));
+          } else if (log.type === 'SEQ_STATE') {
+              if (log.prev === undefined) delete this.sequences[log.name];
+              else this.sequences[log.name] = { ...log.prev };
           }
           // type === 'SAVEPOINT' はマーカーのため何もしない
       },

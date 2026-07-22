@@ -252,11 +252,16 @@
             db.executeQuery("DROP TABLE nx_is2");
             return r.error !== undefined;
         }},
-        { name: "XNeg: ODKU With Insert Select", fn: () => {
-            db.executeQuery("CREATE TABLE nx_od (a INTEGER PRIMARY KEY)");
-            const r = db.executeQuery("INSERT INTO nx_od (a) SELECT id FROM users ON DUPLICATE KEY UPDATE a = a + 1");
+        // v1.3: INSERT ... SELECT と ON DUPLICATE KEY UPDATE の併用はサポートされた（旧: 明示エラー）
+        { name: "XNeg: ODKU With Insert Select Now Works", fn: () => {
+            db.executeQuery("CREATE TABLE nx_od (a INTEGER PRIMARY KEY, hit INTEGER)");
+            db.executeQuery("INSERT INTO nx_od (a, hit) VALUES (1, 0)");
+            const r = db.executeQuery("INSERT INTO nx_od (a, hit) SELECT id, age FROM users WHERE id <= 3 ON DUPLICATE KEY UPDATE hit = 9");
+            const upd = db.executeQuery("SELECT hit FROM nx_od WHERE a = 1");
+            const ins = db.executeQuery("SELECT hit FROM nx_od WHERE a = 2");
+            const c = db.executeQuery("SELECT COUNT(*) AS c FROM nx_od");
             db.executeQuery("DROP TABLE nx_od");
-            return r.error !== undefined;
+            return !r.error && upd.data[0].hit === 9 && ins.data[0].hit === 30 && c.data[0].c === 3;
         }},
         { name: "XNeg: Insert Set Malformed", fn: () => {
             db.executeQuery("CREATE TABLE nx_set (a INTEGER)");
@@ -358,8 +363,9 @@
         }},
         { name: "XNeg: Call Syntax With Args", sql: "CALL some_proc(1)", isErrorExpected: true, check: r => r.error !== undefined },
         { name: "XNeg: Create Procedure Empty Body", sql: "CREATE PROCEDURE nx_p AS", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Correlated Scalar Subquery", sql: "SELECT * FROM users u WHERE age > (SELECT AVG(amount) FROM orders o WHERE o.user_id = u.id)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Correlated') },
-        { name: "XNeg: Correlated IN Subquery", sql: "SELECT * FROM users u WHERE id IN (SELECT user_id FROM orders WHERE user_id = u.id)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Correlated') },
+        // v1.2: 相関サブクエリは行単位評価でサポートされた（旧: 明示エラー）
+        { name: "XNeg: Correlated Scalar Subquery Now Works", sql: "SELECT * FROM users u WHERE age > (SELECT AVG(amount) FROM orders o WHERE o.user_id = u.id)", check: r => !r.error && r.data.length === 10 },
+        { name: "XNeg: Correlated IN Subquery Now Works", sql: "SELECT * FROM users u WHERE id IN (SELECT user_id FROM orders WHERE user_id = u.id)", check: r => !r.error && r.data.length === 4 },
         { name: "XNeg: CTE Missing Main Statement", sql: "WITH a AS (SELECT id FROM users)", isErrorExpected: true, check: r => r.error !== undefined },
         { name: "XNeg: CTE Body Error", sql: "WITH a AS (SELECT * FROM zz_nothing) SELECT * FROM a", isErrorExpected: true, check: r => r.error !== undefined },
         { name: "XNeg: Show Unknown Target", sql: "SHOW GADGETS", isErrorExpected: true, check: r => r.error !== undefined },
@@ -556,7 +562,9 @@
         { name: "XBnd: Zero Divide Zero NaN", sql: "SELECT 0 / 0 AS v", check: r => typeof r.data[0].v === 'number' && isNaN(r.data[0].v) },
         { name: "XBnd: Mod By Zero NaN", sql: "SELECT MOD(10, 0) AS v", check: r => typeof r.data[0].v === 'number' && isNaN(r.data[0].v) },
         { name: "XBnd: Mod Negative Operands", sql: "SELECT MOD(-7, 3) AS a, MOD(7, -3) AS b", check: r => r.data[0].a === -1 && r.data[0].b === 1 },
-        { name: "XBnd: Round Half Values", sql: "SELECT ROUND(0.5) AS a, ROUND(-0.5) AS b, ROUND(2.5) AS c, ROUND(-2.5) AS d", check: r => r.data[0].a === 1 && r.data[0].b === 0 && r.data[0].c === 3 && r.data[0].d === -2 },
+        // v1.1: ROUND は MySQL 互換の「ゼロから遠い方向」丸めへ変更（JS Math.round の
+        // 負数切り上げ挙動 ROUND(-2.5)=-2 は SQL として直感に反するため）
+        { name: "XBnd: Round Half Values", sql: "SELECT ROUND(0.5) AS a, ROUND(-0.5) AS b, ROUND(2.5) AS c, ROUND(-2.5) AS d", check: r => r.data[0].a === 1 && r.data[0].b === -1 && r.data[0].c === 3 && r.data[0].d === -3 },
         { name: "XBnd: Ceil Floor Near Zero", sql: "SELECT CEIL(-0.1) AS a, FLOOR(-0.1) AS b", check: r => r.data[0].a === 0 && r.data[0].b === -1 },
         { name: "XBnd: Truncate Digits", sql: "SELECT TRUNCATE(3.999, 0) AS a, TRUNCATE(-3.999, 0) AS b, TRUNCATE(3.14159, 4) AS c", check: r => r.data[0].a === 3 && r.data[0].b === -3 && r.data[0].c === 3.1415 },
 

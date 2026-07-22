@@ -33,6 +33,28 @@
         });
       });
 
+      // ビュー / トリガーのセクション（存在する場合のみ表示）
+      const addSection = (title, names, makeQuery) => {
+          if (names.length === 0) return;
+          const header = document.createElement('li');
+          header.innerHTML = `<div class="text-xs font-semibold text-gray-400 uppercase tracking-widest mt-4 mb-1 px-3">${title}</div>`;
+          tree.appendChild(header);
+          names.forEach(n => {
+              const li = document.createElement('li');
+              const btn = document.createElement('button');
+              btn.className = 'text-gray-600 hover:text-blue-600 text-sm w-full text-left px-3 py-1 rounded hover:bg-gray-100 transition-colors';
+              btn.textContent = n; // textContent 経由のため名前はエスケープ不要
+              btn.addEventListener('click', () => {
+                  setQueryValue(makeQuery(n));
+                  els.query.focus();
+              });
+              li.appendChild(btn);
+              tree.appendChild(li);
+          });
+      };
+      addSection('Views', Object.keys(db.views), (n) => `SELECT * FROM ${n}`);
+      addSection('Triggers', Object.keys(db.triggers || {}), () => 'SHOW TRIGGERS');
+
       tree.querySelectorAll('.table-select-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
           setQueryValue(`SELECT * FROM ${e.currentTarget.dataset.table}`);

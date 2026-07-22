@@ -7,6 +7,7 @@
         let dump = Object.create(null); // キーはテーブル名（SQL由来）のため null プロトタイプ
         for(let tName in this.tables) {
           const t = this.tables[tName];
+          if (t.isTemp) continue; // TEMPORARY テーブルは永続化しない
           dump[tName] = {
             rowCount: t.rowCount, capacity: t.capacity,
             strPools: t.strPools, strMaps: t.strMaps, cols: {},
@@ -18,6 +19,8 @@
             defaults: t.defaults,
             autoIncrementCol: t.autoIncrementCol,
             checks: t.checks,
+            compositeKeys: t.compositeKeys,
+            generatedCols: t.generatedCols,
             indexCols: Object.keys(t.indices)
           };
           for(let c in t.cols) {
@@ -29,14 +32,19 @@
         }
         dump.__views__ = Object.assign({}, this.views);
         dump.__procedures__ = JSON.parse(JSON.stringify(this.procedures));
+        dump.__triggers__ = JSON.parse(JSON.stringify(this.triggers));
+        dump.__sequences__ = JSON.parse(JSON.stringify(this.sequences));
         return dump;
       },
 
       importFromIDB(dump) {
         // 復元データのキーはユーザーデータ由来のため、null プロトタイプの辞書へコピーする
         this.tables = Object.create(null);
+        this._attachEngineRef(); // 相関サブクエリ用のエンジン参照を張り直す
         this.views = Object.assign(Object.create(null), (dump && dump.__views__) || {});
         this.procedures = Object.assign(Object.create(null), (dump && dump.__procedures__) ? JSON.parse(JSON.stringify(dump.__procedures__)) : {});
+        this.triggers = Object.assign(Object.create(null), (dump && dump.__triggers__) ? JSON.parse(JSON.stringify(dump.__triggers__)) : {});
+        this.sequences = Object.assign(Object.create(null), (dump && dump.__sequences__) ? JSON.parse(JSON.stringify(dump.__sequences__)) : {});
         for(let tName in dump) {
           if (tName.startsWith('__')) continue;
           const dt = dump[tName];
@@ -64,11 +72,78 @@
           t.defaults = Object.assign(Object.create(null), dt.defaults || {});
           t.autoIncrementCol = dt.autoIncrementCol || null;
           t.checks = Array.isArray(dt.checks) ? dt.checks.map(c => ({ name: c.name || null, expr: c.expr })) : [];
+          t.compositeKeys = Array.isArray(dt.compositeKeys) ? dt.compositeKeys.map(ck => ({ cols: [...ck.cols], isPK: !!ck.isPK })) : [];
+          t.generatedCols = Object.assign(Object.create(null), dt.generatedCols || {});
           t.rebuildIndices();
           // PK / UNIQUE の自動インデックスに加え、ユーザー作成インデックスも復元する
           [...(t.primaryKey ? [t.primaryKey] : []), ...t.uniqueCols, ...(dt.indexCols || [])].forEach(c => { if (t.cols[c]) t.createIndex(c); });
           this.tables[tName] = t;
         }
+      },
+
+      // SQLテキストを ';' 区切りで文へ分割する（エンジン内蔵版）。
+      // 文字列リテラル内の ';' は保護し、引用符二重化 ('') とバックスラッシュ
+      // エスケープ (\') の両方を認識する。コメント (-- 行 / ブロック) 内も区切らない
+      splitStatements(text) {
+          const statements = [];
+          let currentStmt = '';
+          let inString = false;
+          let stringChar = '';
+          for (let i = 0; i < text.length; i++) {
+              const char = text[i];
+              if (inString) {
+                  if (char === '\\') {
+                      currentStmt += char;
+                      if (i + 1 < text.length) { currentStmt += text[i + 1]; i++; }
+                      continue;
+                  }
+                  if (char === stringChar) {
+                      if (text[i + 1] === stringChar) {
+                          currentStmt += char; i++;
+                      } else {
+                          inString = false;
+                      }
+                  }
+                  currentStmt += char;
+              } else {
+                  if (char === '-' && text[i + 1] === '-') {
+                      while (i < text.length && text[i] !== '\n') i++;
+                      currentStmt += ' ';
+                      continue;
+                  }
+                  if (char === '/' && text[i + 1] === '*') {
+                      i += 2;
+                      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+                      i++;
+                      currentStmt += ' ';
+                      continue;
+                  }
+                  if (char === "'" || char === '"') {
+                      inString = true;
+                      stringChar = char;
+                      currentStmt += char;
+                  } else if (char === ';') {
+                      if (currentStmt.trim() !== '') statements.push(currentStmt.trim());
+                      currentStmt = '';
+                  } else {
+                      currentStmt += char;
+                  }
+              }
+          }
+          if (currentStmt.trim() !== '') statements.push(currentStmt.trim());
+          return statements;
+      },
+
+      // 複数文をまとめて実行する（スクリプト実行）。エラーがあっても後続の文を実行し、
+      // 文ごとの結果と成功/失敗数を返す
+      executeScript(sqlText) {
+          const statements = this.splitStatements(String(sqlText == null ? '' : sqlText));
+          const results = statements.map(stmt => {
+              const res = this.executeQuery(stmt);
+              return { sql: stmt, ...res };
+          });
+          const succeeded = results.filter(r => !r.error).length;
+          return { results, total: statements.length, succeeded, failed: statements.length - succeeded };
       },
 
       // 単一テーブルの CREATE TABLE 文を組み立てる（SHOW CREATE TABLE / exportSQL 共用）
@@ -77,13 +152,17 @@
           const cols = t.getColumnNames();
           const colDefs = cols.map(c => {
               let def = c + (t.colTypes[c] && t.colTypes[c] !== 'ANY' ? ` ${t.colTypes[c]}` : '');
+              // 生成列は型のみ + GENERATED ALWAYS AS (expr) STORED（他の修飾は付かない）
+              if (t.generatedCols && c in t.generatedCols) {
+                  return def + ` GENERATED ALWAYS AS (${t.generatedCols[c]}) STORED`;
+              }
               if (t.primaryKey === c) def += ' PRIMARY KEY';
               else if (t.uniqueCols && t.uniqueCols.includes(c)) def += ' UNIQUE';
               if (t.autoIncrementCol === c) def += ' AUTO_INCREMENT';
               if (t.notNullCols && t.notNullCols.includes(c)) def += ' NOT NULL';
               if (t.defaults && c in t.defaults) {
                   const dv = t.defaults[c];
-                  def += ` DEFAULT ${typeof dv === 'string' ? this._quoteLiteral(dv) : dv}`;
+                  def += ` DEFAULT ${this._isNowMarker(dv) ? 'CURRENT_TIMESTAMP' : (typeof dv === 'string' ? this._quoteLiteral(dv) : dv)}`;
               }
               return def;
           });
@@ -97,18 +176,24 @@
                   colDefs.push(def);
               });
           }
+          if (t.compositeKeys && t.compositeKeys.length > 0) {
+              t.compositeKeys.forEach(ck => {
+                  colDefs.push(`${ck.isPK ? 'PRIMARY KEY' : 'UNIQUE'} (${ck.cols.join(', ')})`);
+              });
+          }
           if (t.checks && t.checks.length > 0) {
               t.checks.forEach(chk => {
                   colDefs.push(`${chk.name ? `CONSTRAINT ${chk.name} ` : ''}CHECK (${chk.expr})`);
               });
           }
-          return `CREATE TABLE ${tName} (${colDefs.join(', ')})`;
+          return `CREATE ${t.isTemp ? 'TEMPORARY ' : ''}TABLE ${tName} (${colDefs.join(', ')})`;
       },
 
       exportSQL() {
           let sqlLines = [];
           for (let tName in this.tables) {
               if (tName.startsWith('__tmp_')) continue;
+              if (this.tables[tName].isTemp) continue; // TEMPORARY テーブルはエクスポート対象外
               const t = this.tables[tName];
               const cols = t.getColumnNames();
               sqlLines.push(`${this.buildCreateTableSQL(tName)};`);
@@ -144,6 +229,12 @@
           // ビュー定義を出力（プロシージャは本体に';'を含むためSQLエクスポート対象外）
           for (let vName in this.views) {
               sqlLines.push(`CREATE VIEW ${vName} AS ${this.views[vName]};`);
+          }
+          // シーケンス定義と現在値（SETVAL で再インポート時に採番位置を復元する）
+          for (const sn in this.sequences) {
+              const s = this.sequences[sn];
+              sqlLines.push(`CREATE SEQUENCE ${sn} START WITH ${s.start} INCREMENT BY ${s.increment};`);
+              if (s.value !== null) sqlLines.push(`SELECT SETVAL('${sn}', ${s.value});`);
           }
           return sqlLines.join('\n');
       },

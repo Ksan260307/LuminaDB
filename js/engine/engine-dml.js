@@ -18,7 +18,11 @@
           const extraCols = [];
           const defaults = tData.defaults || {};
           for (const col in defaults) {
-              if (cols.indexOf(col) === -1) extraCols.push({ col, val: defaults[col] });
+              if (cols.indexOf(col) === -1) {
+                  const dv = defaults[col];
+                  // DEFAULT CURRENT_TIMESTAMP は挿入時点の時刻へ解決する
+                  extraCols.push({ col, val: this._isNowMarker(dv) ? this._nowString() : dv });
+              }
           }
           const ai = tData.autoIncrementCol;
           let aiNext = null;
@@ -80,8 +84,41 @@
           });
       },
 
+      // 複合 UNIQUE / PRIMARY KEY のタプル重複チェック（INSERT 用）。
+      // タプルのいずれかが NULL の行は UNIQUE では対象外（SQL標準）、PK では拒否
+      _checkCompositeInsert(tData, cols, valuesList) {
+          (tData.compositeKeys || []).forEach(ck => {
+              const label = ck.isPK ? 'PRIMARY KEY' : 'UNIQUE';
+              const idxs = ck.cols.map(c => cols.indexOf(c));
+              const existing = new Set();
+              for (let i = 0; i < tData.rowCount; i++) {
+                  const tup = ck.cols.map(c => tData.getValue(c, i));
+                  if (tup.some(v => v === null || v === undefined)) continue;
+                  existing.add(JSON.stringify(tup));
+              }
+              const batchSeen = new Set();
+              valuesList.forEach(vals => {
+                  const tup = ck.cols.map((c, j) => {
+                      let v = idxs[j] === -1 ? null : vals[idxs[j]];
+                      if (v !== null && v !== undefined) v = this._normalizeByColType(tData, c, v);
+                      return v;
+                  });
+                  if (tup.some(v => v === null || v === undefined)) {
+                      if (ck.isPK) throw new Error(`PRIMARY KEY constraint failed: NULL not allowed in composite key (${ck.cols.join(', ')}).`);
+                      return;
+                  }
+                  const sig = JSON.stringify(tup);
+                  if (batchSeen.has(sig) || existing.has(sig)) {
+                      throw new Error(`${label} constraint failed: Duplicate value (${tup.join(', ')}) in (${ck.cols.join(', ')}).`);
+                  }
+                  batchSeen.add(sig);
+              });
+          });
+      },
+
       // INSERT 時の UNIQUE / PRIMARY KEY 制約チェック（適用前に一括検証）
       _checkInsertConstraints(tData, cols, valuesList) {
+          this._checkCompositeInsert(tData, cols, valuesList);
           const pk = tData.primaryKey;
           const uniqueSet = new Set(tData.uniqueCols || []);
           if (pk) uniqueSet.add(pk);
@@ -109,6 +146,35 @@
                       throw new Error(`${label} constraint failed: Value '${val}' already exists in column '${col}'.`);
                   }
               });
+          });
+      },
+
+      // 生成列 (GENERATED ALWAYS AS) の式を1度コンパイルする。
+      // insertCols/changeCols に生成列が含まれていたら「明示指定不可」としてエラーにする
+      _compileGeneratedCols(tData, providedCols) {
+          if (!tData.generatedCols) return [];
+          const names = Object.keys(tData.generatedCols);
+          if (names.length === 0) return [];
+          if (providedCols) {
+              names.forEach(gc => {
+                  if (providedCols.indexOf(gc) !== -1) throw new Error(`Cannot assign to generated column '${gc}'.`);
+              });
+          }
+          return names.map(gc => {
+              const sm = [];
+              return { col: gc, fn: this.compileCondition(this._maskStrings(tData.generatedCols[gc], sm), sm) };
+          });
+      },
+
+      // 指定行 idx の生成列を評価して書き込む（他の列が確定した後に呼ぶ）
+      _applyGeneratedCols(table, tData, genFns, idx) {
+          if (!genFns || genFns.length === 0) return;
+          const aliases = { [table]: table };
+          genFns.forEach(g => {
+              let v;
+              try { v = g.fn({ [table]: idx }, this.tables, aliases); }
+              catch (e) { throw new Error(`Generated column '${g.col}': ${e.message}`); }
+              tData.setValue(g.col, idx, v === undefined ? null : v);
           });
       },
 
@@ -258,6 +324,34 @@
               });
           });
 
+          // 複合 UNIQUE / PRIMARY KEY チェック（更新後の最終状態で一意性を検証する）
+          (tData.compositeKeys || []).forEach(ck => {
+              if (!pending.some(p => ck.cols.some(c => c in p.changes))) return;
+              const label = ck.isPK ? 'PRIMARY KEY' : 'UNIQUE';
+              const targetSet2 = new Set(pending.map(p => p.idx));
+              const existing = new Set();
+              for (let i = 0; i < tData.rowCount; i++) {
+                  if (targetSet2.has(i)) continue;
+                  const tup = ck.cols.map(c => tData.getValue(c, i));
+                  if (tup.some(v => v === null || v === undefined)) continue;
+                  existing.add(JSON.stringify(tup));
+              }
+              pending.forEach(({ idx, changes }) => {
+                  const tup = ck.cols.map(c => {
+                      let v = (c in changes) ? changes[c] : tData.getValue(c, idx);
+                      if (v !== null && v !== undefined) v = this._normalizeByColType(tData, c, v);
+                      return v;
+                  });
+                  if (tup.some(v => v === null || v === undefined)) {
+                      if (ck.isPK && ck.cols.some(c => c in changes)) throw new Error(`PRIMARY KEY constraint failed: NULL not allowed in composite key (${ck.cols.join(', ')}).`);
+                      return;
+                  }
+                  const sig = JSON.stringify(tup);
+                  if (existing.has(sig)) throw new Error(`${label} constraint failed: Duplicate value (${tup.join(', ')}) in (${ck.cols.join(', ')}).`);
+                  existing.add(sig);
+              });
+          });
+
           // UNIQUE / PRIMARY KEY チェック（更新後の最終状態で一意性を検証する）
           const pkCol = tData.primaryKey;
           const uniqueCheckCols = new Set(tData.uniqueCols || []);
@@ -303,9 +397,149 @@
           });
       },
 
-      // INSERT の値トークン（リテラル）を JS 値へ解釈する（VALUES 句 / SET 句共用）
+      // ============ トリガー (CREATE TRIGGER) ============
+
+      // 指定テーブル・イベントのトリガーが存在するか（発火前の安価な判定用）
+      _hasTriggers(event, table) {
+          for (const name in this.triggers) {
+              if (this.triggers[name].table === table && this.triggers[name].event === event) return true;
+          }
+          return false;
+      },
+
+      // トリガー本文の NEW.col / OLD.col を対象行の値リテラルへ置換する。
+      // 文字列リテラル内の 'NEW.x' を壊さないよう、マスクしてから置換する
+      _substituteTriggerRefs(stmt, row) {
+          const sm = [];
+          let s = this._maskStrings(stmt, sm);
+          s = s.replace(/\b(NEW|OLD)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)/gi, (m, kind, col) => {
+              const isNew = kind.toUpperCase() === 'NEW';
+              const src = isNew ? row.newRow : row.oldRow;
+              if (!src) throw new Error(`${kind.toUpperCase()}.${col} is not available in this trigger context.`);
+              const key = col.toLowerCase();
+              if (!(key in src)) throw new Error(`Unknown column '${kind}.${col}' in trigger statement.`);
+              const v = src[key];
+              if (v === null || v === undefined) return 'NULL';
+              if (typeof v === 'number') return `(${v})`;
+              if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+              sm.push(this._quoteLiteral(String(v)));
+              return `__STR_${sm.length - 1}__`;
+          });
+          return this._restoreStrings(s, sm);
+      },
+
+      // トリガーを発火する。rows: [{ oldRow, newRow }]（null は該当なし）。
+      // 各文は独立した executeQuery として実行される（トランザクション中は undo 対象）。
+      // 再帰は深さ8まで。文のエラーは呼び出し元の DML を失敗させる
+      _fireTriggers(timing, event, table, rows) {
+          if (!this.triggers || !rows || rows.length === 0) return;
+          const list = [];
+          for (const name in this.triggers) {
+              const tg = this.triggers[name];
+              if (tg.table === table && tg.timing === timing && tg.event === event) list.push(tg);
+          }
+          if (list.length === 0) return;
+          this._triggerDepth = (this._triggerDepth || 0) + 1;
+          try {
+              if (this._triggerDepth > 8) throw new Error("Trigger cascade depth limit (8) exceeded.");
+              for (const tg of list) {
+                  for (const row of rows) {
+                      for (const stmt of tg.statements) {
+                          const sql = this._substituteTriggerRefs(stmt, row);
+                          // 外側の文が保持する相関レジストリをトリガー文の実行から保護する
+                          const savedCorr = this._corrSubs;
+                          let res;
+                          try {
+                              res = this.executeQuery(sql);
+                          } finally {
+                              this._corrSubs = savedCorr;
+                          }
+                          if (res.error) throw new Error(`Trigger '${tg.name}': ${res.error}`);
+                      }
+                  }
+              }
+          } finally {
+              this._triggerDepth--;
+          }
+      },
+
+      // ============ RETURNING / ORDER BY 付き DML の共通ヘルパー ============
+
+      // 文末の RETURNING 句を切り出す。戻り値 { sql, returning }（無ければ returning: null）。
+      // 直後に '=' が続く場合は 'returning' という名前の列への代入とみなして無視する
+      _extractReturning(sql) {
+          const m = sql.match(/\s+returning\s+(?!=)([\s\S]+)$/i);
+          if (!m) return { sql, returning: null };
+          return { sql: sql.slice(0, m.index), returning: m[1].trim() };
+      },
+
+      // RETURNING 式リストを指定行インデックスへ適用して結果行を組み立てる。
+      // '*' は全列、式は AS 別名に対応（SELECT 句と同じ流儀）
+      _evalReturning(table, indices, returning, strMap) {
+          const tData = this.tables[table];
+          const aliases = { [table]: table };
+          const sels = [];
+          this.splitSelectClause(returning).forEach(p => {
+              const asMatch = p.match(/(.+?)\s+AS\s+([a-zA-Z0-9_]+)$/i);
+              const expr = (asMatch ? asMatch[1] : p).trim();
+              const alias = asMatch ? asMatch[2] : expr.replace(/^[a-zA-Z0-9_]+\./, '');
+              if (expr === '*') {
+                  tData.getColumnNames().forEach(c => sels.push({ col: c, alias: c }));
+              } else {
+                  sels.push({ fn: this.compileCondition(expr, strMap), alias });
+              }
+          });
+          return indices.map(idx => {
+              const ptr = { [table]: idx };
+              const row = {};
+              sels.forEach(sel => {
+                  row[sel.alias] = sel.col !== undefined ? tData.getValue(sel.col, idx) : sel.fn(ptr, this.tables, aliases);
+              });
+              return row;
+          });
+      },
+
+      // INSERT 用 RETURNING: テーブル末尾へ追記された count 行分を評価する
+      _returningForAppended(table, count, returning, strMap) {
+          const t = this.tables[table];
+          const idxs = [];
+          for (let i = Math.max(0, t.rowCount - count); i < t.rowCount; i++) idxs.push(i);
+          return this._evalReturning(table, idxs, returning, strMap);
+      },
+
+      // UPDATE / DELETE の ORDER BY: 対象行インデックスを式の値で並べ替える（LIMIT と併用）
+      _sortIndicesByOrderBy(table, indices, orderByStr, strMap) {
+          const items = this.splitSelectClause(orderByStr).map(s => {
+              let e = s.trim();
+              let desc = false;
+              const dm = e.match(/\s+(asc|desc)$/i);
+              if (dm) { desc = dm[1].toLowerCase() === 'desc'; e = e.slice(0, dm.index).trim(); }
+              return { fn: this.compileCondition(e, strMap), desc };
+          });
+          const aliases = { [table]: table };
+          indices.sort((a, b) => {
+              for (const it of items) {
+                  const va = it.fn({ [table]: a }, this.tables, aliases);
+                  const vb = it.fn({ [table]: b }, this.tables, aliases);
+                  if (va === vb) continue;
+                  if (va === null || va === undefined) return it.desc ? 1 : -1;
+                  if (vb === null || vb === undefined) return it.desc ? -1 : 1;
+                  if (va < vb) return it.desc ? 1 : -1;
+                  return it.desc ? -1 : 1;
+              }
+              return 0;
+          });
+          return indices;
+      },
+
+      // INSERT の値トークンを JS 値へ解釈する（VALUES 句 / SET 句共用）。
+      // リテラル（文字列/数値/真偽/NULL/DATE()）はそのまま、DEFAULT はマーカーを返し、
+      // それ以外は定数式としてコンパイル・評価する（1+1, UPPER('a'), NOW() 等。列参照は不可）。
+      // 裸の単語 1 個は従来互換で文字列として扱う
       _parseValueToken(raw, strMap) {
-          let val = raw.trim();
+          const masked = raw.trim();
+          if (/^default$/i.test(masked)) return this._DEFAULT_MARKER;
+          let val = masked;
           // 置換文字列はコールバックで返す。値の '$'（$&, $', $1 等）が String.replace の
           // 特殊置換パターンとして誤解釈され INSERT 値が壊れるのを防ぐ（例: '100$' → '100'）
           strMap.forEach((str, i) => { val = val.replace(new RegExp(`__STR_${i}__`, 'g'), () => str); });
@@ -316,7 +550,35 @@
           if (val.toLowerCase() === 'false') return false;
           const dm = val.match(/^DATE\((.*)\)$/i);
           if (dm) return new Date(dm[1].replace(/['"]/g, ''));
-          return isNaN(val) || val === '' ? val : Number(val);
+          if (val !== '' && !isNaN(val)) return Number(val);
+          if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(masked)) return val;
+          try {
+              const fn = this.compileCondition(masked, strMap);
+              const r = fn({}, this.tables, {});
+              return r === undefined ? null : r;
+          } catch (e) {
+              // 式として解釈できない場合は従来通り生の文字列として扱う
+              return val;
+          }
+      },
+
+      // VALUES 句の DEFAULT キーワード用マーカー（_parseValueToken → _resolveDefaultMarkers）
+      _DEFAULT_MARKER: { __useDefault: true },
+
+      // DEFAULT マーカーを列の DEFAULT 値（未定義なら NULL。AUTO_INCREMENT 列の NULL は
+      // insertRows 側で自動採番される）へ解決する
+      _resolveDefaultMarkers(table, cols, valuesList) {
+          const tData = this.tables[table];
+          valuesList.forEach(vals => {
+              vals.forEach((v, i) => {
+                  if (v === this._DEFAULT_MARKER) {
+                      const col = cols[i];
+                      let dv = (tData && tData.defaults && col in tData.defaults) ? tData.defaults[col] : null;
+                      if (this._isNowMarker(dv)) dv = this._nowString();
+                      vals[i] = dv;
+                  }
+              });
+          });
       },
 
       // PK / UNIQUE 列の値が既存行と衝突する行インデックスを返す（昇順・重複なし）
@@ -333,6 +595,20 @@
               const cType = tData.colTypes[col];
               if ((cType === 'INTEGER' || cType === 'FLOAT') && typeof v === 'string' && v.trim() !== '' && !isNaN(v)) v = Number(v);
               tData.findValueRows(col, v).forEach(i => hits.add(i));
+          });
+          // 複合キーの衝突（全列が一致する既存行）
+          (tData.compositeKeys || []).forEach(ck => {
+              const tup = ck.cols.map(c => {
+                  const ci = cols.indexOf(c);
+                  let v = ci === -1 ? null : vals[ci];
+                  if (v !== null && v !== undefined) v = this._normalizeByColType(tData, c, v);
+                  return v;
+              });
+              if (tup.some(v => v === null || v === undefined)) return;
+              const sig = JSON.stringify(tup);
+              for (let i = 0; i < tData.rowCount; i++) {
+                  if (JSON.stringify(ck.cols.map(c => tData.getValue(c, i))) === sig) hits.add(i);
+              }
           });
           return [...hits].sort((a, b) => a - b);
       },
@@ -404,7 +680,8 @@
           let pendingVals = new Map();  // col -> Map(値 -> pending 添字)
           const deleteSet = new Set();  // REPLACE: フラッシュ時に削除する既存行の添字
 
-          // 行の一意キー値（数値型の文字列は数値へ正規化）を取り出す
+          // 行の一意キー値（数値型の文字列は数値へ正規化）を取り出す。
+          // 複合キーは全列が揃ったタプルのシグネチャを疑似キー __ck_i として扱う
           const keyValsOf = (vals) => {
               const kv = {};
               uniqueSet.forEach(col => {
@@ -415,6 +692,16 @@
                   const cType = tData.colTypes[col];
                   if ((cType === 'INTEGER' || cType === 'FLOAT') && typeof v === 'string' && v.trim() !== '' && !isNaN(v)) v = Number(v);
                   kv[col] = v;
+              });
+              (tData.compositeKeys || []).forEach((ck, i) => {
+                  const tup = ck.cols.map(c => {
+                      const ci = cols.indexOf(c);
+                      let v = ci === -1 ? null : vals[ci];
+                      if (v !== null && v !== undefined) v = this._normalizeByColType(tData, c, v);
+                      return v;
+                  });
+                  if (tup.some(v => v === null || v === undefined)) return;
+                  kv['__ck_' + i] = JSON.stringify(tup);
               });
               return kv;
           };
@@ -543,6 +830,21 @@
           this._checkInsertConstraints(tData, insertCols, valuesList);
           const checkFns = this._compileChecks(tData);
 
+          // 生成列 (GENERATED ALWAYS AS): 明示挿入を拒否し、式を1度コンパイルしておく
+          const genFns = this._compileGeneratedCols(tData, insertCols);
+
+          // BEFORE INSERT トリガー（NEW = 挿入予定の値。キャスト前の生値）
+          const fireInsertTriggers = this._hasTriggers('insert', tableName);
+          if (fireInsertTriggers) {
+              const beforeRows = valuesList.map(vals => {
+                  const nr = Object.create(null);
+                  tData.getColumnNames().forEach(c => { nr[c] = null; });
+                  insertCols.forEach((c, i) => { nr[c] = vals[i] === undefined ? null : vals[i]; });
+                  return { oldRow: null, newRow: nr };
+              });
+              this._fireTriggers('before', 'insert', tableName, beforeRows);
+          }
+
           // INSERT で値を指定しない既存列には明示的に NULL を書き込む。
           // （DELETE / TRUNCATE 後の領域には旧行のデータが残っており、書き込みを
           //   省略すると削除済みの値が新しい行に「復活」してしまうため）
@@ -562,6 +864,8 @@
                       tData.setValue(col, idx, vals[i]);
                   });
                   missingCols.forEach(col => tData.setValue(col, idx, null));
+                  // 生成列を評価（他の列が確定した後・CHECK の前）
+                  this._applyGeneratedCols(tableName, tData, genFns, idx);
                   // CHECK 制約検証（行を書き込んだ直後・rowCount 確定前に評価）
                   this._validateChecksAt(tableName, tData, checkFns, idx);
                   tData.rowCount++;
@@ -579,12 +883,42 @@
               throw e;
           }
 
+          // LAST_INSERT_ID(): AUTO_INCREMENT 列へ採番/指定された値の最大値を記録する
+          const aiCol = tData.autoIncrementCol;
+          if (aiCol) {
+              const aiIdx = insertCols.indexOf(aiCol);
+              if (aiIdx !== -1) {
+                  let maxAi = 0;
+                  valuesList.forEach(vals => {
+                      const v = vals[aiIdx];
+                      if (typeof v === 'number' && v > maxAi) maxAi = v;
+                  });
+                  if (maxAi > 0) this.lastInsertId = maxAi;
+              }
+          }
+
+          // AFTER INSERT トリガー（NEW = 実際に書き込まれたキャスト後の値）
+          if (fireInsertTriggers) {
+              const afterRows = [];
+              const colNames = tData.getColumnNames();
+              for (let i = tData.rowCount - valuesList.length; i < tData.rowCount; i++) {
+                  const nr = Object.create(null);
+                  colNames.forEach(c => { nr[c] = tData.getValue(c, i); });
+                  afterRows.push({ oldRow: null, newRow: nr });
+              }
+              this._fireTriggers('after', 'insert', tableName, afterRows);
+          }
+
           return valuesList.length;
       },
 
       _executeInsert(sql, strMap) {
           let resultSet = [];
           let affectedRows = 0;
+
+          // RETURNING 句（挿入した行を結果セットとして返す）を末尾から切り出す
+          const ret = this._extractReturning(sql);
+          sql = ret.sql;
 
           // 挿入モード: REPLACE INTO / INSERT (OR) IGNORE / ON DUPLICATE KEY UPDATE
           const isReplaceStmt = /^replace\s+into\b/i.test(sql);
@@ -593,25 +927,33 @@
           const odkuM = sql.match(/\s+on\s+duplicate\s+key\s+update\s+([\s\S]+)$/i);
           if (odkuM) { odkuStr = odkuM[1].trim(); sql = sql.slice(0, odkuM.index); }
 
+          // 衝突時に挿入されない/置換される行があり「挿入した行」を一意に定められないため拒否する
+          if (ret.returning && (isReplaceStmt || isIgnore || odkuStr)) {
+              throw new Error("RETURNING is not supported with REPLACE / INSERT IGNORE / ON DUPLICATE KEY UPDATE.");
+          }
+
           // INSERT INTO t DEFAULT VALUES: 全列を DEFAULT / AUTO_INCREMENT / NULL で補完した1行を挿入
           const defaultValuesMatch = sql.match(/^insert\s+into\s+([a-zA-Z0-9_]+)\s+default\s+values$/i);
           if (defaultValuesMatch) {
               const table = defaultValuesMatch[1].toLowerCase();
-              if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
+              if (!this.tables[table]) throw this._tableNotFound(table);
               const affected = this.insertRows(table, [], [[]]);
+              if (ret.returning) {
+                  return { data: this._returningForAppended(table, affected, ret.returning, strMap), affectedRows: affected };
+              }
               return { data: [{ Result: "Success", Message: `${affected} rows inserted.` }], affectedRows: affected };
           }
 
           // カラムリストは省略可（省略時はテーブル定義順の全カラムを対象とする）
-          const insertSelectMatch = sql.match(/^insert\s+into\s+([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*(select\s+[\s\S]+)$/i);
+          // INSERT [IGNORE] / REPLACE ... SELECT および ON DUPLICATE KEY UPDATE ... SELECT に対応
+          const insertSelectMatch = sql.match(/^(?:insert\s+(?:(?:or\s+)?ignore\s+)?into|replace\s+into)\s+([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*(select\s+[\s\S]+)$/i);
           const insertValuesMatch = sql.match(/^(?:insert\s+(?:(?:or\s+)?ignore\s+)?into|replace\s+into)\s+([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*values\s*([\s\S]+)$/i);
           // MySQL互換の INSERT INTO t SET col = val, ... 形式（REPLACE / IGNORE / ODKU とも併用可）
           const insertSetMatch = sql.match(/^(?:insert\s+(?:(?:or\s+)?ignore\s+)?into|replace\s+into)\s+([a-zA-Z0-9_]+)\s+set\s+([\s\S]+)$/i);
-          if (odkuStr && insertSelectMatch) throw new Error("ON DUPLICATE KEY UPDATE is not supported with INSERT ... SELECT.");
 
           if (insertSelectMatch) {
               const table = insertSelectMatch[1].toLowerCase();
-              if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
+              if (!this.tables[table]) throw this._tableNotFound(table);
               const cols = insertSelectMatch[2]
                   ? insertSelectMatch[2].split(',').map(c => c.trim().toLowerCase())
                   : this.tables[table].getColumnNames();
@@ -627,26 +969,43 @@
                   if (cols.length !== selectCols.length) throw new Error("Column count doesn't match select count.");
 
                   const valuesList = insertData.map(row => selectCols.map(sc => row[sc]));
+                  if (isReplaceStmt || isIgnore || odkuStr) {
+                      const res = this._executeUpsertRows(table, cols, valuesList, { replace: isReplaceStmt, ignore: isIgnore, odkuStr }, strMap);
+                      affectedRows = res.affectedRows;
+                      resultSet = [{Result:"Success", Message: res.message}];
+                      return { data: resultSet, affectedRows };
+                  }
                   affectedRows = this.insertRows(table, cols, valuesList);
+              } else if (isReplaceStmt || isIgnore || odkuStr) {
+                  return { data: [{Result:"Success", Message:"0 rows inserted."}], affectedRows: 0 };
               }
-              resultSet = [{Result:"Success", Message:`${affectedRows} rows inserted.`}];
+              resultSet = ret.returning
+                  ? this._returningForAppended(table, affectedRows, ret.returning, strMap)
+                  : [{Result:"Success", Message:`${affectedRows} rows inserted.`}];
           } else if (insertValuesMatch) {
               const table = insertValuesMatch[1].toLowerCase();
-              if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
+              if (!this.tables[table]) throw this._tableNotFound(table);
               const cols = insertValuesMatch[2]
                   ? insertValuesMatch[2].split(',').map(c => c.trim().toLowerCase())
                   : this.tables[table].getColumnNames();
               const valStr = insertValuesMatch[3];
-              const valMatchStrings = valStr.match(/\((?:[^)(]+|\([^)(]*\))*\)/g) || [];
+              // 値グループは2段の括弧ネストまで対応（VALUES (ROUND(ABS(-2.7)), ...) 等の式を許容）
+              const valGroupRe = /\((?:[^)(]|\((?:[^)(]|\([^)(]*\))*\))*\)/g;
+              const valMatchStrings = valStr.match(valGroupRe) || [];
+              // 値グループとカンマ・空白以外の残余（タイプミス等）は従来無言で無視されていた → 構文エラーに
+              const residual = valStr.replace(valGroupRe, '').replace(/[\s,]+/g, '');
+              if (residual !== '') throw new Error(`Syntax Error in INSERT VALUES near '${residual.slice(0, 20)}'.`);
               const valMatches = valMatchStrings.map(s => [s, s.slice(1, -1)]);
               if(valMatches.length === 0) throw new Error("Syntax Error in INSERT.");
 
               let parsedValsList = [];
               valMatches.forEach(vm => {
-                  let vals = vm[1].split(',').map(v => this._parseValueToken(v, strMap));
+                  // 括弧内カンマを保護して分割する（VALUES (CONCAT('a','b'), 1+1) 等の式を許容）
+                  let vals = this.splitSelectClause(vm[1]).map(v => this._parseValueToken(v, strMap));
                   if (cols.length !== vals.length) throw new Error("Column count doesn't match value count.");
                   parsedValsList.push(vals);
               });
+              this._resolveDefaultMarkers(table, cols, parsedValsList);
 
               if (isReplaceStmt || isIgnore || odkuStr) {
                   const res = this._executeUpsertRows(table, cols, parsedValsList, { replace: isReplaceStmt, ignore: isIgnore, odkuStr }, strMap);
@@ -654,11 +1013,13 @@
                   resultSet = [{Result:"Success", Message: res.message}];
               } else {
                   affectedRows = this.insertRows(table, cols, parsedValsList);
-                  resultSet = [{Result:"Success", Message:`${affectedRows} rows inserted.`}];
+                  resultSet = ret.returning
+                      ? this._returningForAppended(table, affectedRows, ret.returning, strMap)
+                      : [{Result:"Success", Message:`${affectedRows} rows inserted.`}];
               }
           } else if (insertSetMatch) {
               const table = insertSetMatch[1].toLowerCase();
-              if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
+              if (!this.tables[table]) throw this._tableNotFound(table);
               const cols = [];
               const vals = [];
               this.splitSelectClause(insertSetMatch[2]).forEach(p => {
@@ -667,13 +1028,16 @@
                   cols.push(p.substring(0, eqIdx).trim().toLowerCase());
                   vals.push(this._parseValueToken(p.substring(eqIdx + 1), strMap));
               });
+              this._resolveDefaultMarkers(table, cols, [vals]);
               if (isReplaceStmt || isIgnore || odkuStr) {
                   const res = this._executeUpsertRows(table, cols, [vals], { replace: isReplaceStmt, ignore: isIgnore, odkuStr }, strMap);
                   affectedRows = res.affectedRows;
                   resultSet = [{Result:"Success", Message: res.message}];
               } else {
                   affectedRows = this.insertRows(table, cols, [vals]);
-                  resultSet = [{Result:"Success", Message:`${affectedRows} rows inserted.`}];
+                  resultSet = ret.returning
+                      ? this._returningForAppended(table, affectedRows, ret.returning, strMap)
+                      : [{Result:"Success", Message:`${affectedRows} rows inserted.`}];
               }
           } else throw new Error("Syntax Error in INSERT.");
 
@@ -683,14 +1047,20 @@
       _executeUpdate(sql, strMap) {
           let resultSet = [];
           let affectedRows = 0;
-          // MySQL 互換の UPDATE ... [WHERE ...] LIMIT n（格納順で先頭 n 行のみ更新）
+          // RETURNING 句（更新後の行を結果セットとして返す）を末尾から切り出す
+          const ret = this._extractReturning(sql);
+          sql = ret.sql;
+          // MySQL 互換の UPDATE ... [WHERE ...] [ORDER BY ...] LIMIT n
           let limitN = null;
           const lm = sql.match(/\s+limit\s+(\d+)\s*$/i);
           if (lm) { limitN = parseInt(lm[1], 10); sql = sql.slice(0, lm.index); }
+          let orderByStr = null;
+          const om = sql.match(/\s+order\s+by\s+([\s\S]+)$/i);
+          if (om) { orderByStr = om[1].trim(); sql = sql.slice(0, om.index); }
           const m = sql.match(/update\s+([a-zA-Z0-9_]+)\s+set\s+([\s\S]+?)(?:\s+where\s+([\s\S]+))?$/i);
           if (m) {
              const table = m[1].toLowerCase();
-             if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
+             if (!this.tables[table]) throw this._tableNotFound(table);
 
              let setStr = m[2];
              let whereStr = m[3];
@@ -701,6 +1071,7 @@
                  if(eqIdx === -1) throw new Error("Syntax Error in SET clause.");
                  let col = s.substring(0, eqIdx).trim().toLowerCase();
                  if (!this.tables[table].cols[col]) throw new Error(`Column '${col}' not found.`);
+                 if (this.tables[table].generatedCols && col in this.tables[table].generatedCols) throw new Error(`Cannot assign to generated column '${col}'.`);
                  let expr = s.substring(eqIdx + 1).trim();
                  let evalFunc = this.compileCondition(expr, strMap);
                  return { col, evalFunc };
@@ -722,6 +1093,7 @@
              } else {
                  for (let i = 0; i < rowCount; i++) targetIndices.push(i);
              }
+             if (orderByStr) this._sortIndicesByOrderBy(table, targetIndices, orderByStr, strMap);
              if (limitN !== null) targetIndices = targetIndices.slice(0, limitN);
 
              // FK 参照アクション (ON UPDATE): 参照される列が変わる行について、子テーブルへの
@@ -773,12 +1145,39 @@
              this._validatePendingChanges(tData, pending);
              this._validateChecksForChanges(table, pending);
 
+             // BEFORE UPDATE トリガー（OLD = 現値 / NEW = 変更適用後の予定値）
+             const fireUpdTriggers = this._hasTriggers('update', table);
+             let updOldRows = null;
+             if (fireUpdTriggers) {
+                 const colNames = tData.getColumnNames();
+                 updOldRows = pending.map(({ idx }) => {
+                     const or = Object.create(null);
+                     colNames.forEach(c => { or[c] = tData.getValue(c, idx); });
+                     return or;
+                 });
+                 const beforeRows = pending.map(({ changes }, i) => {
+                     const nr = Object.assign(Object.create(null), updOldRows[i]);
+                     for (const c in changes) nr[c] = changes[c];
+                     return { oldRow: updOldRows[i], newRow: nr };
+                 });
+                 const rcGuard = tData.rowCount;
+                 this._fireTriggers('before', 'update', table, beforeRows);
+                 // 行の追加/削除はインデックスを狂わせるため禁止（同一テーブルの setValue は許容）
+                 if (tData.rowCount !== rcGuard) throw new Error("Trigger added/removed rows of the target table during UPDATE; this is not supported.");
+             }
+
              // Phase 2: 検証を全て通過した後にまとめて適用する
              pending.forEach(({ idx, changes }) => {
                  Object.keys(changes).forEach(c => {
                      tData.setValue(c, idx, changes[c]);
                  });
              });
+
+             // Phase 2b: 生成列を再評価する（依存元の列が更新された後）
+             const updGenFns = this._compileGeneratedCols(tData, null);
+             if (updGenFns.length > 0) {
+                 targetIndices.forEach(idx => this._applyGeneratedCols(table, tData, updGenFns, idx));
+             }
 
              // Phase 3: FK ON UPDATE の子テーブル波及を適用する（子テーブルは COW してから）
              if (childUpdates.length > 0) {
@@ -789,8 +1188,21 @@
                  });
              }
 
+             // AFTER UPDATE トリガー（NEW = 適用後の実値）
+             if (fireUpdTriggers) {
+                 const colNames = tData.getColumnNames();
+                 const afterRows = pending.map(({ idx }, i) => {
+                     const nr = Object.create(null);
+                     colNames.forEach(c => { nr[c] = tData.getValue(c, idx); });
+                     return { oldRow: updOldRows[i], newRow: nr };
+                 });
+                 this._fireTriggers('after', 'update', table, afterRows);
+             }
+
              affectedRows = targetIndices.length;
-             resultSet = [{Result:"Success", Message:`${affectedRows} rows updated.`}];
+             resultSet = ret.returning
+                 ? this._evalReturning(table, targetIndices, ret.returning, strMap)
+                 : [{Result:"Success", Message:`${affectedRows} rows updated.`}];
           } else throw new Error("Syntax Error in UPDATE.");
 
           return { data: resultSet, affectedRows };
@@ -799,14 +1211,20 @@
       _executeDelete(sql, strMap) {
           let resultSet = [];
           let affectedRows = 0;
-          // MySQL 互換の DELETE ... [WHERE ...] LIMIT n（格納順で先頭 n 行のみ削除）
+          // RETURNING 句（削除した行を結果セットとして返す）を末尾から切り出す
+          const ret = this._extractReturning(sql);
+          sql = ret.sql;
+          // MySQL 互換の DELETE ... [WHERE ...] [ORDER BY ...] LIMIT n
           let limitN = null;
           const lm = sql.match(/\s+limit\s+(\d+)\s*$/i);
           if (lm) { limitN = parseInt(lm[1], 10); sql = sql.slice(0, lm.index); }
+          let orderByStr = null;
+          const om = sql.match(/\s+order\s+by\s+([\s\S]+)$/i);
+          if (om) { orderByStr = om[1].trim(); sql = sql.slice(0, om.index); }
           const m = sql.match(/delete\s+from\s+([a-zA-Z0-9_]+)(?:\s+where\s+([\s\S]+))?$/i);
           if (m) {
              const table = m[1].toLowerCase();
-             if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
+             if (!this.tables[table]) throw this._tableNotFound(table);
              this._cowColumns(table, 'ALL');
              const whereStr = m[2];
              const tData = this.tables[table];
@@ -822,14 +1240,66 @@
              } else {
                  for (let i = 0; i < rowCount; i++) targetIndices.push(i);
              }
+             if (orderByStr) this._sortIndicesByOrderBy(table, targetIndices, orderByStr, strMap);
              if (limitN !== null) targetIndices = targetIndices.slice(0, limitN);
+
+             // RETURNING は削除前に評価する（削除後は行が存在しないため）
+             const returningRows = ret.returning ? this._evalReturning(table, targetIndices, ret.returning, strMap) : null;
+
+             // BEFORE DELETE トリガー（OLD = 削除予定行）。行の増減は行インデックスを
+             // 狂わせ誤った行を削除してしまうため、同一テーブルの行数変化を禁止する
+             const fireDelTriggers = this._hasTriggers('delete', table);
+             let delOldRows = null;
+             if (fireDelTriggers) {
+                 const colNames = tData.getColumnNames();
+                 delOldRows = targetIndices.map(idx => {
+                     const or = Object.create(null);
+                     colNames.forEach(c => { or[c] = tData.getValue(c, idx); });
+                     return { oldRow: or, newRow: null };
+                 });
+                 const rcGuard = tData.rowCount;
+                 this._fireTriggers('before', 'delete', table, delOldRows);
+                 if (tData.rowCount !== rcGuard) throw new Error("Trigger added/removed rows of the target table during DELETE; this is not supported.");
+             }
 
              // FK 参照アクション（RESTRICT / CASCADE / SET NULL）を計画・適用（物理削除込み）
              this._applyDeleteReferentialActions(table, targetIndices);
+
+             // AFTER DELETE トリガー（OLD = 削除された行の値）
+             if (fireDelTriggers) this._fireTriggers('after', 'delete', table, delOldRows);
+
              affectedRows = targetIndices.length;
-             resultSet = [{Result:"Success", Message:`${affectedRows} rows deleted.`}];
+             resultSet = returningRows || [{Result:"Success", Message:`${affectedRows} rows deleted.`}];
           } else throw new Error("Syntax Error in DELETE.");
 
           return { data: resultSet, affectedRows };
+      },
+
+      // 表値コンストラクタ文 (VALUES (1, 'a'), (2, 'b'))。列名は column1..N（PostgreSQL 互換）。
+      // 値には INSERT の VALUES 句と同じ定数式（CONCAT / 1+1 / スカラサブクエリ展開済み等）が使える
+      _executeValuesStatement(sql, strMap) {
+          const m = sql.match(/^values\s*([\s\S]+)$/i);
+          if (!m) throw new Error("Syntax Error in VALUES.");
+          const valStr = m[1];
+          const valGroupRe = /\((?:[^)(]|\((?:[^)(]|\([^)(]*\))*\))*\)/g;
+          const groupStrings = valStr.match(valGroupRe) || [];
+          const residual = valStr.replace(valGroupRe, '').replace(/[\s,]+/g, '');
+          if (groupStrings.length === 0 || residual !== '') {
+              throw new Error("Syntax Error in VALUES. Use VALUES (v1, v2), (v1, v2), ...");
+          }
+          let width = null;
+          const rows = groupStrings.map(g => {
+              const vals = this.splitSelectClause(g.slice(1, -1)).map(v => {
+                  const parsed = this._parseValueToken(v, strMap);
+                  if (parsed === this._DEFAULT_MARKER) throw new Error("DEFAULT is not allowed in a VALUES statement.");
+                  return parsed;
+              });
+              if (width === null) width = vals.length;
+              else if (vals.length !== width) throw new Error("VALUES rows must all have the same number of columns.");
+              const row = {};
+              vals.forEach((v, i) => { row[`column${i + 1}`] = v; });
+              return row;
+          });
+          return { data: rows, affectedRows: rows.length };
       }
     });
