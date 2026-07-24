@@ -1,11 +1,23 @@
     // ============================================================================
     // [Query Runner] - クエリ実行と結果反映
     // ============================================================================
+    // コンソールへ1行記録する薄いラッパ（console.js 未読込でも安全）
+    // sql を渡すとコンソール上でクリック→エディタ再読込できる
+    function logToConsole(type, msg, detail, sql) {
+      if (typeof logConsole === 'function') logConsole(type, msg, detail, sql);
+    }
+    // ログ表示用にSQLを1行へ畳んで長さを制限する
+    function sqlSummary(sql) {
+      const one = String(sql).replace(/\s+/g, ' ').trim();
+      return one.length > 120 ? one.slice(0, 117) + '...' : one;
+    }
+
     function runQuery() {
       const sql = els.query.value.trim();
       if (!sql) return;
 
       if (sql.toLowerCase() === 'runtest') {
+          logToConsole('info', 'runtest — テストスイートを実行');
           runTestSuite();
           return;
       }
@@ -28,13 +40,14 @@
                   + `</div>`;
               document.getElementById('exportCsvBtn').disabled = true;
               document.getElementById('exportJsonBtn').disabled = true;
+              logToConsole('error', `Script: ${script.succeeded}/${script.total} 文成功`, `${errors.length} 件のエラー: ${errors[0] ? errors[0].error : ''}`, sql);
           } else if (lastData) {
               currentResultData = lastData.data;
               renderDisplay(true);
               const isObservation = lastData.data.length > 0 && !lastData.data[0].Result;
               document.getElementById('exportCsvBtn').disabled = !isObservation;
               document.getElementById('exportJsonBtn').disabled = !isObservation;
-              showToast(`${script.succeeded} / ${script.total} 文を実行しました。`);
+              showToast(`${script.succeeded} / ${script.total} 文を実行しました（最終結果 ${lastData.data.length.toLocaleString()} 件）。`);
           } else {
               els.resArea.innerHTML = `<div class="m-auto text-gray-400 text-sm">${script.succeeded} / ${script.total} statements executed.</div>`;
               showToast(`${script.succeeded} / ${script.total} 文を実行しました。`);
@@ -50,9 +63,16 @@
       if (res.error) {
         // XSS対策: エラーメッセージにはユーザー入力由来の値が含まれるためエスケープする
         els.resArea.innerHTML = `<div class="m-auto text-red-600 text-sm font-mono font-medium">${escapeHtml(res.error)}</div>`;
+        logToConsole('error', sqlSummary(sql), res.error, sql);
       } else {
         els.mTime.textContent = `${res.executionTime} ms`;
         els.mRows.textContent = res.scannedRows.toLocaleString();
+        // 結果セット(SELECT等)は取得件数、DML/DDLは処理行数を表示する
+        const isResultSet = Array.isArray(res.data) && (res.data.length === 0 || !res.data[0].Result);
+        const detail = isResultSet
+            ? `${res.data.length.toLocaleString()} 件取得 · ${res.executionTime} ms`
+            : `${(res.scannedRows || 0).toLocaleString()} 行処理 · ${res.executionTime} ms`;
+        logToConsole('query', sqlSummary(sql), detail, sql);
 
         currentResultData = res.data;
         renderDisplay(true);

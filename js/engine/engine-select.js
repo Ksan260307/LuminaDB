@@ -44,7 +44,19 @@
           }
           let argFunc = null, argFunc2 = null, argFuncs = null;
           if (argExpr && argExpr !== '*') {
-              if (func === 'STRING_AGG') {
+              if (func === 'LISTAGG') {
+                  // Oracle LISTAGG(expr [, 'sep']): GROUP_CONCAT の別名（WITHIN GROUP は非対応、既定はカンマ）
+                  const pp = this.splitSelectClause(argExpr);
+                  if (pp.length < 1 || pp.length > 2) throw new Error("LISTAGG requires 1 or 2 arguments (expr [, separator]).");
+                  argFunc = this.compileCondition(pp[0], strMap);
+                  if (pp.length === 2) {
+                      const sepTok = pp[1].trim().match(/^__STR_(\d+)__$/);
+                      separator = sepTok
+                          ? this._unquoteLiteral(strMap[Number(sepTok[1])])
+                          : String(this.compileCondition(pp[1], strMap)({}, {}, {}));
+                  }
+                  func = 'GROUP_CONCAT';
+              } else if (func === 'STRING_AGG') {
                   // STRING_AGG(expr, 'sep'): 区切り文字を第2引数で受ける GROUP_CONCAT の別名
                   const pp = this.splitSelectClause(argExpr);
                   if (pp.length !== 2) throw new Error("STRING_AGG requires exactly 2 arguments (expr, separator).");
@@ -93,7 +105,7 @@
       // HAVING COUNT(*) > 1 / ORDER BY SUM(x) DESC のような直接集計参照を可能にする
       _rewriteAggCalls(str, compiledSelects, strMap, prefix) {
           // 引数は2段の括弧ネストまで対応（HAVING SUM(ROUND(ABS(x), 2)) 等）
-          return str.replace(/\b(COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|ANY_VALUE|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG)\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))*)\)/gi, (m, fn, arg) => {
+          return str.replace(/\b(COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|ANY_VALUE|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG)\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))*)\)/gi, (m, fn, arg) => {
               const alias = `${prefix}${compiledSelects.length}`;
               compiledSelects.push(this._compileAggSelect(fn.toUpperCase(), arg, strMap, alias));
               return ` ${alias} `;
@@ -579,8 +591,8 @@
                   return { type: 'window', wfId, alias };
               }
 
-              if (/^(COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|ANY_VALUE|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG)\(/i.test(expr)) {
-                  let m = expr.match(/^(COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|ANY_VALUE|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG)\(\s*([\s\S]*?)\s*\)$/i);
+              if (/^(COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|ANY_VALUE|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG)\(/i.test(expr)) {
+                  let m = expr.match(/^(COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|ANY_VALUE|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG)\(\s*([\s\S]*?)\s*\)$/i);
                   return this._compileAggSelect(m ? m[1].toUpperCase() : 'COUNT', m ? m[2] : '', strMap, alias, filterExpr);
               }
               if (filterExpr) throw new Error("FILTER (WHERE ...) is only supported on aggregate functions.");

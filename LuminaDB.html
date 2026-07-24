@@ -179,11 +179,18 @@
         <h2 class="text-lg font-bold text-gray-800">Command Reference</h2>
         <button class="closeModalBtn text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">✕</button>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex items-center gap-2 flex-wrap">
         <label class="text-sm text-gray-600 font-medium">Target Table:</label>
         <select id="helpTableSelect" class="bg-gray-50 border border-gray-300 text-gray-800 text-sm rounded px-3 py-1.5 focus:border-blue-500 outline-none cursor-pointer"></select>
+        <span id="helpSearchCount" class="text-xs text-gray-400 ml-auto"></span>
       </div>
-      <div class="overflow-y-auto pr-2 mt-2 space-y-5" id="helpContent"></div>
+      <div class="relative">
+        <svg class="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+        <input id="helpSearchInput" type="text" autocomplete="off" placeholder="コマンドを検索 (例: JOIN, DATE, INSERT, JSON)" class="w-full bg-gray-50 border border-gray-300 text-gray-800 text-sm rounded pl-9 pr-9 py-2 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none">
+        <button id="helpSearchClear" title="クリア" class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-sm px-1.5 rounded hover:bg-gray-100 leading-none">✕</button>
+      </div>
+      <div id="helpNoResults" class="hidden text-sm text-gray-400 text-center py-10">一致するコマンドがありません。</div>
+      <div class="overflow-y-auto pr-2 mt-1 space-y-5" id="helpContent"></div>
     </div>
   </div>
 
@@ -262,28 +269,53 @@
     </div>
   </div>
 
+  <!-- ============================================================================ -->
+  <!-- コンソール: 画面左下の実行ログ（表示/非表示をトグル可能） -->
+  <!-- ============================================================================ -->
+  <button id="consoleLauncher" class="fixed bottom-4 left-4 z-40 hidden inline-flex items-center gap-2 bg-gray-800 hover:bg-gray-700 text-gray-100 text-xs font-medium pl-3 pr-2.5 py-2 rounded-full shadow-lg border border-gray-700 transition-colors" title="コンソールを開く (Ctrl+`)">
+    <svg class="w-4 h-4 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M4 5h16a1 1 0 011 1v12a1 1 0 01-1 1H4a1 1 0 01-1-1V6a1 1 0 011-1z"></path></svg>
+    Console
+    <span id="consoleBadge" class="bg-gray-700 text-gray-300 text-[10px] px-1.5 py-0.5 rounded-full min-w-[1.25rem] text-center">0</span>
+  </button>
+
+  <div id="consolePanel" class="fixed bottom-4 left-4 z-50 hidden flex flex-col w-[420px] max-w-[calc(100vw-2rem)] h-[45vh] bg-gray-900 border border-gray-700 rounded-lg shadow-2xl overflow-hidden">
+    <div class="flex items-center justify-between px-3 py-2 bg-gray-800 border-b border-gray-700 shrink-0">
+      <div class="flex items-center gap-2 text-gray-200 text-xs font-semibold">
+        <svg class="w-4 h-4 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M4 5h16a1 1 0 011 1v12a1 1 0 01-1 1H4a1 1 0 01-1-1V6a1 1 0 011-1z"></path></svg>
+        Console <span class="text-gray-500 font-normal">(<span id="consoleCount">0</span>)</span>
+      </div>
+      <div class="flex items-center gap-1">
+        <button id="consoleCopyBtn" class="text-gray-400 hover:text-gray-100 text-[11px] px-2 py-1 rounded hover:bg-gray-700 transition-colors" title="ログをコピー">Copy</button>
+        <button id="consoleClearBtn" class="text-gray-400 hover:text-gray-100 text-[11px] px-2 py-1 rounded hover:bg-gray-700 transition-colors">Clear</button>
+        <button id="consoleCloseBtn" class="text-gray-400 hover:text-gray-100 px-2 py-1 rounded hover:bg-gray-700 transition-colors leading-none text-sm" title="閉じる (Ctrl+`)">✕</button>
+      </div>
+    </div>
+    <div id="consoleBody" class="flex-1 overflow-y-auto p-3 font-mono text-xs text-gray-300 space-y-0.5"></div>
+  </div>
+
   <!-- Engine: テーブル構造とSQLエンジン (engine-core が本体、他は prototype 拡張) -->
   <script src="js/engine/table.js?v=7"></script>
-  <script src="js/engine/engine-core.js?v=8"></script>
-  <script src="js/engine/engine-expression.js?v=11"></script>
+  <script src="js/engine/engine-core.js?v=11"></script>
+  <script src="js/engine/engine-expression.js?v=13"></script>
   <script src="js/engine/engine-subquery.js?v=8"></script>
-  <script src="js/engine/engine-select.js?v=10"></script>
+  <script src="js/engine/engine-select.js?v=11"></script>
   <script src="js/engine/engine-dml.js?v=11"></script>
-  <script src="js/engine/engine-ddl.js?v=11"></script>
+  <script src="js/engine/engine-ddl.js?v=13"></script>
   <script src="js/engine/engine-transaction.js?v=8"></script>
   <script src="js/engine/engine-io.js?v=9"></script>
   <!-- Storage: IndexedDB 永続化 -->
   <script src="js/storage/idb.js"></script>
   <!-- UI: state を先頭に、描画系 → 入出力系の順で読み込む -->
   <script src="js/ui/state.js"></script>
-  <script src="js/ui/editor.js?v=5"></script>
-  <script src="js/ui/help.js?v=9"></script>
+  <script src="js/ui/editor.js?v=7"></script>
+  <script src="js/ui/help.js?v=12"></script>
   <script src="js/ui/modals.js"></script>
-  <script src="js/ui/schema-editor.js?v=2"></script>
+  <script src="js/ui/schema-editor.js?v=3"></script>
   <script src="js/ui/results.js?v=2"></script>
   <script src="js/ui/table-tree.js?v=2"></script>
   <script src="js/ui/data-io.js?v=3"></script>
-  <script src="js/ui/query-runner.js?v=3"></script>
+  <script src="js/ui/query-runner.js?v=5"></script>
+  <script src="js/ui/console.js?v=2"></script>
   <!-- API: 外部クエリ受付 (fetch インターセプト / window.LuminaDB / postMessage) -->
   <script src="js/api/api.js?v=7"></script>
   <!-- Tests & Bootstrap -->
@@ -297,7 +329,10 @@
   <script src="js/tests/test-suite-v6.js?v=2"></script>
   <script src="js/tests/test-suite-v7.js?v=2"></script>
   <script src="js/tests/test-suite-v8.js?v=1"></script>
-  <script src="js/tests/test-suite.js?v=11"></script>
+  <script src="js/tests/test-suite-v9.js?v=1"></script>
+  <script src="js/tests/test-suite-v10.js?v=2"></script>
+  <script src="js/tests/test-suite-v11.js?v=1"></script>
+  <script src="js/tests/test-suite.js?v=14"></script>
   <script src="js/main.js"></script>
 </body>
 </html>

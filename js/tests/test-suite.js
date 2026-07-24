@@ -2297,6 +2297,27 @@
         // ============================================================
         ...getV8Tests(),
 
+        // ============================================================
+        // v1.8 機能テスト群（Command Reference 検索 / Table Editor 制約編集 /
+        // 「編集 ⇔ 実装コマンド(生成DDL)」整合性）
+        // 定義は js/tests/test-suite-v9.js の getV9Tests()
+        // ============================================================
+        ...getV9Tests(),
+
+        // ============================================================
+        // v1.9 機能テスト群（商用DB頻用のスカラー関数: DECODE/NVL2/CHOOSE/
+        // STARTS_WITH/CHARINDEX/STUFF/GCD/LCM/WIDTH_BUCKET/ADD_MONTHS/DATE_PART ほか）
+        // 定義は js/tests/test-suite-v10.js の getV10Tests()
+        // ============================================================
+        ...getV10Tests(),
+
+        // ============================================================
+        // v1.10 機能テスト群（追加の商用スカラー関数 / LISTAGG /
+        // コンソールの結果件数表示・クリック再読込）
+        // 定義は js/tests/test-suite-v11.js の getV11Tests()
+        // ============================================================
+        ...getV11Tests(),
+
         // Cleanup (New Features)
         { name: "Drop View Stats", sql: "DROP VIEW v_stats", check: r => true },
         { name: "Drop View Seniors", sql: "DROP VIEW v_seniors", check: r => true },

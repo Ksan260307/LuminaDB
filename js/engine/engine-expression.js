@@ -1033,8 +1033,191 @@
                   : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16); });
               const __version = () => 'LuminaDB ' + (typeof LUMINA_VERSION !== 'undefined' ? LUMINA_VERSION : '1.1.0');
               const __database = () => 'lumina';
-              
-        return { __sha1, __octet_length, __bit_length, __unhex, __date_trunc, __typeof, __regexp_count, __nextval, __currval, __setval, __colSuggest, __resolve, __like, __upper, __lower, __length, __round, __coalesce, __substring, __concat, __concat_ws, __substring_index, __locate, __truncate, __regexp, __replace, __trim, __abs, __ceil, __floor, __now, __lpad, __rpad, __power, __sqrt, __date_parse, __year, __month, __day, __hour, __minute, __second, __datediff, __interval, __add_interval, __date_add, __date_sub, __curdate, __dayofweek, __dayofyear, __quarter, __last_day, __ltrim, __rtrim, __ascii, __char, __sin, __cos, __tan, __sinh, __asin, __acos, __atan, __atan2, __degrees, __radians, __ln, __cbrt, __ifnull, __nullif, __if, __left, __right, __instr, __reverse, __repeat, __greatest, __least, __exp, __log, __log10, __pi, __cast, __mod, __sign, __rand, __date, __log2, __cot, __format, __hex, __bin, __oct, __conv, __space, __strcmp, __elt, __field, __initcap, __MONTH_NAMES, __DAY_NAMES, __monthname, __dayname, __weekday, __week, __weekofyear, __unix_timestamp, __from_unixtime, __date_format, __extract, __timestampdiff, __json_parse, __json_path, __json_get, __json_extract, __json_array, __json_object, __json_length, __json_keys, __json_valid, __json_type, __json_contains_deep, __json_contains, __json_set, __json_remove, __regexp_guard, __regexp_replace, __regexp_substr, __regexp_like, __split_part, __quote, __bit_count, __sec_to_time, __time_to_sec, __makedate, __str_to_date, __time, __trim_dir, __utf8_bytes, __md5, __crc32, __B64_ALPHA, __to_base64, __from_base64, __inet_aton, __inet_ntoa, __soundex, __translate, __str_insert, __cosh, __tanh, __to_days, __from_days, __maketime, __curtime, __format_bytes, __timestampadd, __json_pretty, __json_quote, __json_unquote, __json_depth, __json_array_append, __json_merge_patch, __corr_run, __corr_exists, __corr_scalar, __corr_in, __uuid, __version, __database };
+
+              // --- v1.8 追加関数群: 商用DB(Oracle / SQL Server / PostgreSQL)で頻用のスカラー関数 ---
+              // 条件・NULL処理
+              const __decode = (...args) => {
+                  // Oracle DECODE(expr, s1, r1, [s2, r2, ...], [default])。NULL 同士も一致とみなす
+                  if (args.length < 3) return null;
+                  const expr = args[0];
+                  let i = 1;
+                  for (; i + 1 < args.length; i += 2) {
+                      if (expr === args[i] || ((expr === null || expr === undefined) && (args[i] === null || args[i] === undefined))) return args[i + 1];
+                  }
+                  return i < args.length ? args[i] : null; // 余った末尾1個が既定値
+              };
+              const __nvl2 = (a, b, c) => (a !== null && a !== undefined) ? b : c;
+              const __zeroifnull = (x) => (x === null || x === undefined) ? 0 : x;
+              const __nullifzero = (x) => (x !== null && x !== undefined && Number(x) === 0) ? null : x;
+              const __choose = (idx, ...vals) => { const i = Math.trunc(Number(idx)); return (i >= 1 && i <= vals.length) ? vals[i - 1] : null; };
+              // 文字列
+              const __starts_with = (s, p) => (s == null || p == null) ? null : String(s).startsWith(String(p));
+              const __ends_with = (s, p) => (s == null || p == null) ? null : String(s).endsWith(String(p));
+              const __charindex = (sub, s, start) => {
+                  // SQL Server CHARINDEX(substr, str [, start])。1始まり、無ければ0
+                  if (sub == null || s == null) return null;
+                  const from = start != null ? Math.max(0, Math.trunc(Number(start)) - 1) : 0;
+                  return String(s).indexOf(String(sub), from) + 1;
+              };
+              const __len = (s) => s != null ? String(s).replace(/ +$/, '').length : null; // SQL Server: 末尾空白は数えない
+              const __stuff = (s, start, len, ins) => {
+                  // SQL Server STUFF: start(1始まり)からlen文字を削除しinsを挿入
+                  if (s == null || start == null || len == null) return null;
+                  const str = String(s), st = Math.trunc(Number(start)), l = Math.trunc(Number(len));
+                  if (st < 1 || st > str.length || l < 0) return null;
+                  return str.slice(0, st - 1) + (ins != null ? String(ins) : '') + str.slice(st - 1 + l);
+              };
+              const __regexp_instr = (s, pat) => {
+                  if (s == null || pat == null) return null;
+                  __regexp_guard(pat);
+                  try { const m = String(s).match(new RegExp(String(pat))); return m ? m.index + 1 : 0; } catch (e) { return null; }
+              };
+              // 数値
+              const __square = (x) => x != null ? Number(x) * Number(x) : null;
+              const __gcd = (a, b) => {
+                  if (a == null || b == null) return null;
+                  let x = Math.abs(Math.trunc(Number(a))), y = Math.abs(Math.trunc(Number(b)));
+                  while (y) { const t = y; y = x % y; x = t; }
+                  return x;
+              };
+              const __lcm = (a, b) => {
+                  if (a == null || b == null) return null;
+                  const x = Math.abs(Math.trunc(Number(a))), y = Math.abs(Math.trunc(Number(b)));
+                  if (x === 0 || y === 0) return 0;
+                  return x / __gcd(x, y) * y;
+              };
+              const __factorial = (n) => {
+                  if (n == null) return null;
+                  n = Math.trunc(Number(n));
+                  if (n < 0) return null;
+                  let r = 1; for (let i = 2; i <= n; i++) r *= i;
+                  return r;
+              };
+              const __width_bucket = (v, lo, hi, cnt) => {
+                  // Oracle / PostgreSQL WIDTH_BUCKET。範囲外は 0 または cnt+1
+                  if (v == null || lo == null || hi == null || cnt == null) return null;
+                  v = Number(v); lo = Number(lo); hi = Number(hi); cnt = Math.trunc(Number(cnt));
+                  if (cnt <= 0 || lo === hi) return null;
+                  if (lo < hi) {
+                      if (v < lo) return 0;
+                      if (v >= hi) return cnt + 1;
+                      return Math.floor((v - lo) / (hi - lo) * cnt) + 1;
+                  }
+                  if (v > lo) return 0;
+                  if (v <= hi) return cnt + 1;
+                  return Math.floor((lo - v) / (lo - hi) * cnt) + 1;
+              };
+              // 日付（Oracle系）
+              const __add_months = (v, n) => {
+                  if (v == null || n == null) return null;
+                  const d = __date_parse(v);
+                  if (isNaN(d.getTime())) return null;
+                  const day = d.getUTCDate();
+                  const r = new Date(d.getTime());
+                  r.setUTCDate(1);
+                  r.setUTCMonth(r.getUTCMonth() + Math.trunc(Number(n)));
+                  const dim = new Date(Date.UTC(r.getUTCFullYear(), r.getUTCMonth() + 1, 0)).getUTCDate();
+                  r.setUTCDate(Math.min(day, dim)); // 月末を超える日付は月末へ丸める
+                  return r.toISOString().replace('T', ' ').slice(0, 19);
+              };
+              const __months_between = (a, b) => {
+                  if (a == null || b == null) return null;
+                  const d1 = __date_parse(a), d2 = __date_parse(b);
+                  if (isNaN(d1.getTime()) || isNaN(d2.getTime())) return null;
+                  const months = (d1.getUTCFullYear() - d2.getUTCFullYear()) * 12 + (d1.getUTCMonth() - d2.getUTCMonth());
+                  return months + (d1.getUTCDate() - d2.getUTCDate()) / 31; // Oracle は端数を /31
+              };
+              const __date_part = (unit, v) => {
+                  // PostgreSQL DATE_PART('unit', ts)
+                  if (unit == null || v == null) return null;
+                  const u = String(unit).toUpperCase();
+                  if (u === 'DOW') return __dayofweek(v) - 1; // 0=日曜
+                  if (u === 'DOY') return __dayofyear(v);
+                  if (u === 'EPOCH') return Math.trunc(__date_parse(v).getTime() / 1000);
+                  return __extract(u, v);
+              };
+
+              // --- v1.9 追加関数群: さらに商用DB(Oracle / SQL Server / PostgreSQL / Snowflake)頻用 ---
+              const __quotename = (s, q) => {
+                  // SQL Server QUOTENAME。既定は角括弧で囲む。第2引数で区切り文字を指定可
+                  if (s == null) return null;
+                  const str = String(s);
+                  const d = q != null ? String(q) : '[';
+                  if (d === '[' || d === ']') return '[' + str.replace(/]/g, ']]') + ']';
+                  if (d === '"') return '"' + str.replace(/"/g, '""') + '"';
+                  if (d === "'") return "'" + str.replace(/'/g, "''") + "'";
+                  if (d === '(' || d === ')') return '(' + str + ')';
+                  return d + str + d;
+              };
+              const __patindex = (pat, s) => {
+                  // SQL Server PATINDEX: LIKE パターン(% _ [])の最初の一致位置(1始まり、無ければ0)。
+                  // 先頭 % は「任意位置検索」、末尾 % は「末尾以降は任意」を意味するため位置計算から除外する。
+                  // 先頭 % が無い場合は文字列先頭にアンカーする。
+                  if (pat == null || s == null) return null;
+                  let p = String(pat);
+                  let anchored = true;
+                  if (p.startsWith('%')) { anchored = false; p = p.slice(1); }
+                  if (p.endsWith('%')) p = p.slice(0, -1);
+                  let re = anchored ? '^' : '';
+                  for (let i = 0; i < p.length; i++) {
+                      const c = p[i];
+                      if (c === '%') re += '[\\s\\S]*';
+                      else if (c === '_') re += '[\\s\\S]';
+                      else if (c === '[') { let cls = '['; i++; while (i < p.length && p[i] !== ']') { cls += p[i]; i++; } cls += ']'; re += cls; }
+                      else re += c.replace(/[.*+?^${}()|\\]/g, '\\$&');
+                  }
+                  try { const m = String(s).match(new RegExp(re)); return m ? m.index + 1 : 0; } catch (e) { return null; }
+              };
+              const __bitand = (a, b) => (a == null || b == null) ? null : (Math.trunc(Number(a)) & Math.trunc(Number(b)));
+              const __bitor = (a, b) => (a == null || b == null) ? null : (Math.trunc(Number(a)) | Math.trunc(Number(b)));
+              const __bitxor = (a, b) => (a == null || b == null) ? null : (Math.trunc(Number(a)) ^ Math.trunc(Number(b)));
+              const __bitnot = (a) => (a == null) ? null : (~Math.trunc(Number(a)));
+              const __isnumeric = (x) => {
+                  // SQL Server ISNUMERIC: 数値変換可能なら1、不可なら0
+                  if (x == null) return 0;
+                  if (typeof x === 'number') return isFinite(x) ? 1 : 0;
+                  if (typeof x === 'boolean') return 1;
+                  const s = String(x).trim();
+                  return (s !== '' && !isNaN(Number(s))) ? 1 : 0;
+              };
+              const __eomonth = (v, n) => {
+                  // SQL Server EOMONTH(date [, month_offset]): 当月(±offset月)の月末日
+                  if (v == null) return null;
+                  const base = (n != null) ? __add_months(v, n) : v;
+                  if (base == null) return null;
+                  return __last_day(base);
+              };
+              const __make_date = (y, mo, d) => {
+                  // PostgreSQL MAKE_DATE(year, month, day)
+                  if (y == null || mo == null || d == null) return null;
+                  const dt = new Date(Date.UTC(Math.trunc(Number(y)), Math.trunc(Number(mo)) - 1, Math.trunc(Number(d))));
+                  return isNaN(dt.getTime()) ? null : dt.toISOString().slice(0, 10);
+              };
+              const __make_timestamp = (y, mo, d, h, mi, se) => {
+                  if (y == null || mo == null || d == null || h == null || mi == null || se == null) return null;
+                  const dt = new Date(Date.UTC(Math.trunc(Number(y)), Math.trunc(Number(mo)) - 1, Math.trunc(Number(d)), Math.trunc(Number(h)), Math.trunc(Number(mi)), Math.trunc(Number(se))));
+                  return isNaN(dt.getTime()) ? null : dt.toISOString().replace('T', ' ').slice(0, 19);
+              };
+              const __to_number = (s) => {
+                  // Oracle/PostgreSQL TO_NUMBER: 数値へ変換（カンマ区切りは除去）。不可なら null
+                  if (s == null) return null;
+                  if (typeof s === 'number') return s;
+                  const n = Number(String(s).replace(/,/g, '').trim());
+                  return isNaN(n) ? null : n;
+              };
+              const __to_date = (s) => {
+                  if (s == null) return null;
+                  const d = __date_parse(s);
+                  return (d && !isNaN(d.getTime())) ? d.toISOString().slice(0, 10) : null;
+              };
+              const __to_timestamp = (s) => {
+                  if (s == null) return null;
+                  const d = __date_parse(s);
+                  return (d && !isNaN(d.getTime())) ? d.toISOString().replace('T', ' ').slice(0, 19) : null;
+              };
+
+        return { __quotename, __patindex, __bitand, __bitor, __bitxor, __bitnot, __isnumeric, __eomonth, __make_date, __make_timestamp, __to_number, __to_date, __to_timestamp,
+                 __decode, __nvl2, __zeroifnull, __nullifzero, __choose, __starts_with, __ends_with, __charindex, __len, __stuff, __regexp_instr, __square, __gcd, __lcm, __factorial, __width_bucket, __add_months, __months_between, __date_part, __sha1, __octet_length, __bit_length, __unhex, __date_trunc, __typeof, __regexp_count, __nextval, __currval, __setval, __colSuggest, __resolve, __like, __upper, __lower, __length, __round, __coalesce, __substring, __concat, __concat_ws, __substring_index, __locate, __truncate, __regexp, __replace, __trim, __abs, __ceil, __floor, __now, __lpad, __rpad, __power, __sqrt, __date_parse, __year, __month, __day, __hour, __minute, __second, __datediff, __interval, __add_interval, __date_add, __date_sub, __curdate, __dayofweek, __dayofyear, __quarter, __last_day, __ltrim, __rtrim, __ascii, __char, __sin, __cos, __tan, __sinh, __asin, __acos, __atan, __atan2, __degrees, __radians, __ln, __cbrt, __ifnull, __nullif, __if, __left, __right, __instr, __reverse, __repeat, __greatest, __least, __exp, __log, __log10, __pi, __cast, __mod, __sign, __rand, __date, __log2, __cot, __format, __hex, __bin, __oct, __conv, __space, __strcmp, __elt, __field, __initcap, __MONTH_NAMES, __DAY_NAMES, __monthname, __dayname, __weekday, __week, __weekofyear, __unix_timestamp, __from_unixtime, __date_format, __extract, __timestampdiff, __json_parse, __json_path, __json_get, __json_extract, __json_array, __json_object, __json_length, __json_keys, __json_valid, __json_type, __json_contains_deep, __json_contains, __json_set, __json_remove, __regexp_guard, __regexp_replace, __regexp_substr, __regexp_like, __split_part, __quote, __bit_count, __sec_to_time, __time_to_sec, __makedate, __str_to_date, __time, __trim_dir, __utf8_bytes, __md5, __crc32, __B64_ALPHA, __to_base64, __from_base64, __inet_aton, __inet_ntoa, __soundex, __translate, __str_insert, __cosh, __tanh, __to_days, __from_days, __maketime, __curtime, __format_bytes, __timestampadd, __json_pretty, __json_quote, __json_unquote, __json_depth, __json_array_append, __json_merge_patch, __corr_run, __corr_exists, __corr_scalar, __corr_in, __uuid, __version, __database };
     })();
     // コンパイル済み関数の先頭でヘルパーを一括束縛する分割代入文
     const __EXPR_PRELUDE = 'const { ' + Object.keys(__EXPR_LIB).join(', ') + ' } = __L;';
@@ -1386,6 +1569,47 @@
           s = s.replace(/\bNEXTVAL\s*\(/gi, '__nextval(dbTables, ');
           s = s.replace(/\bCURRVAL\s*\(/gi, '__currval(dbTables, ');
           s = s.replace(/\bSETVAL\s*\(/gi, '__setval(dbTables, ');
+          // v1.8 追加関数: 商用DB(Oracle / SQL Server / PostgreSQL)頻用のスカラー関数と別名
+          s = s.replace(/\bDECODE\(/gi, '__decode(');
+          s = s.replace(/\bNVL2\(/gi, '__nvl2(');
+          s = s.replace(/\bZEROIFNULL\(/gi, '__zeroifnull(');
+          s = s.replace(/\bNULLIFZERO\(/gi, '__nullifzero(');
+          s = s.replace(/\bCHOOSE\(/gi, '__choose(');
+          s = s.replace(/\bISNULL\(/gi, '__ifnull(');
+          s = s.replace(/\bSTARTS_WITH\(/gi, '__starts_with(');
+          s = s.replace(/\bENDS_WITH\(/gi, '__ends_with(');
+          s = s.replace(/\bCHARINDEX\(/gi, '__charindex(');
+          s = s.replace(/\bLEN\(/gi, '__len(');
+          s = s.replace(/\bSTUFF\(/gi, '__stuff(');
+          s = s.replace(/\bREGEXP_INSTR\(/gi, '__regexp_instr(');
+          s = s.replace(/\bSQUARE\(/gi, '__square(');
+          s = s.replace(/\bPOW\(/gi, '__power(');
+          s = s.replace(/\bGCD\(/gi, '__gcd(');
+          s = s.replace(/\bLCM\(/gi, '__lcm(');
+          s = s.replace(/\bFACTORIAL\(/gi, '__factorial(');
+          s = s.replace(/\bWIDTH_BUCKET\(/gi, '__width_bucket(');
+          s = s.replace(/\bADD_MONTHS\(/gi, '__add_months(');
+          s = s.replace(/\bMONTHS_BETWEEN\(/gi, '__months_between(');
+          s = s.replace(/\bDATE_PART\(/gi, '__date_part(');
+          s = s.replace(/\bGETDATE\(\)/gi, '__now()');
+          s = s.replace(/\bSYSTIMESTAMP\b(?:\(\))?/gi, '__now()');
+          // v1.9 追加関数: 変換 / 文字列 / ビット演算 / 日付ビルダー
+          s = s.replace(/\bQUOTENAME\(/gi, '__quotename(');
+          s = s.replace(/\bPATINDEX\(/gi, '__patindex(');
+          s = s.replace(/\bBITAND\(/gi, '__bitand(');
+          s = s.replace(/\bBITOR\(/gi, '__bitor(');
+          s = s.replace(/\bBITXOR\(/gi, '__bitxor(');
+          s = s.replace(/\bBITNOT\(/gi, '__bitnot(');
+          s = s.replace(/\bISNUMERIC\(/gi, '__isnumeric(');
+          s = s.replace(/\bEOMONTH\(/gi, '__eomonth(');
+          s = s.replace(/\bMAKE_DATE\(/gi, '__make_date(');
+          s = s.replace(/\bMAKE_TIMESTAMP\(/gi, '__make_timestamp(');
+          s = s.replace(/\bTO_NUMBER\(/gi, '__to_number(');
+          s = s.replace(/\bTO_TIMESTAMP\(/gi, '__to_timestamp(');
+          s = s.replace(/\bTO_DATE\(/gi, '__to_date(');
+          s = s.replace(/\bCHR\(/gi, '__char(');
+          s = s.replace(/\bSTRPOS\(/gi, '__instr(');
+          s = s.replace(/\bREPLICATE\(/gi, '__repeat(');
           s = s.replace(/\bTRUE\b/gi, 'true');
           s = s.replace(/\bFALSE\b/gi, 'false');
           // 単独の NULL リテラル（大文字含む）を JS の null へ正規化する。
@@ -1401,7 +1625,7 @@
                .replace(/=/g, '===')
                .replace(/__LTE__/g, '<=').replace(/__GTE__/g, '>=').replace(/__NEQ__/g, '!==').replace(/__LT__/g, '<').replace(/__GT__/g, '>');
 
-          const protectedKeywords = ['&&', '||', '!', 'true', 'false', 'null', 'undefined', '__cast', '__like', '__regexp', '__upper', '__lower', '__length', '__round', '__coalesce', '__substring', '__substring_index', '__concat', '__concat_ws', '__locate', '__truncate', '__replace', '__trim', '__abs', '__ceil', '__floor', '__now', '__lpad', '__rpad', '__power', '__sqrt', '__year', '__month', '__day', '__mod', '__sign', '__rand', '__date', '__datediff', '__ifnull', '__nullif', '__if', '__left', '__right', '__instr', '__reverse', '__repeat', '__greatest', '__least', '__exp', '__log', '__log10', '__pi', '__hour', '__minute', '__second', '__ltrim', '__rtrim', '__ascii', '__char', '__sin', '__cos', '__tan', '__sinh', '__asin', '__acos', '__atan', '__atan2', '__degrees', '__radians', '__ln', '__cbrt', '__date_add', '__date_sub', '__dayofweek', '__dayofyear', '__quarter', '__last_day', '__curdate', '__log2', '__cot', '__format', '__hex', '__bin', '__oct', '__conv', '__space', '__strcmp', '__elt', '__field', '__initcap', '__monthname', '__dayname', '__week', '__weekday', '__weekofyear', '__unix_timestamp', '__from_unixtime', '__date_format', '__extract', '__timestampdiff', '__interval', '__json_extract', '__json_array', '__json_object', '__json_length', '__json_keys', '__json_valid', '__json_type', '__json_contains', '__json_set', '__json_remove', '__uuid', '__version', '__database', '__regexp_replace', '__regexp_substr', '__regexp_like', '__split_part', '__quote', '__bit_count', '__sec_to_time', '__time_to_sec', '__makedate', '__str_to_date', '__trim_dir', '__corr_exists', '__corr_scalar', '__corr_in', '__time', '__md5', '__crc32', '__to_base64', '__from_base64', '__inet_aton', '__inet_ntoa', '__soundex', '__translate', '__str_insert', '__cosh', '__tanh', '__to_days', '__from_days', '__maketime', '__curtime', '__format_bytes', '__timestampadd', '__json_pretty', '__json_quote', '__json_unquote', '__json_array_append', '__json_merge_patch', '__json_depth', '__sha1', '__octet_length', '__bit_length', '__unhex', '__date_trunc', '__typeof', '__regexp_count', '__nextval', '__currval', '__setval', '__resolve', 'ptrs', 'dbTables', 'aliases', 'includes', 'Math', 'Date'];
+          const protectedKeywords = ['&&', '||', '!', 'true', 'false', 'null', 'undefined', '__cast', '__like', '__regexp', '__upper', '__lower', '__length', '__round', '__coalesce', '__substring', '__substring_index', '__concat', '__concat_ws', '__locate', '__truncate', '__replace', '__trim', '__abs', '__ceil', '__floor', '__now', '__lpad', '__rpad', '__power', '__sqrt', '__year', '__month', '__day', '__mod', '__sign', '__rand', '__date', '__datediff', '__ifnull', '__nullif', '__if', '__left', '__right', '__instr', '__reverse', '__repeat', '__greatest', '__least', '__exp', '__log', '__log10', '__pi', '__hour', '__minute', '__second', '__ltrim', '__rtrim', '__ascii', '__char', '__sin', '__cos', '__tan', '__sinh', '__asin', '__acos', '__atan', '__atan2', '__degrees', '__radians', '__ln', '__cbrt', '__date_add', '__date_sub', '__dayofweek', '__dayofyear', '__quarter', '__last_day', '__curdate', '__log2', '__cot', '__format', '__hex', '__bin', '__oct', '__conv', '__space', '__strcmp', '__elt', '__field', '__initcap', '__monthname', '__dayname', '__week', '__weekday', '__weekofyear', '__unix_timestamp', '__from_unixtime', '__date_format', '__extract', '__timestampdiff', '__interval', '__json_extract', '__json_array', '__json_object', '__json_length', '__json_keys', '__json_valid', '__json_type', '__json_contains', '__json_set', '__json_remove', '__uuid', '__version', '__database', '__regexp_replace', '__regexp_substr', '__regexp_like', '__split_part', '__quote', '__bit_count', '__sec_to_time', '__time_to_sec', '__makedate', '__str_to_date', '__trim_dir', '__corr_exists', '__corr_scalar', '__corr_in', '__time', '__md5', '__crc32', '__to_base64', '__from_base64', '__inet_aton', '__inet_ntoa', '__soundex', '__translate', '__str_insert', '__cosh', '__tanh', '__to_days', '__from_days', '__maketime', '__curtime', '__format_bytes', '__timestampadd', '__json_pretty', '__json_quote', '__json_unquote', '__json_array_append', '__json_merge_patch', '__json_depth', '__sha1', '__octet_length', '__bit_length', '__unhex', '__date_trunc', '__typeof', '__regexp_count', '__nextval', '__currval', '__setval', '__decode', '__nvl2', '__zeroifnull', '__nullifzero', '__choose', '__starts_with', '__ends_with', '__charindex', '__len', '__stuff', '__regexp_instr', '__square', '__gcd', '__lcm', '__factorial', '__width_bucket', '__add_months', '__months_between', '__date_part', '__quotename', '__patindex', '__bitand', '__bitor', '__bitxor', '__bitnot', '__isnumeric', '__eomonth', '__make_date', '__make_timestamp', '__to_number', '__to_date', '__to_timestamp', '__resolve', 'ptrs', 'dbTables', 'aliases', 'includes', 'Math', 'Date'];
           s = s.replace(/('([^'\\]|\\.)*'|"([^"\\]|\\.)*")|\b([a-zA-Z_][a-zA-Z0-9_.]*)\b/g, (m, stringLit, _1, _2, word) => {
               if (stringLit) return m;
               if (!word) return m;

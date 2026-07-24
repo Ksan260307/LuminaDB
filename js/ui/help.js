@@ -255,6 +255,27 @@
         { name: "Rollback to Savepoint", sql: "ROLLBACK TO SAVEPOINT sp1" },
         { name: "Release Savepoint", sql: "RELEASE SAVEPOINT sp1" }
       ]},
+      { cat: "Commercial SQL (Oracle / SQL Server / PostgreSQL)", cmds: [
+        { name: "Decode (Oracle)", sql: "SELECT id, DECODE(age, 25, 'young', 30, 'mid', 'other') AS grp FROM {table}" },
+        { name: "Nvl2 (Oracle)", sql: "SELECT name, NVL2(name, 'has name', 'no name') AS chk FROM {table}" },
+        { name: "IsNull / ZeroIfNull / NullIfZero", sql: "SELECT ISNULL(NULL, 'N/A'), ZEROIFNULL(NULL), NULLIFZERO(0)" },
+        { name: "Choose (SQL Server)", sql: "SELECT CHOOSE(2, 'gold', 'silver', 'bronze') AS medal" },
+        { name: "Starts With / Ends With", sql: "SELECT name FROM {table} WHERE STARTS_WITH(name, 'A') OR ENDS_WITH(name, 'e')" },
+        { name: "CharIndex / Len / Stuff (SQL Server)", sql: "SELECT CHARINDEX('l', 'hello') AS pos, LEN('abc   ') AS ln, STUFF('abcdef', 2, 3, 'XY') AS s" },
+        { name: "Regexp Instr", sql: "SELECT REGEXP_INSTR('order#123', '[0-9]+') AS pos" },
+        { name: "Square / Pow", sql: "SELECT SQUARE(7) AS sq, POW(2, 10) AS p" },
+        { name: "Gcd / Lcm / Factorial", sql: "SELECT GCD(12, 18) AS g, LCM(4, 6) AS l, FACTORIAL(5) AS f" },
+        { name: "Width Bucket (Histogram)", sql: "SELECT id, age, WIDTH_BUCKET(age, 20, 40, 4) AS bucket FROM {table} ORDER BY age" },
+        { name: "Add Months / Months Between (Oracle)", sql: "SELECT ADD_MONTHS('2026-01-31', 1) AS nx, MONTHS_BETWEEN('2026-03-15', '2026-01-15') AS diff" },
+        { name: "Date Part / GetDate", sql: "SELECT DATE_PART('year', NOW()) AS yr, DATE_PART('dow', NOW()) AS dow, GETDATE() AS now_ts" },
+        { name: "Listagg (Oracle Aggregate)", sql: "SELECT LISTAGG(name, ', ') AS names FROM {table}" },
+        { name: "To Number / To Date / To Timestamp", sql: "SELECT TO_NUMBER('1,234.5') AS n, TO_DATE('2026-07-23 10:00:00') AS d, TO_TIMESTAMP('2026-07-23') AS ts" },
+        { name: "Eomonth / Make Date (Date Builders)", sql: "SELECT EOMONTH('2026-02-10') AS eom, EOMONTH('2026-02-10', 1) AS next_eom, MAKE_DATE(2026, 7, 23) AS md" },
+        { name: "Make Timestamp", sql: "SELECT MAKE_TIMESTAMP(2026, 7, 23, 14, 30, 0) AS ts" },
+        { name: "Bitwise (BITAND / BITOR / BITXOR)", sql: "SELECT BITAND(12, 10) AS a, BITOR(12, 10) AS o, BITXOR(12, 10) AS x, BITNOT(0) AS n" },
+        { name: "IsNumeric / Chr / Strpos", sql: "SELECT ISNUMERIC('123') AS n1, ISNUMERIC('ab') AS n2, CHR(65) AS c, STRPOS('hello', 'll') AS p" },
+        { name: "QuoteName / PatIndex / Replicate", sql: "SELECT QUOTENAME('col name') AS q, PATINDEX('%[0-9]%', 'abc123') AS pos, REPLICATE('ab', 3) AS r" }
+      ]},
       { cat: "External API", cmds: [
         { name: "JS API", sql: "// JSコンソールから: LuminaDB.query('SELECT * FROM users WHERE id = ?', [1])" },
         { name: "JS API (Named Params)", sql: "// LuminaDB.query('SELECT * FROM users WHERE age > :min AND age < @max', { min: 24, max: 31 })" },
@@ -282,27 +303,82 @@
       }
     });
 
+    // 検索フィルタ用: HTMLエスケープ + マッチ部分のハイライト
+    function escapeHtmlHelp(s) {
+      return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    }
+    function highlightHelp(text, term) {
+      const esc = escapeHtmlHelp(text);
+      if (!term) return esc;
+      const re = new RegExp('(' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+      return esc.replace(re, '<mark class="bg-yellow-200 text-inherit rounded-sm px-0.5">$1</mark>');
+    }
+
     function renderHelpCommands() {
       const tbl = document.getElementById('helpTableSelect').value || 'users';
+      const searchEl = document.getElementById('helpSearchInput');
+      const term = searchEl ? searchEl.value.trim() : '';
+      const termLower = term.toLowerCase();
 
-      const createCommandHTML = (cmd) => {
-        const q = cmd.sql.replace(/\{table\}/g, tbl);
-        return `
+      // コマンド名（UI非表示）と展開後SQLの双方を対象に検索する
+      const createCommandHTML = (cmd, q) => `
           <div class="bg-gray-50 p-3 rounded-lg border border-gray-200 flex justify-between items-center hover:border-gray-300 transition-colors">
-            <span class="font-mono text-xs text-blue-600 truncate mr-2 font-medium">${q}</span>
-            <button class="bg-white hover:bg-gray-100 border border-gray-300 text-gray-700 text-[10px] px-3 py-1.5 rounded shadow-sm font-semibold copy-cmd-btn transition-colors" data-query="${q.replace(/"/g, '&quot;')}">Use</button>
+            <span class="font-mono text-xs text-blue-600 truncate mr-2 font-medium" title="${escapeHtmlHelp(cmd.name)}">${highlightHelp(q, term)}</span>
+            <button class="bg-white hover:bg-gray-100 border border-gray-300 text-gray-700 text-[10px] px-3 py-1.5 rounded shadow-sm font-semibold copy-cmd-btn transition-colors whitespace-nowrap" data-query="${q.replace(/"/g, '&quot;')}">Use</button>
           </div>`;
-      };
 
-      const createCategoryHTML = (group) => `
-        <div class="mb-4">
-          <h3 class="text-xs font-bold text-gray-400 uppercase border-b border-gray-100 pb-1 mb-2 tracking-wider">${group.cat}</h3>
-          <div class="space-y-3">
-            ${group.cmds.map(createCommandHTML).join('')}
-          </div>
-        </div>`;
+      let matchCount = 0;
+      const sections = helpData.map(group => {
+        const items = group.cmds
+          .map(cmd => ({ cmd, q: cmd.sql.replace(/\{table\}/g, tbl) }))
+          .filter(({ cmd, q }) => !termLower || cmd.name.toLowerCase().includes(termLower) || q.toLowerCase().includes(termLower));
+        if (items.length === 0) return '';
+        matchCount += items.length;
+        return `
+          <div class="mb-4">
+            <h3 class="text-xs font-bold text-gray-400 uppercase border-b border-gray-100 pb-1 mb-2 tracking-wider">${group.cat} <span class="text-gray-300 font-medium normal-case">(${items.length})</span></h3>
+            <div class="space-y-3">
+              ${items.map(({ cmd, q }) => createCommandHTML(cmd, q)).join('')}
+            </div>
+          </div>`;
+      }).join('');
 
-      document.getElementById('helpContent').innerHTML = helpData.map(createCategoryHTML).join('');
+      document.getElementById('helpContent').innerHTML = sections;
+
+      const noRes = document.getElementById('helpNoResults');
+      if (noRes) noRes.classList.toggle('hidden', matchCount > 0);
+      const countEl = document.getElementById('helpSearchCount');
+      if (countEl) countEl.textContent = term ? `${matchCount} 件ヒット` : '';
+    }
+
+    // 検索ボックスのワイヤリング（入力で絞り込み・Esc/✕でクリア・モーダル表示時に自動フォーカス）
+    const helpSearchInput = document.getElementById('helpSearchInput');
+    if (helpSearchInput) {
+      helpSearchInput.addEventListener('input', renderHelpCommands);
+      helpSearchInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && helpSearchInput.value) {
+          helpSearchInput.value = '';
+          renderHelpCommands();
+          e.stopPropagation();
+        }
+      });
+    }
+    const helpSearchClear = document.getElementById('helpSearchClear');
+    if (helpSearchClear) {
+      helpSearchClear.addEventListener('click', () => {
+        if (!helpSearchInput) return;
+        helpSearchInput.value = '';
+        renderHelpCommands();
+        helpSearchInput.focus();
+      });
+    }
+    const openHelpBtnEl = document.getElementById('openHelpBtn');
+    if (openHelpBtnEl) {
+      openHelpBtnEl.addEventListener('click', () => {
+        if (helpSearchInput) helpSearchInput.value = '';
+        renderHelpCommands();
+        setTimeout(() => { if (helpSearchInput) helpSearchInput.focus(); }, 30);
+      });
     }
 
     document.getElementById('helpTableSelect').addEventListener('change', renderHelpCommands);
