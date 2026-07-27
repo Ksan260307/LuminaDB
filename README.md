@@ -2,9 +2,9 @@
 
 **日本語** | [English](README.en.md)
 
-ブラウザだけで完結する、ビルド不要の in-memory SQL データベースエンジンです。単一の HTML ファイルを開くだけで、本格的な SQL（DQL / DML / DDL）・トランザクション・ウィンドウ関数・トリガー・ビュー・250 以上の組み込み関数を、サーバーなしで実行できます。
+ブラウザだけで完結する、ビルド不要の in-memory SQL データベースエンジンです。単一の HTML ファイルを開くだけで、本格的な SQL（DQL / DML / DDL）・トランザクション・ウィンドウ関数・トリガー・ビュー・`MERGE` / `TOP` / `ON CONFLICT` などの商用 DB コマンド・270 以上の組み込み関数を、サーバーなしで実行できます。
 
-> バージョン: **v1.10.0** / 自己完結テスト **2,145 件**（全パス）
+> バージョン: **v1.13.0** / 自己完結テスト **5,082 件**（全パス）
 
 ---
 
@@ -48,36 +48,51 @@ ORDER BY o.amount DESC;
 
 | 分類 | 対応内容 |
 |------|----------|
-| **DQL** | `SELECT` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY`（序数・式・`NULLS FIRST/LAST`）/ `LIMIT`・`OFFSET`・`FETCH FIRST` / `DISTINCT` |
-| **結合** | `INNER` / `LEFT` / `RIGHT` / `CROSS` / カンマ結合 / `USING` / `NATURAL` |
+| **DQL** | `SELECT` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY`（序数・式・`NULLS FIRST/LAST`）/ `LIMIT`・`OFFSET`・`FETCH FIRST` / `TOP n [PERCENT]`（SQL Server）/ `DISTINCT` |
+| **結合** | `INNER` / `LEFT` / `RIGHT` / **`FULL OUTER`** / `CROSS` / カンマ結合 / `USING` / `NATURAL` / **`CROSS APPLY`・`OUTER APPLY`・`LATERAL`** |
 | **集合演算** | `UNION` / `INTERSECT` / `EXCEPT`（`ALL` 対応） |
-| **サブクエリ** | スカラー / `IN` / `EXISTS` / 相関サブクエリ |
+| **サブクエリ** | スカラー / `IN` / `EXISTS` / 相関サブクエリ / **量化比較 `= ANY`・`> ALL`・`SOME`** |
 | **CTE** | `WITH` / `WITH RECURSIVE`（列リスト対応） |
-| **ウィンドウ関数** | `ROW_NUMBER` / `RANK` / `LAG` / `LEAD` / フレーム指定 / named window（`WINDOW` 句）/ `QUALIFY` |
-| **集計** | 多数の集計関数 / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / `GROUPING()` / `GROUP_CONCAT` |
-| **DML** | `INSERT`（複数行・`SELECT`・`SET`・`DEFAULT`）/ `UPDATE` / `DELETE`（`ORDER BY`・`LIMIT`）/ `REPLACE` / `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE` / `RETURNING` |
-| **DDL** | `CREATE / ALTER / DROP TABLE` / `VIEW` / `INDEX` / `TRIGGER` / `PROCEDURE` / `SEQUENCE` / `CREATE TABLE AS`・`LIKE` / `TEMPORARY` |
-| **制約** | `PRIMARY KEY`（複合可）/ `UNIQUE` / `NOT NULL` / `DEFAULT`（`CURRENT_TIMESTAMP` 含む）/ `CHECK` / `FOREIGN KEY`（`ON DELETE/UPDATE` 参照アクション）/ `AUTO_INCREMENT` / 生成列（`GENERATED ALWAYS AS`） |
+| **ウィンドウ関数** | `ROW_NUMBER` / `RANK` / `LAG` / `LEAD` / フレーム指定（**`ROWS` / `RANGE` / `GROUPS`**）/ named window（`WINDOW` 句）/ `QUALIFY`（**ウィンドウ関数の直書き可**） |
+| **集計** | 多数の集計関数 / **式に内包した集計（`ROUND(AVG(x), 2)`・`100.0 * SUM(a) / SUM(b)`）** / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / **`CUBE`・`GROUPING SETS`** / `GROUPING()` / **`WITHIN GROUP (ORDER BY ...)`** / `GROUP_CONCAT` |
+| **DML** | `INSERT`（複数行・`SELECT`・`SET`・`DEFAULT`）/ `UPDATE` / `DELETE`（`ORDER BY`・`LIMIT`）/ `REPLACE` / `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO NOTHING`・`DO UPDATE`（PostgreSQL・`EXCLUDED`）/ `MERGE INTO ... USING ... WHEN MATCHED/NOT MATCHED`（Oracle/SQL Server）/ `RETURNING` |
+| **DDL** | `CREATE / ALTER / DROP TABLE` / `VIEW` / **`MATERIALIZED VIEW`（`REFRESH` 付き）** / `INDEX` / `TRIGGER` / `PROCEDURE` / `SEQUENCE` / `CREATE TABLE AS`・`LIKE` / **`SELECT ... INTO`** / **`COMMENT ON`** / `TEMPORARY` |
+| **制約** | `PRIMARY KEY`（複合可）/ `UNIQUE` / `NOT NULL` / `DEFAULT`（`CURRENT_TIMESTAMP` 含む）/ `CHECK` / `FOREIGN KEY`（`ON DELETE/UPDATE` 参照アクション）/ `AUTO_INCREMENT` / **識別列（`GENERATED ALWAYS AS IDENTITY`・`IDENTITY(1,1)`）** / 生成列（`GENERATED ALWAYS AS`） |
 | **トランザクション** | `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` |
-| **その他** | プリペアドステートメント（`PREPARE`/`EXECUTE`/`DEALLOCATE`）/ ユーザー変数（`SET @x`）/ `EXPLAIN`・`EXPLAIN ANALYZE` / `VALUES` 文 / `TABLE` 文 / `SHOW *`・`DESCRIBE`・`CHECK TABLE`・`ANALYZE TABLE` |
+| **行変換** | **`PIVOT` / `UNPIVOT`**（縦横変換。`UNPIVOT` は NULL 行を除外） |
+| **NULL 安全比較** | **`IS [NOT] DISTINCT FROM`** / **`<=>`** |
+| **セッション文** | **`SET TRANSACTION ISOLATION LEVEL`** / **`LOCK`・`UNLOCK TABLES`** / **`GRANT`・`REVOKE`** / **`DISCARD`**（スクリプト互換のため受理） |
+| **その他** | プリペアドステートメント（`PREPARE`/`EXECUTE`/`DEALLOCATE`）/ ユーザー変数（`SET @x`）/ `EXPLAIN`・`EXPLAIN ANALYZE` / `VALUES` 文 / `TABLE` 文 / `SHOW *`（**`STORAGE`・`SETTINGS`・`COMMENTS`・`MATERIALIZED VIEWS`** 含む）・`DESCRIBE`・`CHECK TABLE`・`ANALYZE TABLE` |
 
-### 組み込み関数（250 以上）
+### 組み込み関数（270 以上）
 
 文字列・数値・日付/時刻・JSON・正規表現・ハッシュ/エンコード・条件/NULL 処理・集計・ウィンドウ・シーケンス・メタ情報の各カテゴリを網羅。`SHOW FUNCTIONS` で一覧・検索できます。
 
 商用 DB でよく使われる関数も実装しています（一部）:
 
-- **Oracle**: `DECODE` / `NVL` / `NVL2` / `ADD_MONTHS` / `MONTHS_BETWEEN` / `WIDTH_BUCKET` / `INITCAP` / `LISTAGG` / `TO_NUMBER` / `TO_DATE` / `TO_TIMESTAMP` / `BITAND`
-- **SQL Server**: `ISNULL` / `IIF` / `CHOOSE` / `CHARINDEX` / `PATINDEX` / `LEN` / `STUFF` / `QUOTENAME` / `REPLICATE` / `SQUARE` / `GETDATE` / `EOMONTH` / `ISNUMERIC`
-- **PostgreSQL**: `DATE_PART` / `SPLIT_PART` / `STARTS_WITH` / `ENDS_WITH` / `STRPOS` / `GCD` / `LCM` / `FACTORIAL` / `STRING_AGG` / `MAKE_DATE` / `MAKE_TIMESTAMP` / `CHR`
-- **共通/その他**: `REGEXP_INSTR` / `ZEROIFNULL` / `NULLIFZERO` / `POW` / `BITOR` / `BITXOR` / `BITNOT` ほか多数
+- **Oracle**: `DECODE` / `NVL` / `NVL2` / `ADD_MONTHS` / `MONTHS_BETWEEN` / `NEXT_DAY` / `WIDTH_BUCKET` / `INITCAP` / `LISTAGG` / `TO_NUMBER` / `TO_CHAR` / `TO_DATE` / `NANVL` / `REMAINDER` / `SYS_GUID`
+- **SQL Server**: `ISNULL` / `IIF` / `CHOOSE` / `CHARINDEX` / `PATINDEX` / `LEN` / `STUFF` / `QUOTENAME` / `PARSENAME` / `REPLICATE` / `TRY_CAST` / `TRY_CONVERT` / `DATEADD` / `DATEPART` / `DATENAME` / `NEWID` / `EOMONTH`
+- **PostgreSQL**: `DATE_PART` / `SPLIT_PART` / `STARTS_WITH` / `ENDS_WITH` / `STRPOS` / `OVERLAY` / `TO_HEX` / `QUOTE_IDENT` / `QUOTE_LITERAL` / `GCD` / `LCM` / `MAKE_DATE` / `CHR`
+- **共通/その他**: `SHIFTLEFT` / `SHIFTRIGHT` / `LOG(base, x)` / `USER` / `CURRENT_USER` / `CURRENT_SCHEMA` / `POW` / `BITAND` / `BITOR` / `BITXOR` ほか多数
 
 ```sql
--- 例
-SELECT DECODE(age, 25, 'young', 30, 'mid', 'other') AS grp,
-       WIDTH_BUCKET(age, 20, 40, 4) AS bucket,
-       ADD_MONTHS('2026-01-31', 1) AS next_month
-FROM users;
+-- スカラー関数の例
+SELECT TO_CHAR(1234.5, '9,999.99')        AS money,
+       DATEADD(MONTH, 1, DATE('2026-01-31')) AS next_eom,
+       TRY_CAST('abc' AS INTEGER)          AS safe_cast,   -- 変換不可なら NULL
+       NEXT_DAY(DATE('2026-07-23'), 'Monday') AS next_mon;
+
+-- MERGE（UPSERT）の例
+MERGE INTO target t USING source s ON (t.id = s.id)
+  WHEN MATCHED THEN UPDATE SET val = s.val
+  WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val);
+
+-- PostgreSQL 風 UPSERT
+INSERT INTO target (id, val) VALUES (1, 100)
+  ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+
+-- SQL Server 風 TOP
+SELECT TOP 3 * FROM users ORDER BY age DESC;
 ```
 
 ---
@@ -139,11 +154,30 @@ fetch('lumina://tables').then(r => r.json());
 
 ---
 
-## 永続化
+## 永続化・ブラウザDBとしての運用
+
+サーバ DB には無い「ブラウザ特有の失敗モード」（容量上限・データ退避・タブ間競合・タブを閉じる）に対応しています。
 
 - スナップショットを **IndexedDB** に保存。Web Crypto が使える環境では **AES-GCM で暗号化**して格納します。
+- **自動保存**（デバウンス 1 秒）。タブが非表示になる際は保留中の保存を**即時フラッシュ**します。
 - **楽観ロック**により、別タブ/ウィンドウが先に保存していた場合は上書きを中止して警告します。
-- 自動保存（デバウンス）に対応。テスト実行中は保存をガードします。
+- **マルチタブ同期** — 保存時に `BroadcastChannel` で他タブへ通知し、「別のタブが更新した」ことを即座に知らせます。
+- **クォータ超過の明示** — 容量上限に達した保存失敗は原因の分かる日本語メッセージに変換されます。
+- **使用量の可視化** — `SHOW STORAGE`（DB 自身の概算サイズ）と `LuminaDB.storage()`（ブラウザの使用量・上限・永続化状態）で確認できます。
+- **永続化ストレージの要求** — `LuminaDB.persist()` でディスク逼迫時の自動退避を防ぐ永続化を要求できます。
+
+```js
+await LuminaDB.storage();
+// { supported: true, usage: 12345678, quota: 9876543210, usagePercent: 0.12,
+//   persisted: false, estimatedBytes: 4096, tables: 3, rows: 20 }
+
+await LuminaDB.persist();   // { granted: true | false }
+```
+
+```sql
+SHOW STORAGE;    -- tables / rows / string_pool_bytes / estimated_bytes / estimated_mb ...
+SHOW SETTINGS;   -- セッション設定と実効分離レベル
+```
 
 ---
 

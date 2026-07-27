@@ -121,9 +121,19 @@
             const tx = idb.transaction(IDB_STORE, 'readwrite');
             tx.objectStore(IDB_STORE).put(record, 'latest');
             tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+            // クォータ超過はブラウザDB特有の失敗モードなので、原因が分かる文言へ変換する
+            tx.onerror = () => {
+                const err = tx.error;
+                if (err && (err.name === 'QuotaExceededError' || /quota/i.test(err.message || ''))) {
+                    reject(new Error("ブラウザのストレージ上限に達したため保存できません。不要なテーブルを削除するか、SQL としてエクスポートしてください。"));
+                } else {
+                    reject(err);
+                }
+            };
         });
         dbSnapshotVersion = dataObj.__version__;
+        // 他タブへ保存を通知する（相手側は最新版の存在に気づける）
+        broadcastSaved(dbSnapshotVersion);
     }
 
     async function loadDB() {
@@ -230,3 +240,72 @@
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'hidden') flushAutoSave();
     });
+
+    // ========================================================================
+    // [Storage Quota] - ブラウザDB特有の運用情報
+    //
+    // ブラウザのストレージには origin 単位のクォータがあり、超過すると保存が
+    // QuotaExceededError で失敗する。またベストエフォート保存の場合、ディスク
+    // 逼迫時にブラウザがデータを退避（eviction）することがある。両者はサーバDBに
+    // 存在しない失敗モードなので、利用状況の可視化と永続化要求の手段を提供する。
+    // ========================================================================
+
+    // 現在の使用量・クォータ・永続化状態を返す（未対応ブラウザでは supported:false）
+    async function getStorageInfo() {
+        const info = {
+            supported: !!(navigator.storage && navigator.storage.estimate),
+            usage: null, quota: null, usagePercent: null, persisted: null
+        };
+        if (info.supported) {
+            try {
+                const est = await navigator.storage.estimate();
+                info.usage = est.usage != null ? est.usage : null;
+                info.quota = est.quota != null ? est.quota : null;
+                if (info.usage != null && info.quota) {
+                    info.usagePercent = Number(((info.usage / info.quota) * 100).toFixed(2));
+                }
+            } catch (e) { /* 権限や実装差で失敗しても情報なしとして扱う */ }
+        }
+        if (navigator.storage && navigator.storage.persisted) {
+            try { info.persisted = await navigator.storage.persisted(); } catch (e) { /* 同上 */ }
+        }
+        return info;
+    }
+
+    // 永続化ストレージ（eviction されない保存）を要求する。付与されたかを返す
+    async function requestPersistence() {
+        if (!(navigator.storage && navigator.storage.persist)) return false;
+        try { return await navigator.storage.persist(); } catch (e) { return false; }
+    }
+
+    // ========================================================================
+    // [Multi-tab Sync] - 同一オリジンの他タブへ保存を通知する
+    //
+    // saveDB は楽観ロックで他タブの上書きを「拒否」するが、それだけでは利用者は
+    // 保存に失敗するまで競合に気づけない。保存のたびに通知を送り、他タブ側で
+    // 「別タブが更新した」ことを即座に知らせる。
+    // ========================================================================
+    let syncChannel = null;
+    if (typeof BroadcastChannel !== 'undefined') {
+        try {
+            syncChannel = new BroadcastChannel('luminadb-sync');
+            syncChannel.onmessage = (ev) => {
+                const msg = ev && ev.data;
+                if (!msg || msg.type !== 'saved') return;
+                if (typeof isTesting !== 'undefined' && isTesting) return;
+                // 自分より新しいスナップショットが他タブで保存された
+                if (typeof msg.version === 'number' && msg.version > dbSnapshotVersion) {
+                    if (typeof logConsole === 'function') {
+                        logConsole('info', `別のタブがデータベースを更新しました (v${msg.version})`, 'Load DB で最新の状態を取得できます');
+                    }
+                    if (typeof showToast === 'function') {
+                        showToast('別のタブがデータベースを更新しました。Load DB で最新を取得してください。', true);
+                    }
+                }
+            };
+        } catch (e) { syncChannel = null; }
+    }
+    function broadcastSaved(version) {
+        if (!syncChannel) return;
+        try { syncChannel.postMessage({ type: 'saved', version }); } catch (e) { /* 送信失敗は無視 */ }
+    }

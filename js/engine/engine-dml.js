@@ -783,11 +783,25 @@
                   addPending(vals, kv);
                   return;
               }
-              // ON DUPLICATE KEY UPDATE: 衝突行へ SET を適用する
+              // ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE: 衝突行へ SET を適用する
               // （FK 存在 / NOT NULL / UNIQUE の検証は UPDATE と共通の _validatePendingChanges に委譲）
+              // ON CONFLICT の EXCLUDED.col は挿入予定値を参照するため、疑似テーブル __excluded を注入する。
               conflicts.forEach(idx => {
                   const changes = {};
-                  updates.forEach(u => { changes[u.col] = u.evalFunc({ [table]: idx }, this.tables, aliases); });
+                  let ptrs = { [table]: idx };
+                  let dbs = this.tables;
+                  if (mode.excluded) {
+                      const exRow = Object.create(null);
+                      cols.forEach((c, ci) => { exRow[c] = vals[ci] === undefined ? null : vals[ci]; });
+                      const exTbl = { cols: Object.create(null), _row: exRow, getValue(c) { const v = this._row[c]; return v === undefined ? null : v; } };
+                      cols.forEach(c => { exTbl.cols[c] = true; });
+                      // __resolve は ptrs をエイリアス名で、dbTables を実テーブル名で引く。
+                      // EXCLUDED.<col> → alias 'excluded' → 実体 '__excluded'
+                      ptrs = { [table]: idx, excluded: 0 };
+                      dbs = Object.assign(Object.create(null), this.tables, { __excluded: exTbl });
+                      aliases['excluded'] = '__excluded';
+                  }
+                  updates.forEach(u => { changes[u.col] = u.evalFunc(ptrs, dbs, aliases); });
                   this._validatePendingChanges(tData, [{ idx, changes }]);
                   this._validateChecksForChanges(table, [{ idx, changes }]);
                   // 未フラッシュの pending 行との一意衝突も検査する
@@ -912,6 +926,156 @@
           return valuesList.length;
       },
 
+      // 値を SQL リテラルへ変換（MERGE のソース値埋め込み用）
+      _literalOf(v) {
+          if (v === null || v === undefined) return 'NULL';
+          if (typeof v === 'number') return String(v);
+          if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+          return this._quoteLiteral(String(v));
+      },
+
+      // 文字列中の指定キーワードを括弧深度0で最初に見つけた位置を返す（大文字小文字無視）。無ければ -1
+      _findKwDepth0(str, kw) {
+          let depth = 0;
+          const re = new RegExp('^' + kw + '\\b', 'i');
+          for (let i = 0; i < str.length; i++) {
+              const c = str[i];
+              if (c === '(') depth++;
+              else if (c === ')') depth--;
+              else if (depth === 0 && (c === kw[0] || c === kw[0].toUpperCase()) && re.test(str.slice(i))) return i;
+          }
+          return -1;
+      },
+
+      // MERGE INTO ... USING ... ON ... WHEN MATCHED / NOT MATCHED（Oracle / SQL Server / SQL標準 UPSERT）
+      // ソース行を1行ずつ評価し、一致すれば UPDATE / DELETE、非一致なら INSERT を通常のエンジン経路で実行する。
+      // 制約 / トリガー / 型検査は下位の UPDATE / INSERT / DELETE に委譲される。
+      // 簡略化: マッチ判定と適用を行単位で逐次実行する（集合ベースではない）。ソースキーは一意である前提。
+      _executeMerge(sql, strMap) {
+          const raw = this._restoreStrings(sql, strMap);
+          const head = raw.match(/^\s*merge\s+into\s+([a-zA-Z0-9_]+)(?:\s+(?:as\s+)?(?!using\b)([a-zA-Z0-9_]+))?\s+using\s+/i);
+          if (!head) throw new Error("Syntax Error in MERGE. Use: MERGE INTO t USING src [s] ON (cond) WHEN MATCHED THEN UPDATE SET ... WHEN NOT MATCHED THEN INSERT (...) VALUES (...).");
+          const target = head[1].toLowerCase();
+          const talias = (head[2] || head[1]).toLowerCase();
+          if (!this.tables[target]) throw this._tableNotFound(target);
+
+          let rest = raw.slice(head[0].length).replace(/^\s+/, '');
+          let sourceSql, salias;
+          if (rest[0] === '(') {
+              let depth = 0, end = -1;
+              for (let i = 0; i < rest.length; i++) {
+                  if (rest[i] === '(') depth++;
+                  else if (rest[i] === ')') { depth--; if (depth === 0) { end = i; break; } }
+              }
+              if (end === -1) throw new Error("Syntax Error in MERGE: unbalanced parentheses in USING source.");
+              sourceSql = rest.slice(1, end).trim();
+              rest = rest.slice(end + 1);
+              const am = rest.match(/^\s+(?:as\s+)?(?!on\b)([a-zA-Z0-9_]+)/i);
+              if (!am) throw new Error("MERGE USING (subquery) requires an alias.");
+              salias = am[1].toLowerCase();
+              rest = rest.slice(am[0].length);
+          } else {
+              const sm = rest.match(/^([a-zA-Z0-9_]+)(?:\s+(?:as\s+)?(?!on\b)([a-zA-Z0-9_]+))?/i);
+              if (!sm) throw new Error("Syntax Error in MERGE USING clause.");
+              const srcTable = sm[1].toLowerCase();
+              if (!this.tables[srcTable] && !this.views[srcTable]) throw this._tableNotFound(srcTable);
+              sourceSql = `SELECT * FROM ${srcTable}`;
+              salias = (sm[2] || sm[1]).toLowerCase();
+              rest = rest.slice(sm[0].length);
+          }
+
+          const onM = rest.match(/^\s*on\s+/i);
+          if (!onM) throw new Error("Syntax Error in MERGE: missing ON clause.");
+          rest = rest.slice(onM[0].length);
+          const whenPos = this._findKwDepth0(rest, 'when');
+          if (whenPos === -1) throw new Error("Syntax Error in MERGE: at least one WHEN clause is required.");
+          let onCond = rest.slice(0, whenPos).trim();
+          if (onCond.startsWith('(') && onCond.endsWith(')')) {
+              let d = 0, strip = true;
+              for (let i = 0; i < onCond.length; i++) {
+                  if (onCond[i] === '(') d++;
+                  else if (onCond[i] === ')') { d--; if (d === 0 && i !== onCond.length - 1) { strip = false; break; } }
+              }
+              if (strip) onCond = onCond.slice(1, -1).trim();
+          }
+
+          // WHEN 節を深度0の WHEN で分割
+          let whenStr = rest.slice(whenPos);
+          const clauses = [];
+          while (whenStr.length) {
+              const nextRel = this._findKwDepth0(whenStr.slice(4), 'when'); // 先頭 WHEN を飛ばす
+              if (nextRel === -1) { clauses.push(whenStr.trim()); break; }
+              const cut = nextRel + 4;
+              clauses.push(whenStr.slice(0, cut).trim());
+              whenStr = whenStr.slice(cut);
+          }
+
+          let matchedUpdate = null, matchedDelete = false, notMatchedInsert = null;
+          clauses.forEach(cl => {
+              let m;
+              if ((m = cl.match(/^when\s+matched\s+then\s+update\s+set\s+([\s\S]+)$/i))) {
+                  matchedUpdate = m[1].trim();
+              } else if (/^when\s+matched\s+then\s+delete$/i.test(cl)) {
+                  matchedDelete = true;
+              } else if ((m = cl.match(/^when\s+not\s+matched(?:\s+by\s+target)?\s+then\s+insert\s*\(([^)]*)\)\s*values\s*\(([\s\S]+)\)$/i))) {
+                  notMatchedInsert = { colsStr: m[1].trim(), valsExpr: m[2].trim() };
+              } else {
+                  throw new Error("Unsupported MERGE WHEN clause: " + cl.slice(0, 60));
+              }
+          });
+          if (!matchedUpdate && !matchedDelete && !notMatchedInsert) {
+              throw new Error("MERGE requires at least one actionable WHEN clause.");
+          }
+
+          // ソース行を実体化（トップレベル実行で文字列は再マスクされる）
+          const srcRes = this.executeQuery(sourceSql);
+          if (srcRes.error) throw new Error("MERGE source query failed: " + srcRes.error);
+          const srcRows = Array.isArray(srcRes.data) ? srcRes.data : [];
+
+          // <alias>. 修飾子を除去（対象列はベア参照に。UPDATE/SELECT は単一表なのでベアで解決される）
+          const stripTargetQ = (expr) => expr
+              .replace(new RegExp('\\b' + talias + '\\.', 'gi'), '')
+              .replace(new RegExp('\\b' + target + '\\.', 'gi'), '');
+          // <salias>.<col> をソース行の値リテラルへ置換
+          const substSrc = (expr, row) => expr.replace(
+              new RegExp('\\b' + salias + '\\.([a-zA-Z0-9_]+)\\b', 'gi'),
+              (m, col) => this._literalOf(row[col] !== undefined ? row[col] : row[col.toLowerCase()])
+          );
+
+          let affected = 0, inserted = 0, updated = 0, deleted = 0;
+          for (const srcRow of srcRows) {
+              const rowLC = Object.create(null);
+              for (const k in srcRow) rowLC[k.toLowerCase()] = srcRow[k];
+              const cond = stripTargetQ(substSrc(onCond, rowLC));
+              const cntRes = this.executeQuery(`SELECT COUNT(*) AS __mc FROM ${target} WHERE ${cond}`);
+              if (cntRes.error) throw new Error("MERGE ON condition failed: " + cntRes.error);
+              const matched = (cntRes.data[0].__mc || 0) > 0;
+
+              if (matched) {
+                  if (matchedUpdate) {
+                      const setStr = stripTargetQ(substSrc(matchedUpdate, rowLC));
+                      const uRes = this.executeQuery(`UPDATE ${target} SET ${setStr} WHERE ${cond}`);
+                      if (uRes.error) throw new Error("MERGE UPDATE failed: " + uRes.error);
+                      updated += uRes.scannedRows || 0;
+                  } else if (matchedDelete) {
+                      const dRes = this.executeQuery(`DELETE FROM ${target} WHERE ${cond}`);
+                      if (dRes.error) throw new Error("MERGE DELETE failed: " + dRes.error);
+                      deleted += dRes.scannedRows || 0;
+                  }
+              } else if (notMatchedInsert) {
+                  const valsExpr = substSrc(notMatchedInsert.valsExpr, rowLC);
+                  const iRes = this.executeQuery(`INSERT INTO ${target} (${notMatchedInsert.colsStr}) VALUES (${valsExpr})`);
+                  if (iRes.error) throw new Error("MERGE INSERT failed: " + iRes.error);
+                  inserted += iRes.scannedRows || 0;
+              }
+          }
+          affected = inserted + updated + deleted;
+          return {
+              data: [{ Result: "Success", Message: `${affected} rows merged (${inserted} inserted, ${updated} updated, ${deleted} deleted).` }],
+              affectedRows: affected
+          };
+      },
+
       _executeInsert(sql, strMap) {
           let resultSet = [];
           let affectedRows = 0;
@@ -920,16 +1084,30 @@
           const ret = this._extractReturning(sql);
           sql = ret.sql;
 
-          // 挿入モード: REPLACE INTO / INSERT (OR) IGNORE / ON DUPLICATE KEY UPDATE
+          // 挿入モード: REPLACE INTO / INSERT (OR) IGNORE / ON DUPLICATE KEY UPDATE / ON CONFLICT
           const isReplaceStmt = /^replace\s+into\b/i.test(sql);
-          const isIgnore = /^insert\s+(?:or\s+)?ignore\s+into\b/i.test(sql);
+          let isIgnore = /^insert\s+(?:or\s+)?ignore\s+into\b/i.test(sql);
           let odkuStr = null;
+          let useExcluded = false;
           const odkuM = sql.match(/\s+on\s+duplicate\s+key\s+update\s+([\s\S]+)$/i);
           if (odkuM) { odkuStr = odkuM[1].trim(); sql = sql.slice(0, odkuM.index); }
+          // PostgreSQL ON CONFLICT [(cols) | ON CONSTRAINT name] { DO NOTHING | DO UPDATE SET ... }
+          //   DO NOTHING → INSERT IGNORE 相当 / DO UPDATE SET → ODKU 相当（EXCLUDED.col で挿入値を参照）
+          //   衝突対象列（target）は PK/UNIQUE 全体で判定するため解釈のみ行い無視する。
+          const confM = sql.match(/\s+on\s+conflict\b\s*(?:\(\s*[a-zA-Z0-9_,\s]*\)|on\s+constraint\s+[a-zA-Z0-9_]+)?\s*do\s+(nothing|update\s+set\s+([\s\S]+))$/i);
+          if (confM) {
+              if (/^nothing/i.test(confM[1])) {
+                  isIgnore = true;
+              } else {
+                  odkuStr = confM[2].trim();
+                  useExcluded = true;
+              }
+              sql = sql.slice(0, confM.index);
+          }
 
           // 衝突時に挿入されない/置換される行があり「挿入した行」を一意に定められないため拒否する
           if (ret.returning && (isReplaceStmt || isIgnore || odkuStr)) {
-              throw new Error("RETURNING is not supported with REPLACE / INSERT IGNORE / ON DUPLICATE KEY UPDATE.");
+              throw new Error("RETURNING is not supported with REPLACE / INSERT IGNORE / ON DUPLICATE KEY UPDATE / ON CONFLICT.");
           }
 
           // INSERT INTO t DEFAULT VALUES: 全列を DEFAULT / AUTO_INCREMENT / NULL で補完した1行を挿入
@@ -970,7 +1148,7 @@
 
                   const valuesList = insertData.map(row => selectCols.map(sc => row[sc]));
                   if (isReplaceStmt || isIgnore || odkuStr) {
-                      const res = this._executeUpsertRows(table, cols, valuesList, { replace: isReplaceStmt, ignore: isIgnore, odkuStr }, strMap);
+                      const res = this._executeUpsertRows(table, cols, valuesList, { replace: isReplaceStmt, ignore: isIgnore, odkuStr, excluded: useExcluded }, strMap);
                       affectedRows = res.affectedRows;
                       resultSet = [{Result:"Success", Message: res.message}];
                       return { data: resultSet, affectedRows };
@@ -1008,7 +1186,7 @@
               this._resolveDefaultMarkers(table, cols, parsedValsList);
 
               if (isReplaceStmt || isIgnore || odkuStr) {
-                  const res = this._executeUpsertRows(table, cols, parsedValsList, { replace: isReplaceStmt, ignore: isIgnore, odkuStr }, strMap);
+                  const res = this._executeUpsertRows(table, cols, parsedValsList, { replace: isReplaceStmt, ignore: isIgnore, odkuStr, excluded: useExcluded }, strMap);
                   affectedRows = res.affectedRows;
                   resultSet = [{Result:"Success", Message: res.message}];
               } else {
@@ -1030,7 +1208,7 @@
               });
               this._resolveDefaultMarkers(table, cols, [vals]);
               if (isReplaceStmt || isIgnore || odkuStr) {
-                  const res = this._executeUpsertRows(table, cols, [vals], { replace: isReplaceStmt, ignore: isIgnore, odkuStr }, strMap);
+                  const res = this._executeUpsertRows(table, cols, [vals], { replace: isReplaceStmt, ignore: isIgnore, odkuStr, excluded: useExcluded }, strMap);
                   affectedRows = res.affectedRows;
                   resultSet = [{Result:"Success", Message: res.message}];
               } else {

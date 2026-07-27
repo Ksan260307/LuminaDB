@@ -1,6 +1,13 @@
     // ============================================================================
     // [DatabaseEngine Select] - SELECT の解析 / 最適化 / 実行
     // ============================================================================
+
+    // 集計関数名の一覧（先頭一致判定・式中判定・書き換えで共用）
+    const LUMINA_AGG_NAMES = 'COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|ANY_VALUE|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG';
+    // 式の「途中」に集計呼び出しが現れるか（ROUND(AVG(x),2) や a/SUM(b) を拾う）。
+    // 直前が識別子文字だと my_sum( のような列名を誤検出するため、境界を明示する。
+    const AGG_ANYWHERE = new RegExp('(^|[^A-Za-z0-9_.])(' + LUMINA_AGG_NAMES + ')\\s*\\(', 'i');
+
     Object.assign(DatabaseEngine.prototype, {
 
       // 集計関数呼び出し 1 件を compiledSelects 用の記述子へ変換する
@@ -100,6 +107,10 @@
           });
       },
 
+      // 式の「途中」に集計呼び出しが現れるかの判定（先頭一致ではない）。
+      // 例: ROUND(AVG(x), 2) / 100.0 * SUM(a) / SUM(b) / CONCAT('n=', COUNT(*))
+      // 直前が識別子文字・'_' でないこと（列名 my_sum( 等の誤検出を防ぐ）を条件にする。
+
       // 式文字列中の集計関数呼び出しを隠し集計列（prefix + 連番）への参照に書き換え、
       // 対応する集計記述子を compiledSelects へ追加する。
       // HAVING COUNT(*) > 1 / ORDER BY SUM(x) DESC のような直接集計参照を可能にする
@@ -115,6 +126,44 @@
       _parseSelect(sql) {
           let tempSql = sql;
           let limitVal = null, offsetVal = null, orderByStr = null, havingStr = null, groupByStr = null, whereStr = null, qualifyStr = null;
+
+          // SQL Server TOP: SELECT [ALL|DISTINCT] TOP (n) [PERCENT] ... を LIMIT へ正規化する。
+          // PERCENT は limitVal を "n%" で表現し適用側(_executeSelectPlan)で全体件数に対して解釈する。
+          // WITH TIES は受理するが通常の TOP n として扱う（同値タイの追加取得は非対応）。
+          {
+              const topM = tempSql.match(/^(\s*select\s+(?:all\s+|distinct\s+)?)top\s+(?:\(\s*(\d+(?:\.\d+)?)\s*\)|(\d+(?:\.\d+)?))\s*(percent\b)?\s*(?:with\s+ties\b)?\s+/i);
+              if (topM) {
+                  const nRaw = topM[2] !== undefined ? topM[2] : topM[3];
+                  limitVal = topM[4] ? (nRaw + '%') : String(Math.trunc(Number(nRaw)));
+                  tempSql = topM[1] + tempSql.slice(topM[0].length);
+              }
+          }
+
+          // 順序集合集計 WITHIN GROUP (ORDER BY ...) を既存の2引数形へ正規化する。
+          //   PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY e)      -> PERCENTILE_CONT(e, p)
+          //   PERCENTILE_DISC(p) WITHIN GROUP (ORDER BY e DESC) -> PERCENTILE_DISC(e, 1 - (p))
+          //   LISTAGG(x, sep)    WITHIN GROUP (ORDER BY y)      -> GROUP_CONCAT(x ORDER BY y SEPARATOR sep)
+          // ORDER BY 句抽出・集計呼び出しの退避より前に消す必要がある（括弧内 ORDER BY の誤検出防止）
+          if (/within\s+group/i.test(tempSql)) {
+              tempSql = tempSql.replace(
+                  /\b(PERCENTILE_CONT|PERCENTILE_DISC|LISTAGG)\s*\(((?:[^()]|\([^()]*\))*)\)\s+WITHIN\s+GROUP\s*\(\s*ORDER\s+BY\s+((?:[^()]|\([^()]*\))*?)\s*\)/gi,
+                  (m, fn, args, ord) => {
+                      const F = fn.toUpperCase();
+                      const dm = ord.match(/\s+(asc|desc)\s*$/i);
+                      const isDesc = !!(dm && dm[1].toLowerCase() === 'desc');
+                      const ordExpr = (dm ? ord.slice(0, dm.index) : ord).trim();
+                      if (F === 'LISTAGG') {
+                          const parts = this.splitSelectClause(args);
+                          const expr = (parts[0] || '').trim();
+                          const sep = parts.length > 1 ? parts[1].trim() : null;
+                          return `GROUP_CONCAT(${expr} ORDER BY ${ordExpr}${isDesc ? ' DESC' : ''}${sep ? ' SEPARATOR ' + sep : ''})`;
+                      }
+                      // 分位は昇順定義。DESC 指定は 1 - p と等価なので式ごと反転させる
+                      const p = args.trim();
+                      return `${F}(${ordExpr}, ${isDesc ? `1 - (${p})` : p})`;
+                  }
+              );
+          }
 
           // named window (WINDOW w AS (...)): 定義を集めて OVER w を OVER (定義) へ展開する。
           // OVER 退避より前に処理する（展開後の OVER (...) を通常のウィンドウ処理へ載せる）
@@ -169,13 +218,23 @@
               aggMap.push(m);
               return `__AGGFN_${aggMap.length - 1}__`;
           });
-          const restoreAgg = (x) => x == null ? x : x.replace(/__AGGFN_(\d+)__/g, (mm, i) => aggMap[i]);
+
+          // IS [NOT] DISTINCT FROM の FROM が FROM 句と誤認される（SELECT 1 IS DISTINCT FROM 2 で
+          // '2' がテーブル名扱いになる）ため、句の切り出し中はトークンへ退避し、最後に復元する
+          tempSql = tempSql.replace(/\bIS\s+(NOT\s+)?DISTINCT\s+FROM\b/gi, (m, not) => not ? '__ISNDF__' : '__ISDF__');
+          const restoreAgg = (x) => x == null ? x
+              : x.replace(/__AGGFN_(\d+)__/g, (mm, i) => aggMap[i])
+                 .replace(/__ISNDF__/g, ' IS NOT DISTINCT FROM ')
+                 .replace(/__ISDF__/g, ' IS DISTINCT FROM ');
 
           // EXTRACT(unit FROM expr) / TRIM(... FROM s) / SUBSTRING(s FROM n) の FROM が
           // FROM 句と誤認されるため、カンマ形式へ正規化する
           // （compileCondition は FROM / カンマの両形式を受理する）
           tempSql = tempSql.replace(/\bEXTRACT\s*\(\s*(YEAR|QUARTER|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)\s+FROM\b/gi, 'EXTRACT($1,');
           tempSql = tempSql.replace(/\b(TRIM|SUBSTRING)\s*\(((?:[^()]|\([^()]*\))*?)\s+FROM\s+/gi, (m, fn, pre) => `${fn}(${pre}, `);
+          // OVERLAY(s PLACING r FROM n [FOR len]) の FROM/FOR が FROM 句と誤認されるためカンマ形式へ正規化
+          tempSql = tempSql.replace(/\bOVERLAY\s*\(([^()]*?)\s+PLACING\s+([^()]*?)\s+FROM\s+([^()]*?)\s+FOR\s+([^()]*?)\)/gi, (m, a, b, c, d) => `OVERLAY(${a}, ${b}, ${c}, ${d})`);
+          tempSql = tempSql.replace(/\bOVERLAY\s*\(([^()]*?)\s+PLACING\s+([^()]*?)\s+FROM\s+([^()]*?)\)/gi, (m, a, b, c) => `OVERLAY(${a}, ${b}, ${c})`);
 
           // SQL標準の OFFSET n ROWS / FETCH FIRST n ROWS ONLY を LIMIT / OFFSET へ正規化
           tempSql = tempSql.replace(/\bOFFSET\s+(\d+)\s+ROWS?\b/gi, 'OFFSET $1');
@@ -183,14 +242,17 @@
 
           // MySQL 形式 LIMIT offset, count を先に判定する（単独 LIMIT の誤マッチを防ぐ）
           // 小数は切り捨て、負の OFFSET は 0 扱い（適用側で解釈。FROM 句の残余判定を汚さないようここで消費する）
-          const limitCommaMatch = tempSql.match(/\s+limit\s+(\d+)\s*,\s*(\d+)/i);
-          if (limitCommaMatch) {
-              offsetVal = limitCommaMatch[1];
-              limitVal = limitCommaMatch[2];
-              tempSql = tempSql.replace(limitCommaMatch[0], '');
-          } else {
-              const limitMatch = tempSql.match(/\s+limit\s+(\d+(?:\.\d+)?|all)/i);
-              if(limitMatch) { limitVal = limitMatch[1]; tempSql = tempSql.replace(limitMatch[0], ''); }
+          // TOP で limitVal が確定済みの場合は LIMIT 解析を行わない（TOP を優先）。
+          if (limitVal === null) {
+              const limitCommaMatch = tempSql.match(/\s+limit\s+(\d+)\s*,\s*(\d+)/i);
+              if (limitCommaMatch) {
+                  offsetVal = limitCommaMatch[1];
+                  limitVal = limitCommaMatch[2];
+                  tempSql = tempSql.replace(limitCommaMatch[0], '');
+              } else {
+                  const limitMatch = tempSql.match(/\s+limit\s+(\d+(?:\.\d+)?|all)/i);
+                  if(limitMatch) { limitVal = limitMatch[1]; tempSql = tempSql.replace(limitMatch[0], ''); }
+              }
           }
           const offsetMatch = tempSql.match(/\s+offset\s+(-?\d+(?:\.\d+)?)/i);
           if(offsetMatch) { offsetVal = offsetMatch[1]; tempSql = tempSql.replace(offsetMatch[0], ''); }
@@ -215,16 +277,19 @@
           // CROSS JOIN は常に真となる ON 条件付きの JOIN へ正規化する（直積）
           tempSql = tempSql.replace(/\bCROSS\s+JOIN\s+([a-zA-Z0-9_]+)((?:\s+(?:AS\s+)?(?!LEFT\b|INNER\b|RIGHT\b|CROSS\b|JOIN\b|ON\b)[a-zA-Z0-9_]+)?)/gi, 'JOIN $1$2 ON 1 = 1');
 
+          // OUTER は省略可能な飾り語なので先に落とす（LEFT/RIGHT/FULL OUTER JOIN → LEFT/RIGHT/FULL JOIN）
+          tempSql = tempSql.replace(/\b(LEFT|RIGHT|FULL)\s+OUTER\s+JOIN\b/gi, '$1 JOIN');
+          // FULL JOIN（OUTER なし）も FULL OUTER JOIN と同義
           const joins = [];
           // 結合条件は ON <式> / USING (col, ...) / NATURAL（共通列で自動結合）の3形式。
           // USING / NATURAL の等価条件への解決はスキーマが必要なため _optimizeSelect で行う
-          const joinRegex = /\b(NATURAL\s+)?(LEFT\s+|INNER\s+|RIGHT\s+)?JOIN\s+([a-zA-Z0-9_]+)(?:\s+(?:AS\s+)?(?!ON\b|USING\b|NATURAL\b|LEFT\b|INNER\b|RIGHT\b|JOIN\b)([a-zA-Z0-9_]+))?\s*(?:ON\s+([\s\S]+?)|USING\s*\(\s*([a-zA-Z0-9_\s,]+?)\s*\))?(?=\s*\b(?:NATURAL\s+)?(?:LEFT|INNER|RIGHT)?\s*JOIN\b|$)/gi;
+          const joinRegex = /\b(NATURAL\s+)?(LEFT\s+|INNER\s+|RIGHT\s+|FULL\s+)?JOIN\s+([a-zA-Z0-9_]+)(?:\s+(?:AS\s+)?(?!ON\b|USING\b|NATURAL\b|LEFT\b|INNER\b|RIGHT\b|FULL\b|JOIN\b)([a-zA-Z0-9_]+))?\s*(?:ON\s+([\s\S]+?)|USING\s*\(\s*([a-zA-Z0-9_\s,]+?)\s*\))?(?=\s*\b(?:NATURAL\s+)?(?:LEFT|INNER|RIGHT|FULL)?\s*JOIN\b|$)/gi;
           let jMatch;
           let firstJoinIdx = -1;
           while ((jMatch = joinRegex.exec(tempSql)) !== null) {
               if (firstJoinIdx === -1) firstJoinIdx = jMatch.index;
               const natural = !!jMatch[1];
-              const onCond = jMatch[5] ? jMatch[5].trim() : null;
+              const onCond = jMatch[5] ? restoreAgg(jMatch[5].trim()) : null;
               const usingCols = jMatch[6] ? jMatch[6].split(',').map(c => c.trim().toLowerCase()).filter(Boolean) : null;
               if (natural && (onCond || usingCols)) throw new Error("NATURAL JOIN cannot be combined with ON / USING.");
               if (!natural && !onCond && !usingCols) throw new Error("JOIN requires an ON or USING clause (use CROSS JOIN for a cartesian product).");
@@ -257,6 +322,23 @@
 
           const isDistinct = !!fMatch[1];
           let selectClause = fMatch[2].trim();
+
+          // QUALIFY にウィンドウ関数を直書きした形（QUALIFY ROW_NUMBER() OVER (...) <= 2）を
+          // 「隠し列 __ql_N を SELECT へ追加し、QUALIFY はその別名を参照する」形へ書き換える。
+          // QUALIFY の評価は出力行ベース（別名参照）なので、この正規化で標準的な用法を受理できる。
+          // ここでは OVER (...) はまだ __OVER_n__ トークンのままである点に注意。
+          if (qualifyStr && /__OVER_\d+__/.test(qualifyStr)) {
+              let qi = 0;
+              qualifyStr = qualifyStr.replace(
+                  /\b([A-Za-z_][A-Za-z0-9_]*)\s*\(((?:[^()]|\([^()]*\))*)\)\s*(__OVER_\d+__)/g,
+                  (m, fn, args, over) => {
+                      const hidden = `__ql_${qi++}`;
+                      selectClause += `, ${fn}(${args}) ${over} AS ${hidden}`;
+                      return hidden;
+                  }
+              );
+          }
+
           selectClause = restoreAgg(selectClause.replace(/__OVER_(\d+)__/g, (m, idx) => overMap[idx]));
           let fromTable = fMatch[3].trim().toLowerCase();
           let baseAlias = (fMatch[4] ? fMatch[4].trim() : fromTable).toLowerCase();
@@ -449,8 +531,10 @@
           let ptrKeys = [fromTable, baseAlias];
           joinPlans.forEach(join => {
               let jTbl = this.tables[join.table];
-              // RIGHT JOIN: マッチした右テーブル行を追跡し、未マッチ行を後段で補完する
-              const matchedRight = join.type === 'RIGHT' ? new Set() : null;
+              // RIGHT / FULL JOIN: マッチした右テーブル行を追跡し、未マッチ行を後段で補完する
+              const matchedRight = (join.type === 'RIGHT' || join.type === 'FULL') ? new Set() : null;
+              // LEFT / FULL JOIN: 右にマッチしない左行を NULL 補完で残す
+              const keepUnmatchedLeft = (join.type === 'LEFT' || join.type === 'FULL');
               let newPtrs = [];
               if (join.isHashJoin) {
                   let rightMap = new Map();
@@ -477,7 +561,7 @@
                               newPtrs.push({ ...ptr, [join.table]: j, [join.alias]: j });
                               if (matchedRight) matchedRight.add(j);
                           }
-                      } else if (join.type === 'LEFT') {
+                      } else if (keepUnmatchedLeft) {
                           newPtrs.push({ ...ptr, [join.table]: -1, [join.alias]: -1 });
                       }
                   });
@@ -493,7 +577,7 @@
                               if (matchedRight) matchedRight.add(j);
                           }
                       }
-                      if (!matched && join.type === 'LEFT') {
+                      if (!matched && keepUnmatchedLeft) {
                           newPtrs.push({ ...ptr, [join.table]: -1, [join.alias]: -1 });
                       }
                   });
@@ -545,10 +629,14 @@
                   if (isNaN(argOffset)) argOffset = 1;
                   let overStr = wfMatch[3].trim();
 
-                  // ウィンドウフレーム句 (ROWS BETWEEN a AND b / ROWS n PRECEDING) を先に切り出す
+                  // ウィンドウフレーム句 (ROWS/RANGE/GROUPS BETWEEN a AND b、または単独境界) を先に切り出す。
+                  //   ROWS   … 物理行数で数える
+                  //   RANGE  … ORDER BY 値のオフセットで数える（CURRENT ROW は同値ピア全体）
+                  //   GROUPS … ピアグループ（同順位のまとまり）の個数で数える
                   let frame = null;
-                  const fM = overStr.match(/\bROWS\s+([\s\S]+)$/i);
+                  const fM = overStr.match(/\b(ROWS|RANGE|GROUPS)\s+([\s\S]+)$/i);
                   if (fM) {
+                      const frameUnit = fM[1].toUpperCase();
                       const parseBound = (txt) => {
                           txt = txt.trim().toUpperCase().replace(/\s+/g, ' ');
                           if (txt === 'UNBOUNDED PRECEDING') return { t: 'up' };
@@ -560,11 +648,11 @@
                           if (bm) return { t: 'fol', n: parseInt(bm[1], 10) };
                           throw new Error(`Unsupported window frame bound: '${txt}'. Use UNBOUNDED|n PRECEDING / CURRENT ROW / n|UNBOUNDED FOLLOWING.`);
                       };
-                      const spec = fM[1].trim();
+                      const spec = fM[2].trim();
                       const bm = spec.match(/^BETWEEN\s+([\s\S]+?)\s+AND\s+([\s\S]+)$/i);
                       frame = bm
-                          ? { start: parseBound(bm[1]), end: parseBound(bm[2]) }
-                          : { start: parseBound(spec), end: { t: 'cur' } };
+                          ? { unit: frameUnit, start: parseBound(bm[1]), end: parseBound(bm[2]) }
+                          : { unit: frameUnit, start: parseBound(spec), end: { t: 'cur' } };
                       overStr = overStr.slice(0, fM.index).trim();
                   }
 
@@ -585,19 +673,57 @@
                       return { eval: this.compileCondition(p[0], strMap), desc: p[1] && p[1].toUpperCase() === 'DESC' };
                   });
 
+                  // RANGE / GROUPS はピア判定に ORDER BY を要する。数値オフセット指定は
+                  // 対象値が一意に決まる必要があるため ORDER BY 式ちょうど1つを要求する（SQL標準）。
+                  if (frame && frame.unit !== 'ROWS') {
+                      if (oFuncs.length === 0) {
+                          throw new Error(`${frame.unit} frames require an ORDER BY clause in the OVER clause.`);
+                      }
+                      const hasOffset = [frame.start, frame.end].some(b => b.t === 'pre' || b.t === 'fol');
+                      if (frame.unit === 'RANGE' && hasOffset && oFuncs.length !== 1) {
+                          throw new Error("RANGE frames with an offset require exactly one ORDER BY expression in the OVER clause.");
+                      }
+                  }
+
                   let wfId = `__wf_${partIdx}`;
                   windowFuncs.push({ wfId, funcName, argFunc, argOffset, pFuncs, oFuncs, frame });
 
                   return { type: 'window', wfId, alias };
               }
 
-              if (/^(COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|ANY_VALUE|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG)\(/i.test(expr)) {
-                  let m = expr.match(/^(COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|ANY_VALUE|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG)\(\s*([\s\S]*?)\s*\)$/i);
-                  return this._compileAggSelect(m ? m[1].toUpperCase() : 'COUNT', m ? m[2] : '', strMap, alias, filterExpr);
+              // 「式全体がちょうど 1 つの集計呼び出し」かを括弧の対応で厳密に判定する。
+              // 先頭一致だけで判断すると SUM(a) / COUNT(*) や MAX(a) * MIN(a) を
+              // 単一の集計と誤認し、引数が 'a) / COUNT(*' のように壊れる。
+              const aggHead = expr.match(new RegExp('^(' + LUMINA_AGG_NAMES + ')\\s*\\(', 'i'));
+              if (aggHead) {
+                  const open = aggHead[0].length - 1;
+                  let d = 0, close = -1;
+                  for (let i = open; i < expr.length; i++) {
+                      if (expr[i] === '(') d++;
+                      else if (expr[i] === ')') { d--; if (d === 0) { close = i; break; } }
+                  }
+                  if (close === expr.length - 1) {
+                      return this._compileAggSelect(aggHead[1].toUpperCase(), expr.slice(open + 1, close).trim(), strMap, alias, filterExpr);
+                  }
               }
               if (filterExpr) throw new Error("FILTER (WHERE ...) is only supported on aggregate functions.");
+              // 集計を内包した式（ROUND(AVG(x), 2) / 100.0 * SUM(a) / SUM(b) 等）は
+              // 「集計そのもの」ではないので、集計を隠し列へ切り出したうえで
+              // 集計後の行に対して式を評価する（type: 'aggexpr'）。
+              // compiledSelects への push はこの map の完了後でないと行えないため、
+              // ここでは検出だけしてマークを返す。
+              if (AGG_ANYWHERE.test(expr)) {
+                  return { type: 'aggexpr', alias, rawExpr: expr };
+              }
               let evalFunc = this.compileCondition(expr, strMap);
               return { type: 'expr', evalFunc, alias, rawExpr: expr };
+          });
+
+          // 集計内包式: 集計呼び出しを隠し列 __se_N へ書き換え、残った式を
+          // 集計後の行（__se_N を列として持つ）に対して評価する文字列として保持する
+          compiledSelects.filter(s => s.type === 'aggexpr').forEach(sel => {
+              sel.evalStr = this._rewriteAggCalls(sel.rawExpr, compiledSelects, strMap, '__se_');
+              sel.evalFunc = this.compileCondition(sel.evalStr, strMap);
           });
 
           // HAVING 句に直接書かれた集計呼び出し（HAVING COUNT(*) > 1 等）を
@@ -607,7 +733,7 @@
               havingStrEff = this._rewriteAggCalls(havingStrEff, compiledSelects, strMap, '__hv_');
           }
 
-          let isAgg = compiledSelects.some(sel => sel.type === 'agg');
+          let isAgg = compiledSelects.some(sel => sel.type === 'agg' || sel.type === 'aggexpr');
 
           // ウィンドウ関数と GROUP BY / 集計の併用は未対応。
           // （従来は無言で出力列が欠落していたため、明示的なエラーとして拒否する）
@@ -693,17 +819,85 @@
                           }
                       }
 
+                      // RANGE / GROUPS 用のピア情報をパーティション単位で1度だけ用意する。
+                      // peerGrp[i]=ピアグループ番号 / grpLo,grpHi=各グループの行索引範囲 / ordNum[i]=単一ORDER BY値
+                      let peerGrp = null, grpLo = null, grpHi = null, ordNum = null, ordDesc = false;
+                      if (wf.frame && wf.frame.unit !== 'ROWS' && wf.oFuncs.length > 0) {
+                          peerGrp = new Array(pRows.length);
+                          grpLo = []; grpHi = [];
+                          let prevKey = null, g = -1;
+                          pRows.forEach((p, i) => {
+                              const k = wf.oFuncs.map(f => f.eval(p, this.tables, aliases)).join('|||');
+                              if (i === 0 || k !== prevKey) { g++; grpLo[g] = i; prevKey = k; }
+                              peerGrp[i] = g;
+                              grpHi[g] = i;
+                          });
+                          ordDesc = !!wf.oFuncs[0].desc;
+                          ordNum = pRows.map(p => wf.oFuncs[0].eval(p, this.tables, aliases));
+                      }
+
                       pRows.forEach((ptr, idx) => {
                           let val = null;
                           if (wf.frame && ['SUM', 'COUNT', 'AVG', 'MIN', 'MAX', 'FIRST_VALUE', 'LAST_VALUE'].includes(wf.funcName)) {
                               // 明示フレーム: 各行ごとに [lo..hi] のスライスに対して集計する
-                              const bound = (b) => b.t === 'up' ? 0
-                                  : b.t === 'uf' ? pRows.length - 1
-                                  : b.t === 'cur' ? idx
-                                  : b.t === 'pre' ? idx - b.n
-                                  : idx + b.n;
-                              const lo = Math.max(0, bound(wf.frame.start));
-                              const hi = Math.min(pRows.length - 1, bound(wf.frame.end));
+                              const unit = wf.frame.unit || 'ROWS';
+                              let lo, hi;
+                              if (unit === 'ROWS' || !peerGrp) {
+                                  const bound = (b) => b.t === 'up' ? 0
+                                      : b.t === 'uf' ? pRows.length - 1
+                                      : b.t === 'cur' ? idx
+                                      : b.t === 'pre' ? idx - b.n
+                                      : idx + b.n;
+                                  lo = bound(wf.frame.start);
+                                  hi = bound(wf.frame.end);
+                              } else if (unit === 'GROUPS') {
+                                  const g = peerGrp[idx], gMax = grpLo.length - 1;
+                                  // 開始境界はグループ先頭、終了境界はグループ末尾を採る
+                                  const gAt = (b) => b.t === 'pre' ? g - b.n : b.t === 'fol' ? g + b.n : g;
+                                  lo = wf.frame.start.t === 'up' ? 0
+                                      : wf.frame.start.t === 'uf' ? pRows.length
+                                      : grpLo[Math.min(gMax, Math.max(0, gAt(wf.frame.start)))];
+                                  hi = wf.frame.end.t === 'uf' ? pRows.length - 1
+                                      : wf.frame.end.t === 'up' ? -1
+                                      : grpHi[Math.min(gMax, Math.max(0, gAt(wf.frame.end)))];
+                                  // 範囲外を指した境界は空フレームになるよう補正する
+                                  if (wf.frame.start.t === 'pre' && g - wf.frame.start.n < 0) lo = 0;
+                                  if (wf.frame.start.t === 'fol' && g + wf.frame.start.n > gMax) lo = pRows.length;
+                                  if (wf.frame.end.t === 'pre' && g - wf.frame.end.n < 0) hi = -1;
+                                  if (wf.frame.end.t === 'fol' && g + wf.frame.end.n > gMax) hi = pRows.length - 1;
+                              } else {
+                                  // RANGE: ORDER BY 値のオフセットで判定（CURRENT ROW は同値ピア全体）
+                                  const cur = ordNum[idx];
+                                  const sgn = ordDesc ? -1 : 1;
+                                  const inLo = (b) => {
+                                      if (b.t === 'up') return 0;
+                                      if (b.t === 'uf') return pRows.length;
+                                      if (b.t === 'cur') return grpLo[peerGrp[idx]];
+                                      const target = b.t === 'pre' ? cur - sgn * b.n : cur + sgn * b.n;
+                                      for (let i = 0; i < pRows.length; i++) {
+                                          const v = ordNum[i];
+                                          if (v === null || v === undefined) continue;
+                                          if (ordDesc ? v <= target : v >= target) return i;
+                                      }
+                                      return pRows.length;
+                                  };
+                                  const inHi = (b) => {
+                                      if (b.t === 'uf') return pRows.length - 1;
+                                      if (b.t === 'up') return -1;
+                                      if (b.t === 'cur') return grpHi[peerGrp[idx]];
+                                      const target = b.t === 'pre' ? cur - sgn * b.n : cur + sgn * b.n;
+                                      for (let i = pRows.length - 1; i >= 0; i--) {
+                                          const v = ordNum[i];
+                                          if (v === null || v === undefined) continue;
+                                          if (ordDesc ? v >= target : v <= target) return i;
+                                      }
+                                      return -1;
+                                  };
+                                  lo = inLo(wf.frame.start);
+                                  hi = inHi(wf.frame.end);
+                              }
+                              lo = Math.max(0, lo);
+                              hi = Math.min(pRows.length - 1, hi);
                               if (hi < lo) {
                                   val = wf.funcName === 'COUNT' ? 0 : null;
                               } else if (wf.funcName === 'FIRST_VALUE') {
@@ -800,15 +994,63 @@
               });
           }
 
-          // GROUP BY ... WITH ROLLUP / GROUP BY ROLLUP(...): 各グループ階層の小計行と総計行を追加する
-          let rollupMode = false;
+          // 小計行を生成する拡張 GROUP BY:
+          //   GROUP BY ... WITH ROLLUP / ROLLUP(...) — 接頭辞階層の小計＋総計
+          //   GROUP BY CUBE(...)                     — 全部分集合の小計＋総計
+          //   GROUP BY GROUPING SETS ((a,b),(a),())  — 明示した集合ごとの集計
+          // いずれも「GROUP BY 項目の索引集合」へ正規化し、buildAggRow の nulledSet で表現する。
+          let rollupMode = false;      // ROLLUP / CUBE / GROUPING SETS のいずれかが有効
+          let groupingSetsSpec = null; // Array<Set<number>>（各出力集合の「有効な」索引集合）
           let groupByEff = groupByStr;
           if (groupByEff) {
               const wrM = groupByEff.match(/^([\s\S]+?)\s+with\s+rollup\s*$/i);
               if (wrM) { rollupMode = true; groupByEff = wrM[1]; }
               else {
-                  const rpM = groupByEff.trim().match(/^rollup\s*\(([\s\S]+)\)$/i);
+                  const trimmed = groupByEff.trim();
+                  const rpM = trimmed.match(/^rollup\s*\(([\s\S]+)\)$/i);
+                  const cbM = trimmed.match(/^cube\s*\(([\s\S]+)\)$/i);
+                  const gsM = trimmed.match(/^grouping\s+sets\s*\(([\s\S]+)\)$/i);
                   if (rpM) { rollupMode = true; groupByEff = rpM[1]; }
+                  else if (cbM) {
+                      rollupMode = true;
+                      groupByEff = cbM[1];
+                      // CUBE: 全部分集合。項目数 n の 2^n 通り（全項目有効 → ... → 総計）
+                      const items = this.splitSelectClause(cbM[1]).map(s => s.trim());
+                      if (items.length > 12) throw new Error("CUBE supports up to 12 grouping items.");
+                      groupingSetsSpec = [];
+                      for (let mask = (1 << items.length) - 1; mask >= 0; mask--) {
+                          const act = new Set();
+                          for (let i = 0; i < items.length; i++) if (mask & (1 << i)) act.add(i);
+                          groupingSetsSpec.push(act);
+                      }
+                  } else if (gsM) {
+                      rollupMode = true;
+                      // GROUPING SETS: 括弧で列挙された各集合を解析し、和集合を GROUP BY 項目とする
+                      const sets = [];
+                      const allItems = [];
+                      const idxOf = (txt) => {
+                          const norm = (x) => String(x).toLowerCase().replace(/\s+/g, '');
+                          for (let i = 0; i < allItems.length; i++) if (norm(allItems[i]) === norm(txt)) return i;
+                          allItems.push(txt);
+                          return allItems.length - 1;
+                      };
+                      this.splitSelectClause(gsM[1]).forEach(part => {
+                          const p = part.trim();
+                          const inner = p.match(/^\(([\s\S]*)\)$/);
+                          if (inner) {
+                              const body = inner[1].trim();
+                              const act = new Set();
+                              if (body !== '') this.splitSelectClause(body).forEach(c => act.add(idxOf(c.trim())));
+                              sets.push(act);
+                          } else {
+                              // 括弧なしの単項目も 1 要素集合として受理する
+                              sets.push(new Set([idxOf(p)]));
+                          }
+                      });
+                      if (allItems.length === 0) throw new Error("GROUPING SETS requires at least one grouping item.");
+                      groupByEff = allItems.join(', ');
+                      groupingSetsSpec = sets;
+                  }
               }
           }
 
@@ -876,9 +1118,10 @@
                       }
                   });
               }
-              // 1 グループ分の出力行を組み立てる。rolledLevel が非 null の場合は ROLLUP の
-              // 小計行であり、階層 rolledLevel 以降の GROUP BY 列を NULL にする
-              const buildAggRow = (groupPtrsAll, rolledLevel) => {
+              // 1 グループ分の出力行を組み立てる。nulledSet が非 null の場合は小計行であり、
+              // そこに含まれる GROUP BY 項目の索引を NULL 表示・GROUPING()=1 とする。
+              // （ROLLUP は接頭辞集合、CUBE は全部分集合、GROUPING SETS は明示集合を渡す）
+              const buildAggRow = (groupPtrsAll, nulledSet) => {
                   let aggRow = {};
                   compiledSelects.forEach(sel => {
                       if (sel.type === 'agg') {
@@ -1012,7 +1255,7 @@
                               aggRow[sel.alias] = cnt;
                           } else if (sel.func === 'GROUPING') {
                               // ROLLUP の小計行で「まとめられた」GROUP BY 列なら 1、それ以外は 0
-                              aggRow[sel.alias] = (rolledLevel !== null && sel._gi !== undefined && sel._gi !== -1 && sel._gi >= rolledLevel) ? 1 : 0;
+                              aggRow[sel.alias] = (nulledSet !== null && sel._gi !== undefined && sel._gi !== -1 && nulledSet.has(sel._gi)) ? 1 : 0;
                           } else if (sel.func === 'BOOL_AND' || sel.func === 'BOOL_OR') {
                               // 非NULL値の真偽の全称/存在。非NULL値が無ければ NULL
                               let acc = null;
@@ -1090,31 +1333,70 @@
                       } else if (sel.type === 'expr') {
                           // 非集計列は FILTER の対象外（グループ全行を代表）
                           const groupPtrs = groupPtrsAll;
-                          if (rolledLevel !== null && sel._gi !== undefined && sel._gi >= rolledLevel) {
+                          if (nulledSet !== null && sel._gi !== undefined && sel._gi !== -1 && nulledSet.has(sel._gi)) {
                               aggRow[sel.alias] = null;
                           } else {
                               aggRow[sel.alias] = groupPtrs.length > 0 ? sel.evalFunc(groupPtrs[0], this.tables, aliases) : null;
                           }
                       }
                   });
+                  // 集計内包式（ROUND(AVG(x), 2) 等）は、すべての集計値が aggRow へ
+                  // 揃った後に「aggRow を1行のテーブルに見立てて」評価する。
+                  // （HAVING / QUALIFY と同じ出力行ベースの評価方式）
+                  const aggExprs = compiledSelects.filter(s => s.type === 'aggexpr');
+                  if (aggExprs.length > 0) {
+                      const cols = {};
+                      Object.keys(aggRow).forEach(k => cols[k.toLowerCase()] = true);
+                      const getVal = (c) => {
+                          const ak = Object.keys(aggRow).find(k => k.toLowerCase() === c.toLowerCase());
+                          return ak !== undefined ? aggRow[ak] : null;
+                      };
+                      const pseudo = { dummy: { cols, getValue: getVal } };
+                      aggExprs.forEach(sel => {
+                          aggRow[sel.alias] = sel.evalFunc({ dummy: 0 }, pseudo, { dummy: 'dummy' });
+                      });
+                      // 集計内包式のために作った隠し列は出力へ含めない
+                      for (const k in aggRow) if (k.startsWith('__se_')) delete aggRow[k];
+                  }
                   return aggRow;
               };
 
               let aggResults = [];
-              Object.keys(groups).forEach(key => {
-                  aggResults.push(buildAggRow(groups[key], null));
-              });
-              // ROLLUP: 階層 n-1 → 0 の小計行を通常グループの後ろへ追加する（階層 0 は総計行）
-              if (rollupMode && groupFuncs && rowPtrs.length > 0) {
-                  for (let L = groupFuncs.length - 1; L >= 0; L--) {
-                      const superGroups = Object.create(null);
-                      const orderKeys = [];
-                      rowPtrs.forEach(ptr => {
-                          const key = groupFuncs.slice(0, L).map(f => f(ptr, this.tables, aliases)).join('|||');
-                          if (!superGroups[key]) { superGroups[key] = []; orderKeys.push(key); }
-                          superGroups[key].push(ptr);
-                      });
-                      orderKeys.forEach(key => aggResults.push(buildAggRow(superGroups[key], L)));
+              // 「有効な索引集合」で行をグループ化し、その集合の出力行を積む共通処理。
+              // active に含まれない索引が nulledSet（NULL 表示・GROUPING()=1）となる。
+              const emitForSet = (active) => {
+                  const nulled = new Set();
+                  for (let i = 0; i < groupFuncs.length; i++) if (!active.has(i)) nulled.add(i);
+                  const superGroups = Object.create(null);
+                  const orderKeys = [];
+                  rowPtrs.forEach(ptr => {
+                      const key = groupFuncs.map((f, i) => active.has(i) ? f(ptr, this.tables, aliases) : ' ').join('|||');
+                      if (!superGroups[key]) { superGroups[key] = []; orderKeys.push(key); }
+                      superGroups[key].push(ptr);
+                  });
+                  orderKeys.forEach(key => aggResults.push(buildAggRow(superGroups[key], nulled)));
+              };
+
+              if (groupingSetsSpec && groupFuncs) {
+                  // CUBE / GROUPING SETS: 指定された各集合ごとに集計する（通常グループ行は作らない）
+                  if (rowPtrs.length > 0) {
+                      groupingSetsSpec.forEach(active => emitForSet(active));
+                  } else {
+                      // 空集合入力: 総計だけを持つ集合（空の active）があれば 1 行返す（COUNT(*)=0 等）
+                      const hasTotal = groupingSetsSpec.some(s => s.size === 0);
+                      if (hasTotal) aggResults.push(buildAggRow([], new Set(groupFuncs.map((_, i) => i))));
+                  }
+              } else {
+                  Object.keys(groups).forEach(key => {
+                      aggResults.push(buildAggRow(groups[key], null));
+                  });
+                  // ROLLUP: 階層 n-1 → 0 の小計行を通常グループの後ろへ追加する（階層 0 は総計行）
+                  if (rollupMode && groupFuncs && rowPtrs.length > 0) {
+                      for (let L = groupFuncs.length - 1; L >= 0; L--) {
+                          const active = new Set();
+                          for (let i = 0; i < L; i++) active.add(i);
+                          emitForSet(active);
+                      }
                   }
               }
               resultSet = aggResults;
@@ -1217,6 +1499,10 @@
                   };
                   return qFunc({ dummy: 0 }, { dummy: { cols: qCols, getValue: getVal } }, { dummy: 'dummy' });
               });
+              // QUALIFY のために追加した隠しウィンドウ列は出力へ含めない
+              resultSet.forEach(row => {
+                  for (const k in row) if (k.startsWith('__ql_')) delete row[k];
+              });
           }
 
           if (isDistinct && resultSet.length > 0) {
@@ -1299,7 +1585,14 @@
           if (limitVal !== null || offsetVal !== null) {
               // 負の OFFSET は 0 扱い（slice の末尾相対解釈を防ぐ）
               let offset = offsetVal !== null ? Math.max(0, parseInt(offsetVal, 10)) : 0;
-              let limit = (limitVal !== null && limitVal.toLowerCase() !== 'all') ? parseInt(limitVal, 10) : resultSet.length;
+              let limit;
+              if (limitVal !== null && /%$/.test(limitVal)) {
+                  // TOP n PERCENT: 全体件数に対する割合（切り上げ、最低1件）
+                  const pct = parseFloat(limitVal);
+                  limit = resultSet.length === 0 ? 0 : Math.max(1, Math.ceil(resultSet.length * pct / 100));
+              } else {
+                  limit = (limitVal !== null && limitVal.toLowerCase() !== 'all') ? parseInt(limitVal, 10) : resultSet.length;
+              }
               if (offset >= resultSet.length) {
                   resultSet = [];
               } else {

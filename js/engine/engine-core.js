@@ -3,7 +3,7 @@
     // 各機能メソッドは engine-*.js で prototype 拡張として定義される
     // ============================================================================
     // エンジンバージョン（VERSION() 関数 / SHOW STATUS / 外部APIが参照する）
-    var LUMINA_VERSION = '1.10.0';
+    var LUMINA_VERSION = '1.13.0';
 
     class DatabaseEngine {
       constructor() {
@@ -21,6 +21,13 @@
         // シーケンス (CREATE SEQUENCE): name -> { start, increment, value }。IDB保存対象。
         // 値の採番 (NEXTVAL) は実DB同様に非トランザクション（ROLLBACKで巻き戻らない）
         this.sequences = Object.create(null);
+        // COMMENT ON で付与した注釈: 'table:t' / 'column:t.c' -> 文字列。IDB保存対象。
+        this.comments = Object.create(null);
+        // マテリアライズドビュー: name -> { sql }。実体は tables[name] に持ち、
+        // REFRESH MATERIALIZED VIEW で再計算する（通常ビューと違い自動更新されない）
+        this.matViews = Object.create(null);
+        // セッション設定（SET TRANSACTION ISOLATION LEVEL 等）。表示・互換用でセッション限り
+        this.sessionSettings = Object.create(null);
         this.inTransaction = false;
         this.undoLog = [];
         // 直近の INSERT で AUTO_INCREMENT 列へ採番された最終値（LAST_INSERT_ID() が返す）
@@ -165,10 +172,15 @@
               sql = this._expandCTEs(sql, strMap);
           }
 
-          // CREATE VIEW / PROCEDURE / TRIGGER の本体は定義として保存するため事前展開しない
-          if (!isSubquery && !/^create\s+(or\s+replace\s+)?(view|procedure|trigger)\b/i.test(sql)) {
+          // CREATE VIEW / PROCEDURE / TRIGGER の本体は定義として保存するため事前展開しない。
+          // MERGE は USING (サブクエリ) を自前で解釈するため、ここでの一括展開対象から除外する
+          // （下位の SELECT / UPDATE / INSERT 再実行時に個別展開される）。
+          if (!isSubquery
+              && !/^create\s+(or\s+replace\s+)?(view|procedure|trigger)\b/i.test(sql)
+              && !/^merge\s+into\b/i.test(sql)) {
               sql = this.expandViews(sql, strMap);
               sql = this.expandTableFunctions(sql, strMap);
+              sql = this.expandRelationalOps(sql, strMap);
               sql = this.expandSubqueries(sql, strMap);
           }
 
@@ -181,6 +193,14 @@
              resultSet = res.data;
           }
           else if (/^select/i.test(sql)) {
+             // SQL Server の SELECT ... INTO <newtable> FROM ...: 結果から新テーブルを作る
+             // （CREATE TABLE ... AS SELECT と同義）。INTO を外して本体を実行し実体化する。
+             const intoM = sql.match(/^([\s\S]*?)\s+INTO\s+([a-zA-Z0-9_]+)\s+(FROM\b[\s\S]*)$/i);
+             if (intoM && /^select/i.test(intoM[1])) {
+                 const res = this._executeSelectInto(intoM[2].toLowerCase(), `${intoM[1]} ${intoM[3]}`, strMap);
+                 if (!isSubquery) this.cleanupTempTables();
+                 return { data: res.data, executionTime: Math.max(0.01, performance.now() - startTime).toFixed(2), scannedRows: res.affectedRows };
+             }
              const unionSegments = this._splitUnion(sql);
              let res;
              if (isAnalyze) {
@@ -225,6 +245,12 @@
              resultSet = res.data;
              affectedRows = res.affectedRows;
           }
+          else if (/^merge\s+into\b/i.test(sql)) {
+             // MERGE INTO ... USING ... ON ... WHEN MATCHED/NOT MATCHED（Oracle/SQL Server/標準 UPSERT）
+             const res = this._executeMerge(sql, strMap);
+             resultSet = res.data;
+             affectedRows = res.affectedRows;
+          }
           else if (/^call\b/i.test(sql)) {
              const res = this._executeCall(sql);
              resultSet = res.data;
@@ -242,6 +268,13 @@
           }
           else if (/^set\s+@/i.test(sql)) {
              const res = this._executeSetVar(sql, strMap);
+             resultSet = res.data;
+             affectedRows = res.affectedRows;
+          }
+          else if (/^(set\s+(session\s+|local\s+)?transaction\b|lock\s+tables?\b|unlock\s+tables?\b|grant\b|revoke\b|comment\s+on\b|analyze\b(?!\s+table)|discard\b)/i.test(sql)) {
+             // セッション制御・権限系: 単一ユーザーのブラウザ内DBでは意味を持たないが、
+             // 実DB向けスクリプトをそのまま流せるよう受理して記録のみ行う（COMMENT ON は保存する）
+             const res = this._executeSessionStatement(sql, strMap);
              resultSet = res.data;
              affectedRows = res.affectedRows;
           }
@@ -275,6 +308,12 @@
              const parsed = this._parseSelect(tsql);
              const plan = this._optimizeSelect(parsed, false, strMap);
              const res = this._executeSelectPlan(plan, strMap);
+             resultSet = res.data;
+             affectedRows = res.affectedRows;
+          }
+          else if (/^refresh\s+materialized\s+view\b/i.test(sql)) {
+             // REFRESH MATERIALIZED VIEW <name>: 定義クエリを再実行して実体を差し替える
+             const res = this._refreshMatView(sql, strMap);
              resultSet = res.data;
              affectedRows = res.affectedRows;
           }

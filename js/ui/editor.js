@@ -32,7 +32,12 @@
     // v1.9 で追加された商用DB頻用の関数
     'QUOTENAME', 'PATINDEX', 'BITAND', 'BITOR', 'BITXOR', 'BITNOT', 'ISNUMERIC', 'EOMONTH',
     'MAKE_DATE', 'MAKE_TIMESTAMP', 'TO_NUMBER', 'TO_DATE', 'TO_TIMESTAMP', 'CHR', 'STRPOS',
-    'REPLICATE', 'LISTAGG'];
+    'REPLICATE', 'LISTAGG',
+    // v1.11 で追加された商用DB頻用の関数・コマンド
+    'TO_CHAR', 'TO_HEX', 'TRY_CAST', 'TRY_CONVERT', 'DATEADD', 'DATEPART', 'DATENAME', 'NEXT_DAY',
+    'NANVL', 'REMAINDER', 'SHIFTLEFT', 'SHIFTRIGHT', 'PARSENAME', 'QUOTE_IDENT', 'QUOTE_LITERAL',
+    'OVERLAY', 'PLACING', 'NEWID', 'SYS_GUID', 'CURRENT_SCHEMA', 'CURRENT_USER', 'SESSION_USER',
+    'SYSTEM_USER', 'SYSDATETIME', 'MERGE', 'MATCHED', 'USING', 'TOP', 'PERCENT', 'CONFLICT', 'EXCLUDED'];
 
     // --- SQL 整形（純粋関数。文字列リテラル/コメントを保護して主要句を改行する） ---
     // 完全なパーサではなく単文の可読性向上を狙う軽量フォーマッタ。括弧内（サブクエリ）は

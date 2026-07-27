@@ -2,9 +2,9 @@
 
 [日本語](README.md) | **English**
 
-A build-free, in-memory SQL database engine that runs entirely in the browser. Open a single HTML file and you get a full SQL engine (DQL / DML / DDL), transactions, window functions, triggers, views, and 250+ built-in functions — with no server.
+A build-free, in-memory SQL database engine that runs entirely in the browser. Open a single HTML file and you get a full SQL engine (DQL / DML / DDL), transactions, window functions, triggers, views, commercial-DB commands such as `MERGE` / `TOP` / `ON CONFLICT`, and 270+ built-in functions — with no server.
 
-> Version: **v1.10.0** / Self-contained tests: **2,145** (all passing)
+> Version: **v1.13.0** / Self-contained tests: **5,082** (all passing)
 
 ---
 
@@ -48,36 +48,51 @@ ORDER BY o.amount DESC;
 
 | Category | Supported |
 |----------|-----------|
-| **DQL** | `SELECT` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` (ordinal, expression, `NULLS FIRST/LAST`) / `LIMIT`, `OFFSET`, `FETCH FIRST` / `DISTINCT` |
-| **Joins** | `INNER` / `LEFT` / `RIGHT` / `CROSS` / comma join / `USING` / `NATURAL` |
+| **DQL** | `SELECT` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` (ordinal, expression, `NULLS FIRST/LAST`) / `LIMIT`, `OFFSET`, `FETCH FIRST` / `TOP n [PERCENT]` (SQL Server) / `DISTINCT` |
+| **Joins** | `INNER` / `LEFT` / `RIGHT` / **`FULL OUTER`** / `CROSS` / comma join / `USING` / `NATURAL` / **`CROSS APPLY`, `OUTER APPLY`, `LATERAL`** |
 | **Set ops** | `UNION` / `INTERSECT` / `EXCEPT` (with `ALL`) |
-| **Subqueries** | scalar / `IN` / `EXISTS` / correlated |
+| **Subqueries** | scalar / `IN` / `EXISTS` / correlated / **quantified comparison `= ANY`, `> ALL`, `SOME`** |
 | **CTEs** | `WITH` / `WITH RECURSIVE` (with column lists) |
-| **Window functions** | `ROW_NUMBER` / `RANK` / `LAG` / `LEAD` / frame specs / named windows (`WINDOW` clause) / `QUALIFY` |
-| **Aggregates** | many aggregate functions / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / `GROUPING()` / `GROUP_CONCAT` |
-| **DML** | `INSERT` (multi-row, `SELECT`, `SET`, `DEFAULT`) / `UPDATE` / `DELETE` (`ORDER BY`, `LIMIT`) / `REPLACE` / `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE` / `RETURNING` |
-| **DDL** | `CREATE / ALTER / DROP TABLE` / `VIEW` / `INDEX` / `TRIGGER` / `PROCEDURE` / `SEQUENCE` / `CREATE TABLE AS` & `LIKE` / `TEMPORARY` |
-| **Constraints** | `PRIMARY KEY` (composite) / `UNIQUE` / `NOT NULL` / `DEFAULT` (incl. `CURRENT_TIMESTAMP`) / `CHECK` / `FOREIGN KEY` (`ON DELETE/UPDATE` actions) / `AUTO_INCREMENT` / generated columns (`GENERATED ALWAYS AS`) |
+| **Window functions** | `ROW_NUMBER` / `RANK` / `LAG` / `LEAD` / frame specs (**`ROWS` / `RANGE` / `GROUPS`**) / named windows (`WINDOW` clause) / `QUALIFY` (**inline window functions supported**) |
+| **Aggregates** | many aggregate functions / **aggregates nested in expressions (`ROUND(AVG(x), 2)`, `100.0 * SUM(a) / SUM(b)`)** / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / **`CUBE`, `GROUPING SETS`** / `GROUPING()` / **`WITHIN GROUP (ORDER BY ...)`** / `GROUP_CONCAT` |
+| **DML** | `INSERT` (multi-row, `SELECT`, `SET`, `DEFAULT`) / `UPDATE` / `DELETE` (`ORDER BY`, `LIMIT`) / `REPLACE` / `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO NOTHING`, `DO UPDATE` (PostgreSQL, `EXCLUDED`) / `MERGE INTO ... USING ... WHEN MATCHED/NOT MATCHED` (Oracle/SQL Server) / `RETURNING` |
+| **DDL** | `CREATE / ALTER / DROP TABLE` / `VIEW` / **`MATERIALIZED VIEW` (with `REFRESH`)** / `INDEX` / `TRIGGER` / `PROCEDURE` / `SEQUENCE` / `CREATE TABLE AS` & `LIKE` / **`SELECT ... INTO`** / **`COMMENT ON`** / `TEMPORARY` |
+| **Constraints** | `PRIMARY KEY` (composite) / `UNIQUE` / `NOT NULL` / `DEFAULT` (incl. `CURRENT_TIMESTAMP`) / `CHECK` / `FOREIGN KEY` (`ON DELETE/UPDATE` actions) / `AUTO_INCREMENT` / **identity columns (`GENERATED ALWAYS AS IDENTITY`, `IDENTITY(1,1)`)** / generated columns (`GENERATED ALWAYS AS`) |
 | **Transactions** | `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` |
-| **Other** | prepared statements (`PREPARE`/`EXECUTE`/`DEALLOCATE`) / user variables (`SET @x`) / `EXPLAIN` & `EXPLAIN ANALYZE` / `VALUES` statement / `TABLE` statement / `SHOW *`, `DESCRIBE`, `CHECK TABLE`, `ANALYZE TABLE` |
+| **Row reshaping** | **`PIVOT` / `UNPIVOT`** (`UNPIVOT` skips NULL rows) |
+| **Null-safe comparison** | **`IS [NOT] DISTINCT FROM`** / **`<=>`** |
+| **Session statements** | **`SET TRANSACTION ISOLATION LEVEL`** / **`LOCK`, `UNLOCK TABLES`** / **`GRANT`, `REVOKE`** / **`DISCARD`** (accepted for script compatibility) |
+| **Other** | prepared statements (`PREPARE`/`EXECUTE`/`DEALLOCATE`) / user variables (`SET @x`) / `EXPLAIN` & `EXPLAIN ANALYZE` / `VALUES` statement / `TABLE` statement / `SHOW *` (incl. **`STORAGE`, `SETTINGS`, `COMMENTS`, `MATERIALIZED VIEWS`**), `DESCRIBE`, `CHECK TABLE`, `ANALYZE TABLE` |
 
-### Built-in functions (250+)
+### Built-in functions (270+)
 
 Covering String, Numeric, Date/Time, JSON, Regexp, Hash/Encoding, Null/Flow, Aggregate, Window, Sequence, and Meta categories. Use `SHOW FUNCTIONS` to list and search them.
 
 Functions commonly used in commercial databases are included (selection):
 
-- **Oracle**: `DECODE` / `NVL` / `NVL2` / `ADD_MONTHS` / `MONTHS_BETWEEN` / `WIDTH_BUCKET` / `INITCAP` / `LISTAGG` / `TO_NUMBER` / `TO_DATE` / `TO_TIMESTAMP` / `BITAND`
-- **SQL Server**: `ISNULL` / `IIF` / `CHOOSE` / `CHARINDEX` / `PATINDEX` / `LEN` / `STUFF` / `QUOTENAME` / `REPLICATE` / `SQUARE` / `GETDATE` / `EOMONTH` / `ISNUMERIC`
-- **PostgreSQL**: `DATE_PART` / `SPLIT_PART` / `STARTS_WITH` / `ENDS_WITH` / `STRPOS` / `GCD` / `LCM` / `FACTORIAL` / `STRING_AGG` / `MAKE_DATE` / `MAKE_TIMESTAMP` / `CHR`
-- **Common/other**: `REGEXP_INSTR` / `ZEROIFNULL` / `NULLIFZERO` / `POW` / `BITOR` / `BITXOR` / `BITNOT` and many more
+- **Oracle**: `DECODE` / `NVL` / `NVL2` / `ADD_MONTHS` / `MONTHS_BETWEEN` / `NEXT_DAY` / `WIDTH_BUCKET` / `INITCAP` / `LISTAGG` / `TO_NUMBER` / `TO_CHAR` / `TO_DATE` / `NANVL` / `REMAINDER` / `SYS_GUID`
+- **SQL Server**: `ISNULL` / `IIF` / `CHOOSE` / `CHARINDEX` / `PATINDEX` / `LEN` / `STUFF` / `QUOTENAME` / `PARSENAME` / `REPLICATE` / `TRY_CAST` / `TRY_CONVERT` / `DATEADD` / `DATEPART` / `DATENAME` / `NEWID` / `EOMONTH`
+- **PostgreSQL**: `DATE_PART` / `SPLIT_PART` / `STARTS_WITH` / `ENDS_WITH` / `STRPOS` / `OVERLAY` / `TO_HEX` / `QUOTE_IDENT` / `QUOTE_LITERAL` / `GCD` / `LCM` / `MAKE_DATE` / `CHR`
+- **Common/other**: `SHIFTLEFT` / `SHIFTRIGHT` / `LOG(base, x)` / `USER` / `CURRENT_USER` / `CURRENT_SCHEMA` / `POW` / `BITAND` / `BITOR` / `BITXOR` and many more
 
 ```sql
--- Example
-SELECT DECODE(age, 25, 'young', 30, 'mid', 'other') AS grp,
-       WIDTH_BUCKET(age, 20, 40, 4) AS bucket,
-       ADD_MONTHS('2026-01-31', 1) AS next_month
-FROM users;
+-- Scalar function example
+SELECT TO_CHAR(1234.5, '9,999.99')            AS money,
+       DATEADD(MONTH, 1, DATE('2026-01-31'))  AS next_eom,
+       TRY_CAST('abc' AS INTEGER)             AS safe_cast,   -- NULL if not convertible
+       NEXT_DAY(DATE('2026-07-23'), 'Monday') AS next_mon;
+
+-- MERGE (UPSERT)
+MERGE INTO target t USING source s ON (t.id = s.id)
+  WHEN MATCHED THEN UPDATE SET val = s.val
+  WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val);
+
+-- PostgreSQL-style UPSERT
+INSERT INTO target (id, val) VALUES (1, 100)
+  ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+
+-- SQL Server-style TOP
+SELECT TOP 3 * FROM users ORDER BY age DESC;
 ```
 
 ---
@@ -139,11 +154,30 @@ Send queries from an `iframe` (etc.) via `postMessage` and receive the results b
 
 ---
 
-## Persistence
+## Persistence & running as a browser database
+
+LuminaDB handles failure modes a server database never sees: storage quotas, browser-initiated eviction, cross-tab conflicts, and tabs being closed mid-write.
 
 - Snapshots are stored in **IndexedDB**, and **encrypted with AES-GCM** where the Web Crypto API is available.
+- **Debounced auto-save** (1s), with a **flush on tab hide** so a pending save is not lost when the tab closes.
 - **Optimistic locking** aborts a save (with a warning) if another tab/window saved first, preventing accidental overwrites.
-- Debounced auto-save is supported; saving is guarded while the test suite is running.
+- **Multi-tab sync** — each save is announced over `BroadcastChannel`, so other tabs learn immediately that the database changed.
+- **Quota errors are explained** — hitting the storage limit produces an actionable message instead of a raw `QuotaExceededError`.
+- **Usage visibility** — `SHOW STORAGE` (the database's own estimated size) and `LuminaDB.storage()` (browser usage, quota, persistence state).
+- **Persistent storage** — `LuminaDB.persist()` asks the browser for storage that is not evicted under disk pressure.
+
+```js
+await LuminaDB.storage();
+// { supported: true, usage: 12345678, quota: 9876543210, usagePercent: 0.12,
+//   persisted: false, estimatedBytes: 4096, tables: 3, rows: 20 }
+
+await LuminaDB.persist();   // { granted: true | false }
+```
+
+```sql
+SHOW STORAGE;    -- tables / rows / string_pool_bytes / estimated_bytes / estimated_mb ...
+SHOW SETTINGS;   -- session settings and the effective isolation level
+```
 
 ---
 

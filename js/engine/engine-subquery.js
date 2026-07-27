@@ -115,7 +115,10 @@
                   const boolStr = subResult.data.length > 0 ? 'TRUE' : 'FALSE';
                   const newBefore = beforeStr.replace(/EXISTS\s*$/i, '');
                   expandedSql = newBefore + boolStr + expandedSql.slice(match.end + 1);
-              } else if (/\bNOT\s+IN\s*$/i.test(beforeStr.trim()) || /\bIN\s*$/i.test(beforeStr.trim())) {
+              } else if (/\bNOT\s+IN\s*$/i.test(beforeStr.trim()) || /\bIN\s*$/i.test(beforeStr.trim())
+                         || /\b(?:ANY|SOME|ALL)\s*$/i.test(beforeStr.trim())) {
+                  // IN / NOT IN / 量化比較 (= ANY, > ALL, ...): 結果1列目を値リストへ畳み込む。
+                  // 量化比較の展開（OR/AND への分配）は compileCondition が担う。
                   // 文字列値はエスケープした上で strMap へ退避する
                   // （生のまま埋め込むとデータ中の引用符がJSソースを汚染し得るため）
                   const vals = subResult.data.map(r => Object.values(r)[0]);
@@ -191,6 +194,302 @@
           });
       },
 
+      // PIVOT / UNPIVOT / CROSS APPLY / OUTER APPLY / LATERAL を一時テーブルへ実体化して
+      // FROM 句のテーブル名に置換する（expandSubqueries より前・expandViews より後に呼ぶ）。
+      // いずれも「等価な通常クエリへ書き換えて実行し、その結果を実体化する」方式。
+      expandRelationalOps(sql, strMap) {
+          if (!/\b(pivot|unpivot|apply|lateral)\b/i.test(sql)) return sql;
+          let out = sql;
+          for (let guard = 0; guard < 20; guard++) {
+              const next = this._expandOnePivot(out, strMap);
+              if (next === out) break;
+              out = next;
+          }
+          for (let guard = 0; guard < 20; guard++) {
+              const next = this._expandOneApply(out, strMap);
+              if (next === out) break;
+              out = next;
+          }
+          return out;
+      },
+
+      // ソース指定（テーブル名 / ビュー名 / (サブクエリ)）を一時テーブルへ解決し、列名一覧を返す
+      _resolveRelSource(srcText, strMap) {
+          const t = srcText.trim();
+          if (t.startsWith('(')) {
+              const inner = t.slice(1, -1).trim();
+              const res = this.executeQuery(inner, true, strMap);
+              if (res.error) throw new Error(res.error);
+              const name = '__tmp_relsrc_' + (this._tmpCounter = (this._tmpCounter || 0) + 1);
+              this._materializeRows(name, res.data);
+              return { name, cols: this.tables[name].getColumnNames() };
+          }
+          const nm = t.toLowerCase();
+          if (!this.tables[nm]) throw this._tableNotFound(nm);
+          return { name: nm, cols: this.tables[nm].getColumnNames() };
+      },
+
+      // FROM <src> PIVOT (AGG(expr) FOR col IN (v1 [AS a1], ...)) [AS] alias
+      //   → SELECT <残り列>, AGG(CASE WHEN col = v1 THEN expr END) ... GROUP BY <残り列>
+      // FROM <src> UNPIVOT (valCol FOR nameCol IN (c1, c2, ...)) [AS] alias
+      //   → 各列の SELECT を UNION ALL（NULL 値の行は除外＝標準の挙動）
+      // 開き括弧の位置から対応する閉じ括弧の位置を返す（見つからなければ -1）
+      _scanBalanced(str, openIdx) {
+          let d = 0;
+          for (let i = openIdx; i < str.length; i++) {
+              if (str[i] === '(') d++;
+              else if (str[i] === ')') { d--; if (d === 0) return i; }
+          }
+          return -1;
+      },
+
+      // pos の直前にある「テーブルソース式」を後方走査で特定する。
+      //   FROM t PIVOT(...)        -> t
+      //   FROM t a PIVOT(...)      -> t（別名 a は置換範囲に含めて捨てる）
+      //   FROM (SELECT ...) PIVOT  -> (SELECT ...)
+      //   FROM (SELECT ...) y PIVOT-> (SELECT ...)（別名 y も置換範囲）
+      // 戻り値 { start, end, srcText }: [start, end) を実体化テーブル名で置き換える
+      _findSourceBefore(sql, pos) {
+          const isWord = (c) => /[a-zA-Z0-9_]/.test(c);
+          // 開き括弧を後方に探す（閉じ括弧位置から対応する開き括弧へ）
+          const scanBack = (closeIdx) => {
+              let d = 0;
+              for (let i = closeIdx; i >= 0; i--) {
+                  if (sql[i] === ')') d++;
+                  else if (sql[i] === '(') { d--; if (d === 0) return i; }
+              }
+              return -1;
+          };
+          let i = pos - 1;
+          while (i >= 0 && /\s/.test(sql[i])) i--;
+          if (i < 0) return null;
+          const end = i + 1;
+
+          if (sql[i] === ')') {
+              const open = scanBack(i);
+              if (open === -1) return null;
+              return { start: open, end, srcText: sql.slice(open, end) };
+          }
+          // 直前の語（ソース名か別名）を読む
+          let j = i;
+          while (j >= 0 && isWord(sql[j])) j--;
+          const ident = sql.slice(j + 1, i + 1);
+          if (!ident) return null;
+
+          let k = j;
+          while (k >= 0 && /\s/.test(sql[k])) k--;
+          if (k >= 0 && sql[k] === ')') {
+              // ident は (サブクエリ) の別名
+              const open = scanBack(k);
+              if (open === -1) return null;
+              return { start: open, end, srcText: sql.slice(open, k + 1) };
+          }
+          let m = k;
+          while (m >= 0 && isWord(sql[m])) m--;
+          const prevWord = sql.slice(m + 1, k + 1);
+          if (/^(from|join)$/i.test(prevWord)) {
+              return { start: j + 1, end, srcText: ident };
+          }
+          if (/^(as)$/i.test(prevWord)) {
+              // FROM t AS a PIVOT(...) : さらに前がソース名
+              let n = m;
+              while (n >= 0 && /\s/.test(sql[n])) n--;
+              let p = n;
+              while (p >= 0 && isWord(sql[p])) p--;
+              const srcName = sql.slice(p + 1, n + 1);
+              if (!srcName) return null;
+              return { start: p + 1, end, srcText: srcName };
+          }
+          if (!prevWord) return null;
+          return { start: m + 1, end, srcText: prevWord };
+      },
+
+      // 別名として使えない後続キーワード（PIVOT/APPLY の直後の語を別名と誤認しないため）
+      _isClauseKeyword(w) {
+          return /^(where|group|order|having|limit|offset|union|intersect|except|join|left|right|inner|cross|full|natural|on|using|qualify|window|fetch|for|into|pivot|unpivot|apply|lateral)$/i.test(w);
+      },
+
+      _expandOnePivot(sql, strMap) {
+          // 括弧はバランス走査で切り出す（PIVOT (SUM(amount) FOR ...) のように本体が括弧を含むため）
+          const km = sql.match(/\b(UN)?PIVOT\s*\(/i);
+          if (!km) return sql;
+          const isUnpivot = !!km[1];
+          const openIdx = km.index + km[0].length - 1;
+          const close = this._scanBalanced(sql, openIdx);
+          if (close === -1) throw new Error(`Syntax Error in ${isUnpivot ? 'UNPIVOT' : 'PIVOT'}: unbalanced parentheses.`);
+          const body = sql.slice(openIdx + 1, close).trim();
+
+          // ソースは PIVOT の直前にあるテーブル式。括弧を考慮した後方走査で特定する
+          // （ネストした FROM や (サブクエリ) 別名があっても正しい範囲を取る）
+          const found = this._findSourceBefore(sql, km.index);
+          if (!found) throw new Error(`${isUnpivot ? 'UNPIVOT' : 'PIVOT'} must follow a table source.`);
+          const srcStart = found.start;
+          const src = this._resolveRelSource(found.srcText.trim(), strMap);
+
+          // 閉じ括弧の後ろにある別名を取り込む（句キーワードは別名としない）
+          const after = sql.slice(close + 1);
+          const aliasM = after.match(/^\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)/i);
+          const aliasName = (aliasM && !this._isClauseKeyword(aliasM[1])) ? aliasM[1] : null;
+          const consumedAfter = aliasName ? aliasM[0].length : 0;
+
+          const forSplit = body.match(/^([\s\S]+?)\s+FOR\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+IN\s*\(([\s\S]+)\)\s*$/i);
+          if (!forSplit) throw new Error(`Syntax Error in ${isUnpivot ? 'UNPIVOT' : 'PIVOT'}. Use ( <spec> FOR <column> IN (...) ).`);
+          const head = forSplit[1].trim();
+          const forCol = forSplit[2].toLowerCase();
+          const inItems = this.splitSelectClause(forSplit[3]).map(s => s.trim()).filter(Boolean);
+          if (inItems.length === 0) throw new Error("PIVOT/UNPIVOT requires at least one item in the IN list.");
+
+          const tmpName = '__tmp_pivot_' + (this._tmpCounter = (this._tmpCounter || 0) + 1);
+          let rows, outCols;
+
+          if (isUnpivot) {
+              const valCol = head.toLowerCase();
+              if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(valCol)) throw new Error("UNPIVOT value column must be a simple identifier.");
+              const srcCols = inItems.map(c => c.replace(/^["'\[]|["'\]]$/g, '').toLowerCase());
+              srcCols.forEach(c => { if (!this.tables[src.name].cols[c]) throw new Error(`Column '${c}' not found in UNPIVOT source.`); });
+              const keep = src.cols.filter(c => !srcCols.includes(c));
+              outCols = [...keep, forCol, valCol];
+              rows = [];
+              const st = this.tables[src.name];
+              for (let i = 0; i < st.rowCount; i++) {
+                  srcCols.forEach(c => {
+                      const v = st.getValue(c, i);
+                      if (v === null || v === undefined) return; // 標準 UNPIVOT は NULL 行を除外
+                      const row = {};
+                      keep.forEach(k => { row[k] = st.getValue(k, i); });
+                      row[forCol] = c;
+                      row[valCol] = v;
+                      rows.push(row);
+                  });
+              }
+          } else {
+              const aggM = head.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([\s\S]*)\)$/);
+              if (!aggM) throw new Error("PIVOT requires an aggregate call, e.g. PIVOT (SUM(amount) FOR c IN (...)).");
+              const aggFn = aggM[1].toUpperCase();
+              const aggArg = aggM[2].trim();
+              if (!this.tables[src.name].cols[forCol]) throw new Error(`Column '${forCol}' not found in PIVOT source.`);
+              // 集計対象に現れる列と FOR 列を除いた残りがグループ化キー
+              const argCols = new Set((aggArg.match(/[a-zA-Z_][a-zA-Z0-9_]*/g) || []).map(x => x.toLowerCase()));
+              const groupCols = src.cols.filter(c => c !== forCol && !argCols.has(c));
+              const sels = [];
+              const names = [];
+              inItems.forEach((item, i) => {
+                  const am = item.match(/^([\s\S]+?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+                  const valTxt = (am ? am[1] : item).trim();
+                  // 別名がなければ IN の値そのものを列名にする。この時点で文字列リテラルは
+                  // __STR_N__ へ退避済みなので、元の値へ戻してから列名化する
+                  let outName;
+                  if (am) {
+                      outName = am[2].toLowerCase();
+                  } else {
+                      const tok = valTxt.match(/^__STR_(\d+)__$/);
+                      const lit = tok ? this._unquoteLiteral(strMap[Number(tok[1])]) : valTxt;
+                      outName = String(lit).replace(/^['"]|['"]$/g, '').toLowerCase();
+                  }
+                  names.push(outName);
+                  sels.push(`${aggFn}(CASE WHEN ${forCol} = ${valTxt} THEN ${aggArg} END) AS __pv_${i}`);
+              });
+              outCols = [...groupCols, ...names];
+              const selectList = [...groupCols, ...sels].join(', ');
+              const grp = groupCols.length ? ` GROUP BY ${groupCols.join(', ')}` : '';
+              const res = this.executeQuery(`SELECT ${selectList} FROM ${src.name}${grp}`, true, strMap);
+              if (res.error) throw new Error("PIVOT failed: " + res.error);
+              rows = res.data;
+          }
+
+          this._materializeRows(tmpName, rows, outCols);
+          return sql.slice(0, srcStart) + `${tmpName}${aliasName ? ' ' + aliasName : ''}` + sql.slice(close + 1 + consumedAfter);
+      },
+
+      // <left> CROSS|OUTER APPLY (subquery) [alias]  /  <left> [,|JOIN] LATERAL (subquery) [alias]
+      //   左の各行に対しサブクエリを評価して連結する（相関可）。結果は一時テーブルへ実体化する。
+      _expandOneApply(sql, strMap) {
+          const km = sql.match(/\b(?:(CROSS|OUTER)\s+APPLY|LATERAL)\s+/i);
+          if (!km) return sql;
+          const kind = km[1] ? km[1].toUpperCase() : 'CROSS'; // LATERAL は CROSS APPLY 相当
+          // 右辺は (サブクエリ) かテーブル名。括弧はバランス走査で切り出す
+          let pos = km.index + km[0].length;
+          let rightText, rightEnd;
+          if (sql[pos] === '(') {
+              const close = this._scanBalanced(sql, pos);
+              if (close === -1) throw new Error("Syntax Error in APPLY / LATERAL: unbalanced parentheses.");
+              rightText = sql.slice(pos, close + 1);
+              rightEnd = close + 1;
+          } else {
+              const idM = sql.slice(pos).match(/^[a-zA-Z_][a-zA-Z0-9_]*/);
+              if (!idM) throw new Error("APPLY / LATERAL requires a subquery or table name.");
+              rightText = idM[0];
+              rightEnd = pos + idM[0].length;
+          }
+          const aliasM = sql.slice(rightEnd).match(/^\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)/i);
+          const rightAlias = (aliasM && !this._isClauseKeyword(aliasM[1])) ? aliasM[1] : null;
+          const consumedEnd = rightEnd + (rightAlias ? aliasM[0].length : 0);
+
+          // APPLY より前の部分から「左側クエリ」を組み立てて行を得る（LATERAL 前のカンマも消費する）
+          const before = sql.slice(0, km.index).trim().replace(/,\s*$/, '');
+          if (!/^select\b/i.test(before)) throw new Error("APPLY / LATERAL must follow a SELECT ... FROM clause.");
+          const leftSql = before.replace(/^select\s+(?:distinct\s+)?[\s\S]*?\s+from\s+/i, 'SELECT * FROM ');
+          const leftRes = this.executeQuery(leftSql, true, strMap);
+          if (leftRes.error) throw new Error("APPLY left side failed: " + leftRes.error);
+          const leftRows = leftRes.data;
+
+          // 左表の別名（相関参照 a.col の解決に使う）
+          const leftFromM = before.match(/\bfrom\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:as\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?/i);
+          const leftAlias = leftFromM ? (leftFromM[2] || leftFromM[1]).toLowerCase() : null;
+          const leftTable = leftFromM ? leftFromM[1].toLowerCase() : null;
+
+          const innerRaw = rightText.startsWith('(') ? rightText.slice(1, -1).trim() : `SELECT * FROM ${rightText}`;
+          const outRows = [];
+          let rightCols = null;
+          for (const lrow of leftRows) {
+              const lc = {};
+              for (const k in lrow) lc[k.toLowerCase()] = lrow[k];
+              // 相関参照（<alias>.col / 素の列名）を左行の値リテラルへ差し替える
+              let q = innerRaw;
+              if (leftAlias) q = q.replace(new RegExp('\\b' + leftAlias + '\\.([a-zA-Z0-9_]+)\\b', 'gi'), (mm, c) => this._literalOf(lc[c.toLowerCase()]));
+              if (leftTable && leftTable !== leftAlias) q = q.replace(new RegExp('\\b' + leftTable + '\\.([a-zA-Z0-9_]+)\\b', 'gi'), (mm, c) => this._literalOf(lc[c.toLowerCase()]));
+              const rres = this.executeQuery(q);
+              if (rres.error) throw new Error("APPLY subquery failed: " + rres.error);
+              if (rres.data.length > 0 && !rightCols) rightCols = Object.keys(rres.data[0]);
+              if (rres.data.length === 0) {
+                  if (kind === 'OUTER') outRows.push({ ...lrow, __apply_null: 1 });
+                  continue;
+              }
+              rres.data.forEach(rr => {
+                  const merged = { ...lrow };
+                  for (const k in rr) merged[k] = rr[k];
+                  outRows.push(merged);
+              });
+          }
+          // OUTER APPLY の非マッチ行は右側列を NULL で補う
+          const leftCols = leftRows.length > 0 ? Object.keys(leftRows[0]) : [];
+          const allCols = [...leftCols];
+          (rightCols || []).forEach(c => { if (!allCols.includes(c)) allCols.push(c); });
+          const norm = outRows.map(r => {
+              const o = {};
+              allCols.forEach(c => { o[c] = r[c] === undefined ? null : r[c]; });
+              return o;
+          });
+
+          const tmpName = '__tmp_apply_' + (this._tmpCounter = (this._tmpCounter || 0) + 1);
+          this._materializeRows(tmpName, norm, allCols);
+
+          // SELECT 句は元のまま、FROM 以降を実体化テーブルへ差し替える。
+          // 実体化後は列名がフラットになるため、左右の別名修飾子は取り除く
+          const selHead = before.match(/^select\s+(distinct\s+)?([\s\S]*?)\s+from\s+/i);
+          const distinctTxt = selHead && selHead[1] ? 'DISTINCT ' : '';
+          const stripQual = (txt) => {
+              let s = txt;
+              [leftAlias, leftTable, rightAlias].forEach(a => {
+                  if (a) s = s.replace(new RegExp('\\b' + a + '\\.', 'gi'), '');
+              });
+              return s;
+          };
+          const selList = stripQual(selHead ? selHead[2] : '*');
+          const rest = stripQual(sql.slice(consumedEnd));
+          return `SELECT ${distinctTxt}${selList} FROM ${tmpName}${rest}`;
+      },
+
       // 再帰CTE (WITH RECURSIVE): アンカー部の行を初期作業集合とし、再帰部を
       // 「前イテレーションの行だけが見える作業テーブル」に対して繰り返し実行する。
       // UNION（重複除去）は累積集合と重複した行を捨てることで循環データでも収束する。
@@ -211,7 +510,7 @@
               return `${kw} ${workName} ${cteName}${aliasPart || ''}`;
           });
           const runSeg = (segSql) => {
-              const expanded = this.expandSubqueries(this.expandTableFunctions(this.expandViews(segSql, strMap), strMap), strMap);
+              const expanded = this.expandSubqueries(this.expandRelationalOps(this.expandTableFunctions(this.expandViews(segSql, strMap), strMap), strMap), strMap);
               const r = this.executeQuery(expanded, true, strMap);
               if (r.error) throw new Error(`Recursive CTE '${cteName}': ${r.error}`);
               return r.data;
@@ -302,7 +601,7 @@
                   // 自己参照あり → 再帰CTE（サブクエリ展開は各セグメントの実行時に行う）
                   this._materializeRecursiveCTE(name, body, tmpName, strMap, colNames);
               } else {
-                  body = this.expandSubqueries(this.expandTableFunctions(this.expandViews(body, strMap), strMap), strMap);
+                  body = this.expandSubqueries(this.expandRelationalOps(this.expandTableFunctions(this.expandViews(body, strMap), strMap), strMap), strMap);
                   const res = this.executeQuery(body, true, strMap);
                   if (res.error) throw new Error(`CTE '${name}': ${res.error}`);
                   this._materializeRows(tmpName, res.data, colNames);

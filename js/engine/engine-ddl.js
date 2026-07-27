@@ -5,18 +5,18 @@
     // SHOW FUNCTIONS 用の関数レジストリ（カテゴリ -> 空白区切りの関数名）。
     // エンジンへ関数を追加したらここにも登録する
     const LUMINA_FN_REGISTRY = {
-        'String': 'UPPER LOWER LENGTH LEN CHAR_LENGTH CHARACTER_LENGTH OCTET_LENGTH BIT_LENGTH CONCAT CONCAT_WS SUBSTRING SUBSTR MID SUBSTRING_INDEX LEFT RIGHT LPAD RPAD TRIM LTRIM RTRIM REPLACE REPLICATE REVERSE REPEAT INSTR STRPOS LOCATE POSITION CHARINDEX PATINDEX ASCII CHAR CHR SPACE STRCMP ELT FIELD INITCAP UCASE LCASE FORMAT HEX UNHEX BIN OCT CONV QUOTE QUOTENAME SPLIT_PART TRANSLATE INSERT STUFF SOUNDEX STARTS_WITH ENDS_WITH',
+        'String': 'UPPER LOWER LENGTH LEN CHAR_LENGTH CHARACTER_LENGTH OCTET_LENGTH BIT_LENGTH CONCAT CONCAT_WS SUBSTRING SUBSTR MID SUBSTRING_INDEX LEFT RIGHT LPAD RPAD TRIM LTRIM RTRIM REPLACE REPLICATE REVERSE REPEAT INSTR STRPOS LOCATE POSITION CHARINDEX PATINDEX ASCII CHAR CHR SPACE STRCMP ELT FIELD INITCAP UCASE LCASE FORMAT HEX UNHEX BIN OCT CONV QUOTE QUOTENAME QUOTE_IDENT QUOTE_LITERAL SPLIT_PART TRANSLATE INSERT STUFF OVERLAY PARSENAME SOUNDEX STARTS_WITH ENDS_WITH',
         'Regexp': 'REGEXP_REPLACE REGEXP_SUBSTR REGEXP_LIKE REGEXP_COUNT REGEXP_INSTR',
-        'Numeric': 'ABS CEIL CEILING FLOOR ROUND TRUNCATE TRUNC MOD SIGN POWER POW SQUARE SQRT CBRT EXP LN LOG LOG10 LOG2 PI RAND RANDOM SIN COS TAN COT SINH COSH TANH ASIN ACOS ATAN ATAN2 DEGREES RADIANS GREATEST LEAST GCD LCM FACTORIAL WIDTH_BUCKET BITAND BITOR BITXOR BITNOT ISNUMERIC BIT_COUNT CRC32 FORMAT_BYTES',
-        'Date & Time': 'NOW CURRENT_TIMESTAMP SYSDATE SYSTIMESTAMP GETDATE UTC_TIMESTAMP CURDATE CURRENT_DATE UTC_DATE CURTIME CURRENT_TIME DATE TIME YEAR MONTH DAY DAYOFMONTH HOUR MINUTE SECOND DAYOFWEEK DAYOFYEAR WEEKDAY WEEK WEEKOFYEAR QUARTER MONTHNAME DAYNAME LAST_DAY EOMONTH DATEDIFF DATE_ADD DATE_SUB ADD_MONTHS MONTHS_BETWEEN ADDDATE SUBDATE EXTRACT DATE_PART TIMESTAMPDIFF TIMESTAMPADD DATE_FORMAT STR_TO_DATE UNIX_TIMESTAMP FROM_UNIXTIME SEC_TO_TIME TIME_TO_SEC MAKEDATE MAKETIME MAKE_DATE MAKE_TIMESTAMP TO_DAYS FROM_DAYS DATE_TRUNC',
+        'Numeric': 'ABS CEIL CEILING FLOOR ROUND TRUNCATE TRUNC MOD REMAINDER SIGN POWER POW SQUARE SQRT CBRT EXP LN LOG LOG10 LOG2 PI RAND RANDOM SIN COS TAN COT SINH COSH TANH ASIN ACOS ATAN ATAN2 DEGREES RADIANS GREATEST LEAST GCD LCM FACTORIAL WIDTH_BUCKET NANVL BITAND BITOR BITXOR BITNOT SHIFTLEFT SHIFTRIGHT ISNUMERIC BIT_COUNT CRC32 FORMAT_BYTES',
+        'Date & Time': 'NOW CURRENT_TIMESTAMP SYSDATE SYSTIMESTAMP GETDATE GETUTCDATE SYSDATETIME SYSUTCDATETIME UTC_TIMESTAMP CURDATE CURRENT_DATE UTC_DATE CURTIME CURRENT_TIME DATE TIME YEAR MONTH DAY DAYOFMONTH HOUR MINUTE SECOND DAYOFWEEK DAYOFYEAR WEEKDAY WEEK WEEKOFYEAR QUARTER MONTHNAME DAYNAME LAST_DAY EOMONTH NEXT_DAY DATEDIFF DATEADD DATEPART DATENAME DATE_ADD DATE_SUB ADD_MONTHS MONTHS_BETWEEN ADDDATE SUBDATE EXTRACT DATE_PART TIMESTAMPDIFF TIMESTAMPADD DATE_FORMAT STR_TO_DATE UNIX_TIMESTAMP FROM_UNIXTIME SEC_TO_TIME TIME_TO_SEC MAKEDATE MAKETIME MAKE_DATE MAKE_TIMESTAMP TO_DAYS FROM_DAYS DATE_TRUNC',
         'JSON': 'JSON_EXTRACT JSON_VALUE JSON_ARRAY JSON_OBJECT JSON_LENGTH JSON_KEYS JSON_VALID JSON_TYPE JSON_CONTAINS JSON_SET JSON_REMOVE JSON_PRETTY JSON_QUOTE JSON_UNQUOTE JSON_ARRAY_APPEND JSON_MERGE_PATCH JSON_DEPTH',
-        'Null & Flow': 'COALESCE IFNULL ISNULL NVL NVL2 ZEROIFNULL NULLIFZERO NULLIF DECODE CHOOSE IF IIF CASE CAST CONVERT',
-        'Conversion': 'CAST CONVERT TO_NUMBER TO_DATE TO_TIMESTAMP',
+        'Null & Flow': 'COALESCE IFNULL ISNULL NVL NVL2 ZEROIFNULL NULLIFZERO NULLIF DECODE CHOOSE IF IIF CASE CAST CONVERT TRY_CAST TRY_CONVERT',
+        'Conversion': 'CAST CONVERT TRY_CAST TRY_CONVERT TO_NUMBER TO_CHAR TO_HEX TO_DATE TO_TIMESTAMP',
         'Encoding & Hash': 'MD5 SHA1 TO_BASE64 FROM_BASE64 INET_ATON INET_NTOA',
         'Aggregate': 'COUNT SUM AVG MAX MIN GROUP_CONCAT STRING_AGG LISTAGG ARRAY_AGG STDDEV STDDEV_POP STDDEV_SAMP VARIANCE VAR_POP VAR_SAMP MEDIAN BIT_AND BIT_OR BIT_XOR BOOL_AND BOOL_OR CORR COVAR_POP COVAR_SAMP ANY_VALUE JSON_ARRAYAGG JSON_OBJECTAGG MIN_BY MAX_BY COUNT_IF PERCENTILE_CONT PERCENTILE_DISC GROUPING',
         'Window': 'ROW_NUMBER RANK DENSE_RANK LAG LEAD NTILE FIRST_VALUE LAST_VALUE NTH_VALUE PERCENT_RANK CUME_DIST',
         'Sequence': 'NEXTVAL CURRVAL SETVAL',
-        'Meta': 'UUID VERSION DATABASE LAST_INSERT_ID TYPEOF'
+        'Meta': 'UUID NEWID SYS_GUID VERSION DATABASE CURRENT_SCHEMA SCHEMA_NAME USER CURRENT_USER SESSION_USER SYSTEM_USER SUSER_NAME LAST_INSERT_ID TYPEOF'
     };
 
     Object.assign(DatabaseEngine.prototype, {
@@ -232,6 +232,59 @@
 
       // SHOW TABLES / VIEWS / PROCEDURES: メタ情報の一覧
       _executeShow(sql, strMap) {
+          // SHOW MATERIALIZED VIEWS: 実体化ビューの一覧（行数と定義）
+          if (/^show\s+materialized\s+views$/i.test(sql.trim())) {
+              const data = Object.keys(this.matViews).map(n => ({
+                  View: n,
+                  Rows: this.tables[n] ? this.tables[n].rowCount : 0,
+                  Definition: this.matViews[n].sql
+              }));
+              return { data, affectedRows: data.length };
+          }
+          // SHOW COMMENTS: COMMENT ON で付与した注釈の一覧
+          if (/^show\s+comments$/i.test(sql.trim())) {
+              const data = Object.keys(this.comments).map(k => {
+                  const i = k.indexOf(':');
+                  return { Kind: k.slice(0, i).toUpperCase(), Object: k.slice(i + 1), Comment: this.comments[k] };
+              });
+              return { data, affectedRows: data.length };
+          }
+          // SHOW SETTINGS: セッション設定（SET TRANSACTION 等で受理した値）
+          if (/^show\s+settings$/i.test(sql.trim())) {
+              const s = this.sessionSettings;
+              const data = Object.keys(s).map(k => ({ Setting: k, Value: String(s[k]) }));
+              data.push({ Setting: 'effective_isolation', Value: 'SERIALIZABLE' });
+              return { data, affectedRows: data.length };
+          }
+          // SHOW STORAGE: ブラウザ内DBの実データ規模（永続化サイズの見積り）。
+          // 数値列は Float64、文字列はプール実測長で概算する
+          if (/^show\s+storage$/i.test(sql.trim())) {
+              let totalRows = 0, totalBytes = 0, strBytes = 0;
+              const names = Object.keys(this.tables).filter(t => !t.startsWith('__tmp_'));
+              names.forEach(t => {
+                  const tb = this.tables[t];
+                  const nCols = tb.getColumnNames().length;
+                  totalRows += tb.rowCount;
+                  totalBytes += tb.rowCount * nCols * 8; // num(Float64)
+                  totalBytes += tb.rowCount * nCols * 4; // meta(Int32)
+                  for (const c in tb.strPools) {
+                      (tb.strPools[c] || []).forEach(s => { strBytes += (s ? String(s).length : 0) * 2; });
+                  }
+              });
+              totalBytes += strBytes;
+              const data = [
+                  { Metric: 'tables', Value: String(names.length) },
+                  { Metric: 'rows', Value: String(totalRows) },
+                  { Metric: 'string_pool_bytes', Value: String(strBytes) },
+                  { Metric: 'estimated_bytes', Value: String(totalBytes) },
+                  { Metric: 'estimated_mb', Value: (totalBytes / 1048576).toFixed(3) },
+                  { Metric: 'views', Value: String(Object.keys(this.views).length) },
+                  { Metric: 'materialized_views', Value: String(Object.keys(this.matViews).length) },
+                  { Metric: 'sequences', Value: String(Object.keys(this.sequences).length) },
+                  { Metric: 'triggers', Value: String(Object.keys(this.triggers).length) }
+              ];
+              return { data, affectedRows: data.length };
+          }
           if (/^show\s+tables$/i.test(sql.trim())) {
               const data = Object.keys(this.tables)
                   .filter(t => !t.startsWith('__tmp_'))
@@ -522,6 +575,81 @@
           return { data, affectedRows: data.length };
       },
 
+      // セッション制御・権限・注釈系。単一ユーザーのブラウザ内DBでは実効を持たないものが多いが、
+      // 実DB向けスクリプトをそのまま流せるよう受理する。COMMENT ON だけは注釈を保存する。
+      _executeSessionStatement(sql, strMap) {
+          const raw = this._restoreStrings(sql, strMap);
+          let m;
+          if ((m = raw.match(/^comment\s+on\s+(table|column)\s+([a-zA-Z0-9_.]+)\s+is\s+([\s\S]+)$/i))) {
+              const kind = m[1].toLowerCase();
+              const target = m[2].toLowerCase();
+              let text = m[3].trim().replace(/;$/, '');
+              if (/^null$/i.test(text)) text = null;
+              else text = text.replace(/^'([\s\S]*)'$/, '$1').replace(/^"([\s\S]*)"$/, '$1').replace(/''/g, "'");
+              if (kind === 'table') {
+                  if (!this.tables[target] && !this.views[target]) throw this._tableNotFound(target);
+              } else {
+                  const dot = target.indexOf('.');
+                  if (dot === -1) throw new Error("COMMENT ON COLUMN requires <table>.<column>.");
+                  const tn = target.slice(0, dot), cn = target.slice(dot + 1);
+                  if (!this.tables[tn]) throw this._tableNotFound(tn);
+                  if (!this.tables[tn].cols[cn]) throw new Error(`Column '${cn}' not found in table '${tn}'.`);
+              }
+              const key = kind + ':' + target;
+              if (text === null) delete this.comments[key]; else this.comments[key] = text;
+              return { data: [{ Result: "Success", Message: `Comment ${text === null ? 'removed' : 'set'} on ${kind} '${target}'.` }], affectedRows: 0 };
+          }
+          if ((m = raw.match(/^set\s+(?:session\s+|local\s+)?transaction\s+([\s\S]+)$/i))) {
+              const spec = m[1].trim().replace(/;$/, '');
+              const il = spec.match(/isolation\s+level\s+(read\s+uncommitted|read\s+committed|repeatable\s+read|serializable)/i);
+              if (il) this.sessionSettings.isolation_level = il[1].toUpperCase().replace(/\s+/g, ' ');
+              if (/read\s+only/i.test(spec)) this.sessionSettings.transaction_mode = 'READ ONLY';
+              else if (/read\s+write/i.test(spec)) this.sessionSettings.transaction_mode = 'READ WRITE';
+              // 単一スレッドで直列実行されるため、実効的な分離レベルは常に SERIALIZABLE
+              return { data: [{ Result: "Success", Message: `Transaction settings accepted (LuminaDB executes statements serially; effective isolation is SERIALIZABLE).` }], affectedRows: 0 };
+          }
+          if (/^(lock|unlock)\s+tables?\b/i.test(raw)) {
+              return { data: [{ Result: "Success", Message: "Lock statement accepted (no-op: LuminaDB is single-threaded)." }], affectedRows: 0 };
+          }
+          if (/^(grant|revoke)\b/i.test(raw)) {
+              return { data: [{ Result: "Success", Message: "Privilege statement accepted (no-op: LuminaDB has no user accounts)." }], affectedRows: 0 };
+          }
+          if (/^analyze\b/i.test(raw)) {
+              return { data: [{ Result: "Success", Message: "ANALYZE accepted (statistics are computed on demand)." }], affectedRows: 0 };
+          }
+          if (/^discard\b/i.test(raw)) {
+              this.prepared = Object.create(null);
+              this.userVars = Object.create(null);
+              return { data: [{ Result: "Success", Message: "Session state discarded (prepared statements and user variables cleared)." }], affectedRows: 0 };
+          }
+          throw new Error("Unsupported session statement.");
+      },
+
+      // SELECT ... INTO <newtable> FROM ... : 結果セットから新テーブルを作成する
+      _executeSelectInto(newName, selectSql, strMap) {
+          if (this.tables[newName]) throw new Error(`Table '${newName}' already exists.`);
+          if (this.views[newName]) throw new Error(`View '${newName}' already exists.`);
+          const res = this.executeQuery(selectSql, true, strMap);
+          if (res.error) throw new Error(res.error);
+          this._logCreateTable(newName);
+          this._materializeRows(newName, res.data);
+          return { data: [{ Result: "Success", Message: `Table '${newName}' created with ${res.data.length} rows.` }], affectedRows: res.data.length };
+      },
+
+      // REFRESH MATERIALIZED VIEW <name>: 定義クエリを再実行して実体テーブルを差し替える
+      _refreshMatView(sql, strMap) {
+          const m = sql.match(/^refresh\s+materialized\s+view\s+([a-zA-Z0-9_]+)\s*$/i);
+          if (!m) throw new Error("Syntax Error. Use REFRESH MATERIALIZED VIEW <name>.");
+          const name = m[1].toLowerCase();
+          const mv = this.matViews[name];
+          if (!mv) throw new Error(`Materialized view '${name}' not found.`);
+          const res = this.executeQuery(mv.sql, true, strMap);
+          if (res.error) throw new Error(res.error);
+          this._logTableMeta(name);
+          this._materializeRows(name, res.data);
+          return { data: [{ Result: "Success", Message: `Materialized view '${name}' refreshed (${res.data.length} rows).` }], affectedRows: res.data.length };
+      },
+
       _executeDDL(sql, strMap) {
           let resultSet = [];
           let affectedRows = 0;
@@ -539,6 +667,39 @@
                 this.tables[table].createIndex(col);
                 resultSet = [{ Result: "Success", Message: `Index '${idxName}' created on ${table}(${col}).` }];
              } else throw new Error("Syntax Error in CREATE INDEX.");
+          }
+          else if (/^create\s+materialized\s+view/i.test(sql)) {
+             // マテリアライズドビュー: 定義時に結果を実体化し、REFRESH で明示的に再計算する。
+             // 通常ビュー（クエリ書き換え）と違い、実体は独立したテーブルとして保持される。
+             const m = sql.match(/^create\s+materialized\s+view\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+as\s+([\s\S]+)$/i);
+             if (!m) throw new Error("Syntax Error in CREATE MATERIALIZED VIEW. Use CREATE MATERIALIZED VIEW <name> AS SELECT ...");
+             const ifNotExists = !!m[1];
+             const name = m[2].toLowerCase();
+             const body = m[3].trim();
+             if (this.matViews[name] || this.tables[name] || this.views[name]) {
+                 if (ifNotExists) return { data: [{ Result: "Success", Message: `Materialized view '${name}' already exists. Skipped.` }], affectedRows: 0 };
+                 throw new Error(`Table or view '${name}' already exists.`);
+             }
+             if (!/^select\b/i.test(body) && !/^with\b/i.test(body)) throw new Error("MATERIALIZED VIEW definition must be a SELECT statement.");
+             const res = this.executeQuery(body, true, strMap);
+             if (res.error) throw new Error(res.error);
+             this._logCreateTable(name);
+             this._materializeRows(name, res.data);
+             this.matViews[name] = { sql: this._restoreStrings(body, strMap) };
+             resultSet = [{ Result: "Success", Message: `Materialized view '${name}' created with ${res.data.length} rows.` }];
+          }
+          else if (/^drop\s+materialized\s+view/i.test(sql)) {
+             const m = sql.match(/^drop\s+materialized\s+view\s+(if\s+exists\s+)?([a-zA-Z0-9_]+)/i);
+             if (!m) throw new Error("Syntax Error in DROP MATERIALIZED VIEW.");
+             const name = m[2].toLowerCase();
+             if (!this.matViews[name]) {
+                 if (m[1]) return { data: [{ Result: "Success", Message: `Materialized view '${name}' does not exist. Skipped.` }], affectedRows: 0 };
+                 throw new Error(`Materialized view '${name}' not found.`);
+             }
+             this._logDropTable(name);
+             delete this.tables[name];
+             delete this.matViews[name];
+             resultSet = [{ Result: "Success", Message: `Materialized view '${name}' dropped.` }];
           }
           else if (/^create\s+(?:or\s+replace\s+)?view/i.test(sql)) {
              const m = sql.match(/^create\s+(or\s+replace\s+)?view\s+([a-zA-Z0-9_]+)\s+as\s+([\s\S]+)$/i);
@@ -756,6 +917,24 @@
                     } else {
                         // カラム定義: 列レベルの CHECK / GENERATED / PRIMARY KEY / UNIQUE / NOT NULL / DEFAULT / AUTO_INCREMENT 修飾を解析
                         let def = d;
+                        // SQL標準の識別列 GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(...)] と
+                        // SQL Server の IDENTITY[(seed, incr)] を AUTO_INCREMENT へ正規化する。
+                        // 本実装の採番は「既存最大値+1」なので seed/increment が 1 以外なら明示的に拒否する。
+                        // （ALWAYS / BY DEFAULT の区別は設けず、いずれも明示代入可能な AUTO_INCREMENT 相当）
+                        const identM = def.match(/\bgenerated\s+(always|by\s+default)\s+as\s+identity\b(\s*\(([^)]*)\))?/i)
+                            || def.match(/\bidentity\b(\s*\(([^)]*)\))?/i);
+                        if (identM) {
+                            const optTxt = (identM[3] !== undefined ? identM[3] : identM[2]) || '';
+                            const sw = optTxt.match(/start\s+with\s+(-?\d+)/i);
+                            const ib = optTxt.match(/increment\s+by\s+(-?\d+)/i);
+                            const plain = optTxt.match(/^\s*(-?\d+)\s*,\s*(-?\d+)\s*$/);
+                            const seed = sw ? Number(sw[1]) : (plain ? Number(plain[1]) : 1);
+                            const incr = ib ? Number(ib[1]) : (plain ? Number(plain[2]) : 1);
+                            if (seed !== 1 || incr !== 1) {
+                                throw new Error("IDENTITY with a non-default seed/increment is not supported (use a SEQUENCE with DEFAULT NEXTVAL instead).");
+                            }
+                            def = def.replace(identM[0], ' AUTO_INCREMENT ');
+                        }
                         // 生成列 [GENERATED ALWAYS] AS (expr) [STORED|VIRTUAL] を先に切り出す。
                         // STORED/VIRTUAL いずれも挿入/更新時に評価して格納する（本実装は STORED 相当）
                         let generatedExpr = null;
@@ -1263,17 +1442,24 @@
              resultSet = [{ Result: "Success", Message: `Table '${oldName}' renamed to '${newName}'.` }];
           }
           else if (/^truncate\b/i.test(sql)) {
-             // TABLE キーワードは省略可 (TRUNCATE t / TRUNCATE TABLE t)
+             // TABLE キーワードは省略可 (TRUNCATE t / TRUNCATE TABLE t)。
+             // RESTART IDENTITY で AUTO_INCREMENT の採番を 1 から振り直す（CONTINUE IDENTITY は既定＝維持）
              const m = sql.match(/truncate\s+(?:table\s+)?([a-zA-Z0-9_]+)/i);
              if (m) {
                 const table = m[1].toLowerCase();
                 if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
+                const restartIdentity = /\brestart\s+identity\b/i.test(sql);
                 this._cowColumns(table, 'ALL');
                 const t = this.tables[table];
                 affectedRows = t.rowCount;
                 t.rowCount = 0;
                 if (Object.keys(t.indices).length > 0) t.rebuildIndices();
-                resultSet = [{Result:"Success", Message:`${affectedRows} rows truncated.`}];
+                // 採番は既存行の最大値から続くため、行を消した時点で自然に 1 から再開される。
+                // CONTINUE IDENTITY 指定時に採番を維持するには最終値の保持が要るため未対応と明示する。
+                if (/\bcontinue\s+identity\b/i.test(sql) && t.autoIncrementCol) {
+                    throw new Error("TRUNCATE ... CONTINUE IDENTITY is not supported (identity always restarts after truncation).");
+                }
+                resultSet = [{Result:"Success", Message:`${affectedRows} rows truncated${restartIdentity && t.autoIncrementCol ? ' (identity restarted)' : ''}.`}];
              } else throw new Error("Syntax Error in TRUNCATE TABLE.");
           }
           else if (/^drop\s+index/i.test(sql)) {

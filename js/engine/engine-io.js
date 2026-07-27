@@ -34,6 +34,8 @@
         dump.__procedures__ = JSON.parse(JSON.stringify(this.procedures));
         dump.__triggers__ = JSON.parse(JSON.stringify(this.triggers));
         dump.__sequences__ = JSON.parse(JSON.stringify(this.sequences));
+        dump.__comments__ = Object.assign({}, this.comments);
+        dump.__matviews__ = JSON.parse(JSON.stringify(this.matViews));
         return dump;
       },
 
@@ -45,6 +47,8 @@
         this.procedures = Object.assign(Object.create(null), (dump && dump.__procedures__) ? JSON.parse(JSON.stringify(dump.__procedures__)) : {});
         this.triggers = Object.assign(Object.create(null), (dump && dump.__triggers__) ? JSON.parse(JSON.stringify(dump.__triggers__)) : {});
         this.sequences = Object.assign(Object.create(null), (dump && dump.__sequences__) ? JSON.parse(JSON.stringify(dump.__sequences__)) : {});
+        this.comments = Object.assign(Object.create(null), (dump && dump.__comments__) || {});
+        this.matViews = Object.assign(Object.create(null), (dump && dump.__matviews__) ? JSON.parse(JSON.stringify(dump.__matviews__)) : {});
         for(let tName in dump) {
           if (tName.startsWith('__')) continue;
           const dt = dump[tName];

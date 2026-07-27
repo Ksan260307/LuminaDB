@@ -235,6 +235,36 @@
             return r;
         },
 
+        // ブラウザのストレージ使用量・クォータ・永続化状態と、DB自身の概算サイズを返す。
+        // クォータ超過は保存失敗の原因になるため、書き込み前の確認に使える（非同期）。
+        //   const s = await LuminaDB.storage();  // { usage, quota, usagePercent, persisted, estimatedBytes }
+        async storage() {
+            const info = (typeof getStorageInfo === 'function')
+                ? await getStorageInfo()
+                : { supported: false, usage: null, quota: null, usagePercent: null, persisted: null };
+            const s = db.executeQuery('SHOW STORAGE');
+            const own = {};
+            if (!s.error) s.data.forEach(row => { own[row.Metric] = row.Value; });
+            return {
+                supported: info.supported,
+                usage: info.usage,
+                quota: info.quota,
+                usagePercent: info.usagePercent,
+                persisted: info.persisted,
+                estimatedBytes: own.estimated_bytes !== undefined ? Number(own.estimated_bytes) : null,
+                tables: own.tables !== undefined ? Number(own.tables) : null,
+                rows: own.rows !== undefined ? Number(own.rows) : null
+            };
+        },
+
+        // 永続化ストレージ（ディスク逼迫時に退避されない保存）をブラウザへ要求する。
+        // 付与可否はブラウザの裁量（利用頻度やユーザー操作）で決まる。
+        async persist() {
+            if (typeof requestPersistence !== 'function') return { granted: false, error: 'Persistence API unavailable.' };
+            const granted = await requestPersistence();
+            return { granted };
+        },
+
         // 同期コールバックをトランザクションで包む。fn が throw すると ROLLBACK、
         // 正常終了で COMMIT する。fn の戻り値は result.value に入る。
         //   LuminaDB.transaction(api => { api.insert('t', {...}); api.update('t', ...); })
