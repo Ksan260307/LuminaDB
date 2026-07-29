@@ -3,7 +3,7 @@
     // 各機能メソッドは engine-*.js で prototype 拡張として定義される
     // ============================================================================
     // エンジンバージョン（VERSION() 関数 / SHOW STATUS / 外部APIが参照する）
-    var LUMINA_VERSION = '1.13.0';
+    var LUMINA_VERSION = '1.17.0';
 
     class DatabaseEngine {
       constructor() {
@@ -26,8 +26,30 @@
         // マテリアライズドビュー: name -> { sql }。実体は tables[name] に持ち、
         // REFRESH MATERIALIZED VIEW で再計算する（通常ビューと違い自動更新されない）
         this.matViews = Object.create(null);
+        // スキーマ版数 (PRAGMA user_version)。マイグレーション管理用・IDB保存対象
+        this.userVersion = 0;
+        // ストアドプロシージャの仮引数: name -> [p1, p2, ...]（本体は procedures 側）
+        this.procParams = Object.create(null);
+        // ユーザー定義スカラー関数 (CREATE FUNCTION): name -> { params: [...], body, returns }
+        // 呼び出し箇所へ式として展開される（IDB保存対象）
+        this.functions = Object.create(null);
+        // 名前付きスナップショット (CREATE SNAPSHOT): name -> { at, tables, ... }。
+        // メモリ内タイムトラベル用。IDB保存対象外（セッション限り）
+        this.snapshots = Object.create(null);
         // セッション設定（SET TRANSACTION ISOLATION LEVEL 等）。表示・互換用でセッション限り
         this.sessionSettings = Object.create(null);
+        // 文単位の実行時間上限 (ms)。0/未設定なら無制限。
+        // ブラウザではクエリがUIスレッドを占有するため、暴走クエリの保険として使う
+        this.statementTimeoutMs = 0;
+        // 直近クエリのプロファイル（SHOW PROFILE）と遅いクエリのリングバッファ
+        this.lastProfile = null;
+        this.slowLog = [];
+        this.slowLogThresholdMs = 50;
+        // 読み取り専用モード。ON の間は DML/DDL を拒否する（外部APIの安全な公開用）。
+        // readOnlyLocked が真だと SQL 側（SET read_only = OFF）からは解除できず、
+        // ホストアプリの LuminaDB.readOnly(false) だけが解除できる
+        this.readOnly = false;
+        this.readOnlyLocked = false;
         this.inTransaction = false;
         this.undoLog = [];
         // 直近の INSERT で AUTO_INCREMENT 列へ採番された最終値（LAST_INSERT_ID() が返す）
@@ -145,15 +167,48 @@
         if (sql === '') return { error: "Empty query" };
 
         let strMap = externalStrMap;
-        if (!isSubquery && !strMap) {
+        const isTopLevel = !isSubquery && !externalStrMap;
+        if (isTopLevel) {
             strMap = [];
             // 相関サブクエリのレジストリは文単位（コンパイル済み式が実行中に参照する）
             this._corrSubs = [];
             sql = this._maskStrings(sql, strMap);
+            // 文単位の実行時間上限。ネストした executeQuery は最上位の期限を引き継ぐ
+            this._deadline = this.statementTimeoutMs > 0 ? (startTime + this.statementTimeoutMs) : 0;
+        }
+        // エンジン参照は tables 辞書の非列挙プロパティなので、SQL の識別子として
+        // 書かれると「テーブルとして見つかってしまう」。予約語として明示的に弾く
+        // （文字列リテラルは退避済みなので、データ中の同名文字列には反応しない）
+        if (/\b__engine__\b/.test(sql)) {
+            return { error: "Identifier '__engine__' is reserved." };
+        }
+        // 読み取り専用モード: 参照系以外を実行前に拒否する（外部公開時の保護）。
+        // 解除は SET read_only = OFF か LuminaDB.readOnly(false)。ただし
+        // LuminaDB.readOnly(true, { lock: true }) でロックした場合は SQL からは解除できない
+        if (this.readOnly && !this._isReadOnlyStatement(sql)) {
+            const unlock = !this.readOnlyLocked && /^set\s+(?:session\s+|local\s+|global\s+)?read_only\b/i.test(sql);
+            if (!unlock) return { error: "Database is in read-only mode: this statement is not allowed." };
         }
 
         let isExplain = false;
         let isAnalyze = false;
+        // EXPLAIN (FORMAT JSON|TEXT) ... : オプション括弧を受理する（PostgreSQL 形式）
+        let explainJson = false;
+        const exOpt = sql.match(/^explain\s*\(\s*([\s\S]*?)\s*\)\s+/i);
+        if (exOpt) {
+            const opts = exOpt[1].split(',').map(o => o.trim().toUpperCase());
+            const fmt = opts.find(o => /^FORMAT\s+/.test(o));
+            if (fmt) {
+                const f = fmt.replace(/^FORMAT\s+/, '');
+                if (f !== 'JSON' && f !== 'TEXT') {
+                    return { error: `Unsupported EXPLAIN format '${f}'. Use FORMAT JSON or FORMAT TEXT.` };
+                }
+                explainJson = f === 'JSON';
+            }
+            sql = 'EXPLAIN ' + sql.slice(exOpt[0].length);
+        }
+        // SQLite の EXPLAIN QUERY PLAN は通常の EXPLAIN と同義に扱う
+        sql = sql.replace(/^explain\s+query\s+plan\s+/i, 'EXPLAIN ');
         if (/^explain\s+analyze\s+/i.test(sql)) {
             // EXPLAIN ANALYZE: 実行計画に加えてクエリを実際に実行し、実測値を付記する
             isAnalyze = true;
@@ -175,9 +230,26 @@
           // CREATE VIEW / PROCEDURE / TRIGGER の本体は定義として保存するため事前展開しない。
           // MERGE は USING (サブクエリ) を自前で解釈するため、ここでの一括展開対象から除外する
           // （下位の SELECT / UPDATE / INSERT 再実行時に個別展開される）。
+          // ロック句 FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE は受理して無視する
+          // （LuminaDB は文を直列実行するので行ロックは意味を持たない）
+          if (/^select/i.test(sql)) {
+              sql = sql.replace(/\s+FOR\s+(?:UPDATE|SHARE|KEY\s+SHARE|NO\s+KEY\s+UPDATE)(?:\s+OF\s+[a-zA-Z0-9_,\s]+?)?(?:\s+(?:NOWAIT|SKIP\s+LOCKED))?\s*$/i, '');
+          }
+          // 単一スキーマ (main / public) の修飾は取り除いて素の表名にする
+          if (/\b(?:main|public)\s*\.\s*[a-zA-Z_]/i.test(sql)) {
+              sql = sql.replace(/\b(?:main|public)\s*\.\s*(?=[a-zA-Z_])/gi, '');
+          }
+
+          // 複数表 UPDATE/DELETE（... FROM src / ... USING src / ... JOIN src）は
+          // サブクエリ展開の前に単一表＋相関サブクエリの形へ書き換える
+          if (!isSubquery && /^(update|delete)\b/i.test(sql)) {
+              sql = this._rewriteMultiTableDml(sql);
+          }
+
           if (!isSubquery
-              && !/^create\s+(or\s+replace\s+)?(view|procedure|trigger)\b/i.test(sql)
+              && !/^create\s+(or\s+replace\s+)?(view|procedure|trigger|function)\b/i.test(sql)
               && !/^merge\s+into\b/i.test(sql)) {
+              sql = this.expandInfoSchema(sql);
               sql = this.expandViews(sql, strMap);
               sql = this.expandTableFunctions(sql, strMap);
               sql = this.expandRelationalOps(sql, strMap);
@@ -225,7 +297,9 @@
                  res = this._executeSelectPlan(plan, strMap);
              }
              if (isExplain) {
-                 return { data: res.data, executionTime: (performance.now() - startTime).toFixed(2), scannedRows: res.affectedRows };
+                 // FORMAT JSON: 計画を 1 行の JSON 文字列で返す（ツール連携向け）
+                 const out = explainJson ? [{ QUERY_PLAN: JSON.stringify(res.data) }] : res.data;
+                 return { data: out, executionTime: (performance.now() - startTime).toFixed(2), scannedRows: res.affectedRows };
              }
              resultSet = res.data;
              affectedRows = res.affectedRows;
@@ -252,7 +326,7 @@
              affectedRows = res.affectedRows;
           }
           else if (/^call\b/i.test(sql)) {
-             const res = this._executeCall(sql);
+             const res = this._executeCall(sql, strMap);
              resultSet = res.data;
              affectedRows = res.affectedRows;
           }
@@ -270,6 +344,50 @@
              const res = this._executeSetVar(sql, strMap);
              resultSet = res.data;
              affectedRows = res.affectedRows;
+          }
+          else if (/^(create|drop)\s+schema\b/i.test(sql)) {
+             // 単一スキーマ (main) のみのため、CREATE/DROP SCHEMA は受理して記録するに留める。
+             // 実DB向けスクリプトをそのまま流せるようにするための互換措置
+             const sm = sql.match(/^(create|drop)\s+schema\s+(if\s+not\s+exists\s+|if\s+exists\s+)?([a-zA-Z0-9_]+)/i);
+             if (!sm) throw new Error("Syntax Error. Use CREATE|DROP SCHEMA [IF [NOT] EXISTS] <name>.");
+             const nm = sm[3].toLowerCase();
+             this.schemas = this.schemas || Object.create(null);
+             if (sm[1].toLowerCase() === 'create') this.schemas[nm] = true; else delete this.schemas[nm];
+             resultSet = [{ Result: "Success", Message: `Schema '${nm}' ${sm[1].toLowerCase() === 'create' ? 'created' : 'dropped'} (LuminaDB uses a single schema; objects live in 'main').` }];
+          }
+          else if (/^pragma\b/i.test(sql)) {
+             // SQLite 互換の PRAGMA（table_info / index_list / user_version 等）
+             const res = this._executePragma(sql, strMap);
+             resultSet = res.data;
+             affectedRows = res.affectedRows;
+          }
+          else if (/^declare\s+@/i.test(sql)) {
+             // T-SQL の DECLARE @x [type] [= 値]: ユーザー変数の宣言（初期値なしは NULL）
+             const dm = sql.match(/^declare\s+@([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+[a-zA-Z][a-zA-Z0-9_]*(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)?(?:\s*=\s*([\s\S]+))?$/i);
+             if (!dm) throw new Error("Syntax Error in DECLARE. Use DECLARE @name [type] [= <expression>].");
+             const res = this._executeSetVar(`SET @${dm[1]} = ${dm[2] !== undefined ? dm[2] : 'NULL'}`, strMap);
+             resultSet = res.data;
+             affectedRows = res.affectedRows;
+          }
+          else if (/^(create|drop|restore)\s+snapshot\b/i.test(sql)) {
+             // メモリ内スナップショット（タイムトラベル）: CREATE / RESTORE / DROP SNAPSHOT
+             const res = this._executeSnapshot(sql);
+             resultSet = res.data;
+             affectedRows = res.affectedRows;
+          }
+          // 否定先読みは修飾語の前に置く（後ろに置くと SET SESSION TRANSACTION ... のとき
+          // 「修飾語なし」へバックトラックして一致してしまう）
+          else if (/^set\s+(?!(?:session\s+|local\s+|global\s+)?transaction\b)(?:session\s+|local\s+|global\s+)?[a-zA-Z_@]/i.test(sql)) {
+             // セッション変数: SET [SESSION] statement_timeout = 500 / read_only = ON など
+             const res = this._executeSetSessionVar(sql, strMap);
+             resultSet = res.data;
+             affectedRows = res.affectedRows;
+          }
+          else if (/^(reindex|checkpoint|flush|cluster|deallocate\s+all)\b/i.test(sql)) {
+             // 保守系コマンド。LuminaDB はインメモリなので実効を持たないが、
+             // 実DB向けスクリプトをそのまま流せるよう受理する（VACUUM だけは実処理あり）
+             const verb = sql.match(/^[a-zA-Z_]+/)[0].toUpperCase();
+             resultSet = [{ Result: "Success", Message: `${verb} accepted (no-op: LuminaDB keeps everything in memory; use VACUUM to compact).` }];
           }
           else if (/^(set\s+(session\s+|local\s+)?transaction\b|lock\s+tables?\b|unlock\s+tables?\b|grant\b|revoke\b|comment\s+on\b|analyze\b(?!\s+table)|discard\b)/i.test(sql)) {
              // セッション制御・権限系: 単一ユーザーのブラウザ内DBでは意味を持たないが、
@@ -328,16 +446,73 @@
 
         } catch (e) {
           if (!isSubquery) this.cleanupTempTables();
+          if (isTopLevel) { this._deadline = 0; this._recordProfile(rawSql, startTime, -1, e.message); }
           return { error: e.message };
         }
 
         if (!isSubquery) this.cleanupTempTables();
 
         const executionTime = performance.now() - startTime;
+        if (isTopLevel) { this._deadline = 0; this._recordProfile(rawSql, startTime, resultSet ? resultSet.length : 0, null); }
         return {
           data: resultSet,
           executionTime: Math.max(0.01, executionTime).toFixed(2),
           scannedRows: affectedRows
         };
+      }
+
+      // 実行時間の上限チェック。行ループの内側から一定間隔で呼ばれる。
+      // ブラウザではクエリが UI スレッドを止めるため、暴走を確実に切る手段が要る
+      _checkDeadline() {
+          if (this._deadline && performance.now() > this._deadline) {
+              const ms = this.statementTimeoutMs;
+              this._deadline = 0;
+              const e = new Error(`Statement timeout: query exceeded ${ms} ms (SET statement_timeout = 0 to disable).`);
+              e.__fatal = true;   // DECLARE HANDLER で捕まえられない（時間上限の保証を守るため）
+              throw e;
+          }
+      }
+
+      // 行ループ用の軽量な期限チェッカを作る。statement_timeout 未設定なら
+      // 何もしないクロージャを返すので、既定経路のコストは実質ゼロ。
+      // 1024 行ごとにだけ時刻を読む（performance.now() を毎行呼ぶと逆に遅くなる）
+      _mkTick() {
+          const dl = this._deadline;
+          if (!dl) return function () {};
+          const ms = this.statementTimeoutMs;
+          let n = 0;
+          return function () {
+              if ((++n & 1023) !== 0) return;
+              if (performance.now() > dl) {
+                  const e = new Error(`Statement timeout: query exceeded ${ms} ms (SET statement_timeout = 0 to disable).`);
+                  e.__fatal = true;
+                  throw e;
+              }
+          };
+      }
+
+      // 読み取り専用モードで許可する文かどうか（WITH 句は本体の文種で判定する）
+      _isReadOnlyStatement(sql) {
+          let s = String(sql).trim();
+          if (/^with\s/i.test(s)) {
+              const bodyIdx = s.toLowerCase().lastIndexOf(')');
+              if (bodyIdx !== -1) s = s.slice(bodyIdx + 1).trim();
+          }
+          // PRAGMA は参照形（'=' を含まない）だけ許可する（PRAGMA user_version = n は書き込み）
+          if (/^pragma\b/i.test(s)) return !/=/.test(s);
+          // SELECT ... INTO <table> は新しい表を作るので参照系ではない
+          if (/^select\b[\s\S]*?\s+into\s+[a-zA-Z0-9_]+\s+from\b/i.test(s)) return false;
+          return /^(select|explain|show|describe|desc|table|values|check|analyze\s+table|use\b)/i.test(s);
+      }
+
+      // 直近クエリのプロファイルを記録し、閾値を超えたものは slowLog へ積む
+      _recordProfile(sql, startTime, rows, error) {
+          const ms = performance.now() - startTime;
+          const text = String(sql).replace(/\s+/g, ' ').trim().slice(0, 200);
+          this.lastProfile = { sql: text, ms: Number(ms.toFixed(3)), rows, error: error || null };
+          if (ms >= this.slowLogThresholdMs || error) {
+              this.slowLog.push(this.lastProfile);
+              if (this.slowLog.length > 100) this.slowLog.shift();
+          }
       }
     }

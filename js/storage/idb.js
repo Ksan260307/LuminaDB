@@ -85,41 +85,119 @@
     // 楽観ロック用: このタブが最後に読み込み/保存したスナップショットのバージョン番号
     let dbSnapshotVersion = 0;
 
+    // 保存済みの世代番号を読む。新形式は 'meta'、旧形式は 'latest' に入っている
     function readStoredVersion(idb) {
         return new Promise((resolve, reject) => {
             const tx = idb.transaction(IDB_STORE, 'readonly');
-            const req = tx.objectStore(IDB_STORE).get('latest');
-            req.onsuccess = () => resolve((req.result && typeof req.result.__version__ === 'number') ? req.result.__version__ : 0);
-            req.onerror = () => reject(req.error);
+            const store = tx.objectStore(IDB_STORE);
+            const mreq = store.get(META_KEY);
+            mreq.onsuccess = () => {
+                if (mreq.result && typeof mreq.result.__version__ === 'number') { resolve(mreq.result.__version__); return; }
+                const lreq = store.get('latest');
+                lreq.onsuccess = () => resolve((lreq.result && typeof lreq.result.__version__ === 'number') ? lreq.result.__version__ : 0);
+                lreq.onerror = () => reject(lreq.error);
+            };
+            mreq.onerror = () => reject(mreq.error);
         });
     }
 
+    // ------------------------------------------------------------------------
+    // タブ間の書き込み排他 (Web Locks API)
+    //
+    // 楽観ロックだけだと「バージョン読み取り → 書き込み」の間に他タブが割り込む窓が残る。
+    // Web Locks でオリジン単位の名前付きロックを取れば、その区間そのものを直列化できる。
+    // 未対応ブラウザでは従来どおり楽観ロックだけで動く（機能低下のみ）。
+    // ------------------------------------------------------------------------
+    const hasWebLocks = typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function';
+    function withWriteLock(fn) {
+        if (!hasWebLocks) return fn();
+        return navigator.locks.request('luminadb-write', fn);
+    }
+
     async function saveDB(dataObj) {
+        return withWriteLock(() => saveDBLocked(dataObj));
+    }
+
+    // ------------------------------------------------------------------------
+    // 差分（テーブル単位）保存
+    //
+    // 以前は保存のたびに DB 全体を 1 レコードへ直列化・暗号化していた。行が 1 行
+    // 変わっただけでも全テーブルを書き直すため、データが増えるほど自動保存が重くなる。
+    // ここではテーブルごとに 'tbl:<name>' レコードへ分け、`fp`（変更世代:行数:容量）が
+    // 前回と同じテーブルは書き直さない。カタログ（ビュー/関数/シーケンス等）と
+    // 指紋一覧は 'meta' に置く。
+    //   旧形式（'latest' 1 レコード）も読み込みだけ引き続き対応する。
+    // ------------------------------------------------------------------------
+    const META_KEY = 'meta';
+    const CHUNK_FORMAT = 'chunked-v1';
+    const tableKey = (name) => 'tbl:' + name;
+    // 直近に保存したテーブルの指紋（このタブが把握している保存済みの状態）
+    let storedFingerprints = Object.create(null);
+    // 統計（テストと SHOW STORAGE 用）: 直近保存で何テーブル書いたか
+    let lastSaveStats = { tables: 0, written: 0, skipped: 0, removed: 0, full: true };
+
+    async function encryptRecord(idb, value, version) {
+        if (!hasSubtleCrypto) return { __encrypted__: false, __version__: version, plain: value };
+        const key = await getCryptoKey(idb);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key,
+            new TextEncoder().encode(serializeDump(value)));
+        return { __encrypted__: true, __version__: version, iv, data: cipher };
+    }
+
+    async function decryptRecord(idb, rec) {
+        if (!rec) return undefined;
+        if (!rec.__encrypted__) return rec.plain !== undefined ? rec.plain : rec;
+        if (!hasSubtleCrypto) throw new Error("暗号化されたスナップショットの復号には Web Crypto API（セキュアコンテキスト）が必要です。");
+        const key = await getCryptoKey(idb);
+        try {
+            const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: rec.iv }, key, rec.data);
+            return deserializeDump(new TextDecoder().decode(plain));
+        } catch (e) {
+            throw new Error("保存データの復号に失敗しました（データ破損または鍵の不一致）。'Clear DB' で初期化できます。");
+        }
+    }
+
+    async function saveDBLocked(dataObj) {
         const idb = await initDB();
-        // 楽観ロック: 別のタブ/ウィンドウが先に保存していた場合は上書きせずエラーにする
-        // （読み取り→書き込み間の競合窓は残るが、タブ間の意図しない相互上書きを実用上防げる）
+        // 楽観ロック: 別のタブ/ウィンドウが先に保存していた場合は上書きせずエラーにする。
+        // Web Locks が使える環境では、この読み取りから書き込みまでが直列化される
         const stored = await readStoredVersion(idb);
         if (stored !== dbSnapshotVersion) {
             throw new Error("保存を中止しました: 別のタブ/ウィンドウがデータベースを更新しています。ページを再読み込みして最新の状態を取得してください。");
         }
-        dataObj.__version__ = stored + 1;
+        const version = stored + 1;
+        dataObj.__version__ = version;
 
-        // AES-GCM で暗号化して保存する。バージョン番号は楽観ロックが復号なしで
-        // 参照できるよう、暗号文の外側（ラッパー）にも平文で持たせる
-        let record = dataObj;
-        if (hasSubtleCrypto) {
-            const key = await getCryptoKey(idb);
-            const iv = crypto.getRandomValues(new Uint8Array(12));
-            const plain = new TextEncoder().encode(serializeDump(dataObj));
-            const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain);
-            record = { __encrypted__: true, __version__: dataObj.__version__, iv, data: cipher };
-        } else {
-            console.warn('Web Crypto API が利用できないため、スナップショットは平文で保存されます。');
-        }
+        // テーブルとカタログに分ける
+        const tableNames = Object.keys(dataObj).filter(k => !k.startsWith('__'));
+        const catalog = Object.create(null);
+        Object.keys(dataObj).filter(k => k.startsWith('__')).forEach(k => { catalog[k] = dataObj[k]; });
+
+        const fps = Object.create(null);
+        const changed = [];
+        tableNames.forEach(n => {
+            const fp = dataObj[n].fp !== undefined ? String(dataObj[n].fp) : null;
+            fps[n] = fp;
+            // 指紋が取れないテーブル（旧ダンプ由来）は毎回書く
+            if (fp === null || storedFingerprints[n] !== fp) changed.push(n);
+        });
+        const removed = Object.keys(storedFingerprints).filter(n => !(n in fps));
+
+        // 変更のあったテーブルだけ暗号化する（暗号化は保存コストの大半を占める）
+        const records = [];
+        for (const n of changed) records.push([tableKey(n), await encryptRecord(idb, dataObj[n], version)]);
+        const metaRecord = await encryptRecord(idb, { __format__: CHUNK_FORMAT, tables: fps, catalog }, version);
+        metaRecord.__format__ = CHUNK_FORMAT;   // 復号せずに形式を判別できるよう外側にも置く
 
         await new Promise((resolve, reject) => {
             const tx = idb.transaction(IDB_STORE, 'readwrite');
-            tx.objectStore(IDB_STORE).put(record, 'latest');
+            const store = tx.objectStore(IDB_STORE);
+            records.forEach(([k, v]) => store.put(v, k));
+            removed.forEach(n => store.delete(tableKey(n)));
+            store.put(metaRecord, META_KEY);
+            // 旧形式の全体レコードが残っていれば、新形式への移行後に片付ける
+            store.delete('latest');
             tx.oncomplete = () => resolve();
             // クォータ超過はブラウザDB特有の失敗モードなので、原因が分かる文言へ変換する
             tx.onerror = () => {
@@ -131,34 +209,55 @@
                 }
             };
         });
-        dbSnapshotVersion = dataObj.__version__;
+
+        storedFingerprints = fps;
+        lastSaveStats = {
+            tables: tableNames.length, written: changed.length,
+            skipped: tableNames.length - changed.length, removed: removed.length,
+            full: changed.length === tableNames.length
+        };
+        dbSnapshotVersion = version;
         // 他タブへ保存を通知する（相手側は最新版の存在に気づける）
         broadcastSaved(dbSnapshotVersion);
     }
 
-    async function loadDB() {
-        const idb = await initDB();
-        const data = await new Promise((resolve, reject) => {
+    // 直近保存で「書いたテーブル / 省いたテーブル」の内訳
+    function getSaveStats() { return Object.assign({}, lastSaveStats); }
+
+    function idbGet(idb, key) {
+        return new Promise((resolve, reject) => {
             const tx = idb.transaction(IDB_STORE, 'readonly');
-            const req = tx.objectStore(IDB_STORE).get('latest');
+            const req = tx.objectStore(IDB_STORE).get(key);
             req.onsuccess = () => resolve(req.result);
             req.onerror = () => reject(req.error);
         });
+    }
+
+    async function loadDB() {
+        const idb = await initDB();
+        // 新形式（テーブル分割）を優先して読む
+        const meta = await idbGet(idb, META_KEY);
+        if (meta !== undefined) {
+            dbSnapshotVersion = (typeof meta.__version__ === 'number') ? meta.__version__ : 0;
+            const m = await decryptRecord(idb, meta);
+            const dump = Object.create(null);
+            Object.keys(m.catalog || {}).forEach(k => { dump[k] = m.catalog[k]; });
+            const names = Object.keys(m.tables || {});
+            for (const n of names) {
+                const rec = await idbGet(idb, tableKey(n));
+                if (rec === undefined) continue;   // 破損時はその表だけ落とす（全損より良い）
+                dump[n] = await decryptRecord(idb, rec);
+            }
+            storedFingerprints = Object.assign(Object.create(null), m.tables || {});
+            dump.__version__ = dbSnapshotVersion;
+            return dump;
+        }
+        // 旧形式（1 レコード）。読み込みは維持し、次回保存で新形式へ移行される
+        const data = await idbGet(idb, 'latest');
         if (data !== undefined) {
             dbSnapshotVersion = (typeof data.__version__ === 'number') ? data.__version__ : 0;
-            if (data.__encrypted__) {
-                if (!hasSubtleCrypto) {
-                    throw new Error("暗号化されたスナップショットの復号には Web Crypto API（セキュアコンテキスト）が必要です。");
-                }
-                const key = await getCryptoKey(idb);
-                try {
-                    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: data.iv }, key, data.data);
-                    return deserializeDump(new TextDecoder().decode(plain));
-                } catch (e) {
-                    throw new Error("保存データの復号に失敗しました（データ破損または鍵の不一致）。'Clear DB' で初期化できます。");
-                }
-            }
-            // 旧形式（平文）はそのまま読み込む。次回の保存時に暗号化形式へ移行される
+            storedFingerprints = Object.create(null);
+            if (data.__encrypted__) return decryptRecord(idb, data);
             return data;
         }
         return migrateLegacyDB();
@@ -198,11 +297,14 @@
          const idb = await initDB();
          await new Promise((resolve, reject) => {
             const tx = idb.transaction(IDB_STORE, 'readwrite');
-            tx.objectStore(IDB_STORE).delete('latest');
+            // 分割保存した各テーブルのレコードも残らず消す
+            tx.objectStore(IDB_STORE).clear();
             tx.oncomplete = () => resolve();
             tx.onerror = () => reject(tx.error);
         });
         dbSnapshotVersion = 0;
+        storedFingerprints = Object.create(null);
+        lastSaveStats = { tables: 0, written: 0, skipped: 0, removed: 0, full: true };
     }
 
     // --- Auto Save ---
@@ -240,6 +342,80 @@
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'hidden') flushAutoSave();
     });
+
+    // 未保存の変更を抱えたままタブを閉じようとしたら確認ダイアログを出す。
+    // visibilitychange のフラッシュを取りこぼした場合（クラッシュ・強制終了）の最後の砦
+    function hasUnsavedChanges() { return autoSaveTimer !== null; }
+    window.addEventListener('beforeunload', (e) => {
+        if (typeof isTesting !== 'undefined' && isTesting) return;
+        if (!hasUnsavedChanges()) return;
+        flushAutoSave();       // まず保存を試みる（同期的には完了しない）
+        e.preventDefault();
+        e.returnValue = '';    // 仕様上、離脱確認を出すには returnValue の設定が要る
+    });
+
+    // 他タブの保存に追従して自動で読み直すモード（既定は警告のみ）。
+    // 「編集は 1 タブ・閲覧は複数タブ」という使い方で効く
+    let autoReloadOnRemoteSave = false;
+    function setAutoReload(flag) {
+        if (flag === undefined) return autoReloadOnRemoteSave;
+        autoReloadOnRemoteSave = !!flag;
+        return autoReloadOnRemoteSave;
+    }
+    async function reloadFromStorage() {
+        const dump = await loadDB();
+        if (dump === undefined) return false;
+        db.importFromIDB(dump);
+        if (typeof renderTree === 'function') renderTree();
+        if (typeof LuminaDB !== 'undefined' && LuminaDB._notifySubscribers) LuminaDB._notifySubscribers();
+        return true;
+    }
+
+    // ========================================================================
+    // [Backup] - スナップショットのファイル入出力
+    //
+    // IndexedDB は「ブラウザを消したら消える」保存先なので、ユーザーの手元へ
+    // 取り出せる経路が要る。TypedArray を base64 化した JSON 1 ファイルで
+    // 完全な状態（スキーマ・データ・ビュー・関数・シーケンス）を往復できる。
+    // ========================================================================
+    const BACKUP_FORMAT = 'luminadb-backup';
+
+    // 現在のDBをバックアップ用の JSON 文字列にする
+    function serializeBackup(dump) {
+        const meta = {
+            __format__: BACKUP_FORMAT,
+            __app_version__: (typeof LUMINA_VERSION !== 'undefined') ? LUMINA_VERSION : null,
+            __created_at__: new Date().toISOString(),
+            payload: dump
+        };
+        return serializeDump(meta);
+    }
+
+    // バックアップ JSON をダンプへ戻す（形式チェック付き）
+    function parseBackup(text) {
+        let obj;
+        try { obj = deserializeDump(String(text)); }
+        catch (e) { throw new Error("バックアップの解析に失敗しました（JSON として読めません）。"); }
+        if (!obj || obj.__format__ !== BACKUP_FORMAT || !obj.payload) {
+            throw new Error("LuminaDB のバックアップファイルではありません。");
+        }
+        return obj.payload;
+    }
+
+    // バックアップをファイルとしてダウンロードさせる（ブラウザ環境のみ）
+    function downloadBackup(filename) {
+        const text = serializeBackup(db.exportForIDB());
+        const blob = new Blob([text], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename || `luminadb-backup-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        return { bytes: text.length, filename: a.download };
+    }
 
     // ========================================================================
     // [Storage Quota] - ブラウザDB特有の運用情報
@@ -295,6 +471,13 @@
                 if (typeof isTesting !== 'undefined' && isTesting) return;
                 // 自分より新しいスナップショットが他タブで保存された
                 if (typeof msg.version === 'number' && msg.version > dbSnapshotVersion) {
+                    // 自動追従モード: 手元に未保存の変更が無ければ最新を読み直す
+                    if (autoReloadOnRemoteSave && !hasUnsavedChanges() && !db.inTransaction) {
+                        reloadFromStorage()
+                            .then(ok => { if (ok && typeof showToast === 'function') showToast(`別のタブの更新を反映しました (v${msg.version})`); })
+                            .catch(e => console.error('Auto-reload failed:', e));
+                        return;
+                    }
                     if (typeof logConsole === 'function') {
                         logConsole('info', `別のタブがデータベースを更新しました (v${msg.version})`, 'Load DB で最新の状態を取得できます');
                     }

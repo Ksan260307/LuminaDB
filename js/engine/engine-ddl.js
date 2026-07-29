@@ -19,7 +19,19 @@
         'Meta': 'UUID NEWID SYS_GUID VERSION DATABASE CURRENT_SCHEMA SCHEMA_NAME USER CURRENT_USER SESSION_USER SYSTEM_USER SUSER_NAME LAST_INSERT_ID TYPEOF'
     };
 
+    // 組み込み関数名の集合（CREATE FUNCTION による上書きを禁じるための照合用）。
+    // 式コンパイラは組み込み名を固定の写像で置換するため、同名のUDFは到達不能になる
+    const LUMINA_BUILTIN_FN_NAMES = new Set(
+        Object.keys(LUMINA_FN_REGISTRY)
+            .reduce((acc, cat) => acc.concat(LUMINA_FN_REGISTRY[cat].split(' ')), [])
+            .map(n => n.toLowerCase())
+    );
+
     Object.assign(DatabaseEngine.prototype, {
+
+      _isBuiltinFunctionName(name) {
+          return LUMINA_BUILTIN_FN_NAMES.has(String(name).toLowerCase());
+      },
 
       // テーブル名の変更（ALTER TABLE ... RENAME TO / RENAME TABLE 共用）
       _renameTable(oldName, newName) {
@@ -90,21 +102,515 @@
           return { expr, rest };
       },
 
-      // ストアドプロシージャの実行 (CALL name)
-      _executeCall(sql) {
-          const m = sql.match(/^call\s+([a-zA-Z0-9_]+)\s*(?:\(\s*\))?$/i);
+      // ============ ストアドプロシージャの手続き型制御構造 ============
+      // DECLARE / SET / IF..ELSEIF..ELSE..END IF / WHILE..DO..END WHILE /
+      // [label:] LOOP..END LOOP / REPEAT..UNTIL..END REPEAT / LEAVE / ITERATE / RETURN
+      // をサポートする。ローカル変数は呼び出しスコープに持ち、埋め込み SQL 文へは
+      // 実行直前にリテラルとして差し込む（同名の列があるとローカルが優先される点は
+      // 実 DB のルーチンと同じ挙動）。
+
+      // 本文を文単位へ分割する。';' で切るが、IF / WHILE / LOOP / REPEAT / BEGIN / CASE
+      // のブロックは丸ごと 1 つの要素として保つ（'END IF' の IF を開始と誤認しないよう、
+      // END は直後のキーワードごと消費する）
+      _splitProcBody(text) {
+          const parts = [];
+          const isW = (ch) => /[a-zA-Z0-9_]/.test(ch);
+          const OPENERS = ['IF', 'WHILE', 'LOOP', 'REPEAT', 'BEGIN', 'CASE'];
+          let cur = '', depth = 0, block = 0, i = 0;
+          while (i < text.length) {
+              const c = text[i];
+              if (c === "'" || c === '"') {
+                  let j = i + 1;
+                  while (j < text.length) {
+                      if (text[j] === '\\') { j += 2; continue; }
+                      if (text[j] === c) { j++; break; }
+                      j++;
+                  }
+                  cur += text.slice(i, j); i = j; continue;
+              }
+              if (c === '(') { depth++; cur += c; i++; continue; }
+              if (c === ')') { depth--; cur += c; i++; continue; }
+              if (isW(c) && (i === 0 || !isW(text[i - 1]))) {
+                  let j = i;
+                  while (j < text.length && isW(text[j])) j++;
+                  const w = text.slice(i, j).toUpperCase();
+                  if (depth === 0) {
+                      if (w === 'END') {
+                          block--;
+                          const em = /^\s+(IF|WHILE|LOOP|REPEAT|CASE)\b/i.exec(text.slice(j));
+                          if (em) { cur += text.slice(i, j + em[0].length); i = j + em[0].length; continue; }
+                      } else if (OPENERS.includes(w)) {
+                          block++;
+                      }
+                  }
+                  cur += text.slice(i, j); i = j; continue;
+              }
+              if (c === ';' && depth === 0 && block <= 0) { parts.push(cur.trim()); cur = ''; i++; continue; }
+              cur += c; i++;
+          }
+          if (cur.trim() !== '') parts.push(cur.trim());
+          return parts.filter(p => p !== '');
+      },
+
+      // 制御構造ブロックの形が正しいかを定義時に検査する（再帰的に中身も見る）
+      _validateProcBody(stmts) {
+          stmts.forEach(st => {
+              const t = st.trim();
+              if (/^if\b/i.test(t)) {
+                  if (!/\bend\s+if$/i.test(t)) throw new Error('Syntax Error in IF: missing END IF.');
+                  const parsed = this._parseIfStatement(t);
+                  parsed.conds.forEach(b => this._validateProcBody(this._splitProcBody(b.body)));
+                  if (parsed.elseBody) this._validateProcBody(this._splitProcBody(parsed.elseBody));
+              } else if (/^while\b/i.test(t)) {
+                  const m = t.match(/^while\s+([\s\S]+?)\s+do\s+([\s\S]+?)\s+end\s+while$/i);
+                  if (!m) throw new Error('Syntax Error in WHILE. Use WHILE <cond> DO ... END WHILE.');
+                  this._validateProcBody(this._splitProcBody(m[2]));
+              } else if (/^repeat\b/i.test(t)) {
+                  const m = t.match(/^repeat\s+([\s\S]+?)\s+until\s+([\s\S]+?)\s+end\s+repeat$/i);
+                  if (!m) throw new Error('Syntax Error in REPEAT. Use REPEAT ... UNTIL <cond> END REPEAT.');
+                  this._validateProcBody(this._splitProcBody(m[1]));
+              } else if (/^case\b/i.test(t)) {
+                  if (!/\bend\s+case$/i.test(t)) throw new Error('Syntax Error in CASE statement: missing END CASE.');
+                  const c = this._parseCaseStatement(t);
+                  c.branches.forEach(b => this._validateProcBody(this._splitProcBody(b.body)));
+                  if (c.elseBody) this._validateProcBody(this._splitProcBody(c.elseBody));
+              } else if (/^declare\s+(?:continue|exit)\s+handler\b/i.test(t)) {
+                  if (!/^declare\s+(?:continue|exit)\s+handler\s+for\s+(?:not\s+found|sqlexception|sqlwarning|sqlstate\s+(?:value\s+)?'[^']*')\s+[\s\S]+$/i.test(t)) {
+                      throw new Error("Syntax Error in DECLARE HANDLER. Use DECLARE {CONTINUE|EXIT} HANDLER FOR {NOT FOUND|SQLEXCEPTION|SQLSTATE 'xxxxx'} <statement>.");
+                  }
+              } else if (/^fetch\b/i.test(t)) {
+                  if (!/^fetch\s+(?:next\s+from\s+|from\s+)?[a-zA-Z_][a-zA-Z0-9_]*\s+into\s+[\s\S]+$/i.test(t)) {
+                      throw new Error('Syntax Error in FETCH. Use FETCH [NEXT FROM] <cursor> INTO <var>[, ...].');
+                  }
+              } else if (/^(?:[a-zA-Z_][a-zA-Z0-9_]*\s*:\s*)?loop\b/i.test(t)) {
+                  const m = t.match(/^(?:([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*)?loop\s+([\s\S]+?)\s+end\s+loop(?:\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i);
+                  if (!m) throw new Error('Syntax Error in LOOP. Use [label:] LOOP ... END LOOP.');
+                  this._validateProcBody(this._splitProcBody(m[2]));
+              }
+          });
+      },
+
+      // JS 値を SQL リテラルへ
+      _procLiteral(v) {
+          if (v === null || v === undefined) return 'NULL';
+          if (typeof v === 'number') return isFinite(v) ? String(v) : 'NULL';
+          if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+          return this._quoteLiteral(String(v));
+      },
+
+      // ローカル変数（および @名 での参照）をリテラルへ差し替える。文字列リテラル内は保護する
+      _substProcLocals(text, scope) {
+          const names = Object.keys(scope);
+          if (names.length === 0 || !/[a-zA-Z_@]/.test(text)) return text;
+          const sm = [];
+          let s = this._maskStrings(text, sm);
+          names.sort((a, b) => b.length - a.length).forEach(n => {
+              const lit = this._procLiteral(scope[n]);
+              s = s.replace(new RegExp('@?\\b' + n + '\\b', 'gi'), () => lit);
+          });
+          return this._restoreStrings(s, sm);
+      },
+
+      // 制御構造の条件式・代入式をスコープ込みで評価する
+      _evalProcExpr(text, scope) {
+          const sm = [];
+          const masked = this._maskStrings(this._substProcLocals(text, scope), sm);
+          const v = this.compileCondition(masked, sm)({}, this.tables, {});
+          return v === undefined ? null : v;
+      },
+
+      // 条件（NOT FOUND / SQLEXCEPTION / SQLSTATE）に一致するハンドラを探す。
+      // SQL 標準どおり SQLEXCEPTION は「'00'/'01'/'02' で始まらない SQLSTATE」を捕まえる
+      _findProcHandler(ctx, e) {
+          // 文単位タイムアウトや反復回数上限は「保証」なのでハンドラでは捕まえない
+          if (e && e.__fatal) return null;
+          const cond = e && e.sqlCondition ? e.sqlCondition : 'SQLEXCEPTION';
+          const state = e && e.sqlstate ? e.sqlstate : '45000';
+          for (let i = ctx.handlers.length - 1; i >= 0; i--) {
+              const h = ctx.handlers[i];
+              if (h.cond === 'SQLSTATE:' + state) return h;
+              if (h.cond === 'NOTFOUND' && cond === 'NOTFOUND') return h;
+              if (h.cond === 'SQLWARNING' && /^01/.test(state)) return h;
+              if (h.cond === 'SQLEXCEPTION' && cond !== 'NOTFOUND' && !/^(00|01|02)/.test(state)) return h;
+          }
+          return null;
+      },
+
+      // 文のリストを順に実行する。戻り値 { last, signal } の signal は
+      // LEAVE / ITERATE / RETURN / EXIT（EXIT HANDLER によるブロック脱出）
+      _runProcBlock(stmts, ctx) {
+          let last = null;
+          for (const raw of stmts) {
+              this._checkDeadline();
+              const st = raw.trim();
+              if (st === '') continue;
+              let m;
+              try {
+
+              // DECLARE <name> CURSOR FOR <select>: 結果集合を 1 行ずつ手続き的に読む
+              if ((m = st.match(/^declare\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+cursor\s+for\s+([\s\S]+)$/i))) {
+                  ctx.cursors[m[1].toLowerCase()] = { sql: m[2].trim(), rows: null, pos: 0, open: false };
+                  continue;
+              }
+              // DECLARE {CONTINUE|EXIT} HANDLER FOR {NOT FOUND|SQLEXCEPTION|SQLSTATE 'xxxxx'} <statement>
+              if ((m = st.match(/^declare\s+(continue|exit)\s+handler\s+for\s+([\s\S]+)$/i))) {
+                  const kind = m[1].toUpperCase();
+                  const rest = m[2].trim();
+                  const cm = rest.match(/^(not\s+found|sqlexception|sqlwarning|sqlstate\s+(?:value\s+)?'([^']*)')\s+([\s\S]+)$/i);
+                  if (!cm) throw new Error("Syntax Error in DECLARE HANDLER. Use DECLARE {CONTINUE|EXIT} HANDLER FOR {NOT FOUND|SQLEXCEPTION|SQLSTATE 'xxxxx'} <statement>.");
+                  const head = cm[1].toUpperCase().replace(/\s+/g, ' ');
+                  const cond = cm[2] ? 'SQLSTATE:' + cm[2] : (head.indexOf('NOT FOUND') === 0 ? 'NOTFOUND' : head);
+                  ctx.handlers.push({ kind, cond, body: cm[3].trim() });
+                  continue;
+              }
+              if ((m = st.match(/^open\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i))) {
+                  const cur = ctx.cursors[m[1].toLowerCase()];
+                  if (!cur) throw new Error(`Cursor '${m[1]}' is not declared.`);
+                  const res = this.executeQuery(this._substProcLocals(cur.sql, ctx.scope));
+                  if (res.error) throw new Error(res.error);
+                  cur.rows = res.data || [];
+                  cur.pos = 0;
+                  cur.open = true;
+                  continue;
+              }
+              if ((m = st.match(/^close\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i))) {
+                  const cur = ctx.cursors[m[1].toLowerCase()];
+                  if (!cur) throw new Error(`Cursor '${m[1]}' is not declared.`);
+                  cur.open = false; cur.rows = null; cur.pos = 0;
+                  continue;
+              }
+              if ((m = st.match(/^fetch\s+(?:next\s+from\s+|from\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+into\s+([\s\S]+)$/i))) {
+                  const cur = ctx.cursors[m[1].toLowerCase()];
+                  if (!cur) throw new Error(`Cursor '${m[1]}' is not declared.`);
+                  if (!cur.open) throw new Error(`Cursor '${m[1]}' is not open.`);
+                  const targets = m[2].split(',').map(x => x.trim().replace(/^@/, '').toLowerCase());
+                  if (cur.pos >= cur.rows.length) {
+                      // 行が尽きた: NOT FOUND 条件（ハンドラがなければエラー）
+                      const e = new Error('No data - zero rows fetched, selected, or processed.');
+                      e.sqlCondition = 'NOTFOUND';
+                      e.sqlstate = '02000';
+                      throw e;
+                  }
+                  const row = cur.rows[cur.pos++];
+                  const keys = Object.keys(row);
+                  if (targets.length !== keys.length) {
+                      throw new Error(`FETCH: cursor returns ${keys.length} column(s) but ${targets.length} variable(s) were given.`);
+                  }
+                  targets.forEach((tv, k) => { ctx.scope[tv] = row[keys[k]]; });
+                  continue;
+              }
+              // SIGNAL / RESIGNAL: 手続きから明示的にエラーを起こす
+              if ((m = st.match(/^(re)?signal(?:\s+sqlstate\s+(?:value\s+)?'([^']*)')?(?:\s+set\s+([\s\S]+))?$/i))) {
+                  let msg = 'Unhandled user-defined exception.';
+                  if (m[3]) {
+                      const tm = m[3].match(/message_text\s*=\s*([\s\S]+)$/i);
+                      if (tm) {
+                          const v = this._evalProcExpr(tm[1].trim().replace(/,\s*[a-zA-Z_]+\s*=[\s\S]*$/, ''), ctx.scope);
+                          if (v !== null && v !== undefined) msg = String(v);
+                      }
+                  }
+                  const e = new Error(msg);
+                  e.sqlstate = m[2] || '45000';
+                  e.sqlCondition = 'SQLEXCEPTION';
+                  throw e;
+              }
+              // CASE 文（式の CASE ... END とは別物。END CASE で閉じる）
+              if (/^case\b[\s\S]*\bend\s+case$/i.test(st)) {
+                  const parsed = this._parseCaseStatement(st);
+                  let taken = null;
+                  for (const b of parsed.branches) {
+                      const hit = parsed.operand === null
+                          ? this._truthy(this._evalProcExpr(b.when, ctx.scope))
+                          : this._evalProcExpr(`(${parsed.operand}) = (${b.when})`, ctx.scope) === true;
+                      if (hit) { taken = b.body; break; }
+                  }
+                  if (taken === null) taken = parsed.elseBody;
+                  if (taken === null || taken === undefined) {
+                      const e = new Error('Case not found for CASE statement.');
+                      e.sqlstate = '20000';
+                      e.sqlCondition = 'SQLEXCEPTION';
+                      throw e;
+                  }
+                  const r = this._runProcBlock(this._splitProcBody(taken), ctx);
+                  if (r.last) last = r.last;
+                  if (r.signal) return { last, signal: r.signal };
+                  continue;
+              }
+
+              if ((m = st.match(/^declare\s+([\s\S]+)$/i))) {
+                  // DECLARE a [, b] [type] [DEFAULT expr]
+                  let rest = m[1];
+                  let defExpr = null;
+                  const dm = rest.match(/\bdefault\s+([\s\S]+)$/i);
+                  if (dm) { defExpr = dm[1].trim(); rest = rest.slice(0, dm.index).trim(); }
+                  rest = rest.replace(/\s+[a-zA-Z][a-zA-Z0-9_]*(\s*\(\s*\d+\s*(,\s*\d+\s*)?\))?\s*$/, '');
+                  const names = rest.split(',').map(x => x.trim().replace(/^@/, '').toLowerCase()).filter(x => x !== '');
+                  if (names.length === 0 || names.some(n => !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(n))) {
+                      throw new Error(`Syntax Error in DECLARE near '${st.slice(0, 40)}'.`);
+                  }
+                  const v = defExpr === null ? null : this._evalProcExpr(defExpr, ctx.scope);
+                  names.forEach(n => { ctx.scope[n] = v; });
+                  continue;
+              }
+
+              if ((m = st.match(/^set\s+@?([a-zA-Z_][a-zA-Z0-9_]*)\s*:?=\s*([\s\S]+)$/i))
+                  && Object.prototype.hasOwnProperty.call(ctx.scope, m[1].toLowerCase())) {
+                  ctx.scope[m[1].toLowerCase()] = this._evalProcExpr(m[2].trim(), ctx.scope);
+                  continue;
+              }
+
+              if (/^if\b/i.test(st)) {
+                  const branches = this._parseIfStatement(st);
+                  let taken = null;
+                  for (const b of branches.conds) {
+                      if (this._truthy(this._evalProcExpr(b.cond, ctx.scope))) { taken = b.body; break; }
+                  }
+                  if (taken === null) taken = branches.elseBody;
+                  if (taken) {
+                      const r = this._runProcBlock(this._splitProcBody(taken), ctx);
+                      if (r.last) last = r.last;
+                      if (r.signal) return { last, signal: r.signal };
+                  }
+                  continue;
+              }
+
+              if ((m = st.match(/^while\s+([\s\S]+?)\s+do\s+([\s\S]+?)\s+end\s+while$/i))) {
+                  const body = this._splitProcBody(m[2]);
+                  let n = 0;
+                  while (this._truthy(this._evalProcExpr(m[1], ctx.scope))) {
+                      if (++n > 1000000) throw this._fatalError("WHILE loop exceeded 1,000,000 iterations.");
+                      this._checkDeadline();
+                      const r = this._runProcBlock(body, ctx);
+                      if (r.last) last = r.last;
+                      if (r.signal) {
+                          if (r.signal.type === 'return') return { last, signal: r.signal };
+                          if (r.signal.type === 'leave' && (!r.signal.label || r.signal.label === ctx.label)) break;
+                          if (r.signal.type === 'iterate' && (!r.signal.label || r.signal.label === ctx.label)) continue;
+                          return { last, signal: r.signal };
+                      }
+                  }
+                  continue;
+              }
+
+              if ((m = st.match(/^repeat\s+([\s\S]+?)\s+until\s+([\s\S]+?)\s+end\s+repeat$/i))) {
+                  const body = this._splitProcBody(m[1]);
+                  let n = 0;
+                  do {
+                      if (++n > 1000000) throw this._fatalError("REPEAT loop exceeded 1,000,000 iterations.");
+                      this._checkDeadline();
+                      const r = this._runProcBlock(body, ctx);
+                      if (r.last) last = r.last;
+                      if (r.signal) {
+                          if (r.signal.type === 'return') return { last, signal: r.signal };
+                          if (r.signal.type === 'leave') break;
+                          return { last, signal: r.signal };
+                      }
+                  } while (!this._truthy(this._evalProcExpr(m[2], ctx.scope)));
+                  continue;
+              }
+
+              if ((m = st.match(/^(?:([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*)?loop\s+([\s\S]+?)\s+end\s+loop(?:\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i))) {
+                  const label = m[1] ? m[1].toLowerCase() : null;
+                  const body = this._splitProcBody(m[2]);
+                  const inner = { scope: ctx.scope, cursors: ctx.cursors, handlers: ctx.handlers, label };
+                  let n = 0, done = false;
+                  while (!done) {
+                      if (++n > 1000000) throw this._fatalError("LOOP exceeded 1,000,000 iterations (add a LEAVE).");
+                      this._checkDeadline();
+                      const r = this._runProcBlock(body, inner);
+                      if (r.last) last = r.last;
+                      if (r.signal) {
+                          if (r.signal.type === 'return') return { last, signal: r.signal };
+                          if (r.signal.type === 'leave' && (!r.signal.label || r.signal.label === label)) done = true;
+                          else if (r.signal.type === 'iterate' && (!r.signal.label || r.signal.label === label)) continue;
+                          else return { last, signal: r.signal };
+                      }
+                  }
+                  continue;
+              }
+
+              if ((m = st.match(/^(leave|iterate)(?:\s+([a-zA-Z_][a-zA-Z0-9_]*))?$/i))) {
+                  return { last, signal: { type: m[1].toLowerCase(), label: m[2] ? m[2].toLowerCase() : null } };
+              }
+              if ((m = st.match(/^return(?:\s+([\s\S]+))?$/i))) {
+                  const v = m[1] ? this._evalProcExpr(m[1].trim(), ctx.scope) : null;
+                  return { last, signal: { type: 'return', value: v } };
+              }
+              if (/^begin\s+[\s\S]*\s+end$/i.test(st)) {
+                  const bm = st.match(/^begin\s+([\s\S]*)\s+end$/i);
+                  const r = this._runProcBlock(this._splitProcBody(bm[1]), ctx);
+                  if (r.last) last = r.last;
+                  if (r.signal) return { last, signal: r.signal };
+                  continue;
+              }
+
+              // 通常の SQL 文: ローカル変数をリテラルへ差し込んでから実行する
+              const sqlText = this._substProcLocals(st, ctx.scope);
+              const res = this.executeQuery(sqlText);
+              if (res.error) throw new Error(res.error);
+              last = res;
+              } catch (e) {
+                  // DECLARE HANDLER が宣言されていれば条件を捕まえる。
+                  // CONTINUE は次の文へ、EXIT は囲みブロックを抜ける
+                  const h = this._findProcHandler(ctx, e);
+                  if (!h) throw e;
+                  const hr = this._runProcBlock(this._splitProcBody(h.body), ctx);
+                  if (hr.last) last = hr.last;
+                  if (hr.signal) return { last, signal: hr.signal };
+                  if (h.kind === 'EXIT') return { last, signal: { type: 'exit' } };
+              }
+          }
+          return { last, signal: null };
+      },
+
+      // CASE 文（CASE <expr> WHEN v THEN ... / CASE WHEN cond THEN ...、END CASE で閉じる）
+      _parseCaseStatement(st) {
+          const body = st.replace(/^case\b/i, '').replace(/\s*end\s+case$/i, '');
+          const isW = (ch) => /[a-zA-Z0-9_]/.test(ch);
+          const marks = [];
+          let depth = 0, block = 0;
+          for (let i = 0; i < body.length; i++) {
+              const c = body[i];
+              if (c === "'" || c === '"') {
+                  let j = i + 1;
+                  while (j < body.length) { if (body[j] === '\\') { j += 2; continue; } if (body[j] === c) break; j++; }
+                  i = j; continue;
+              }
+              if (c === '(') { depth++; continue; }
+              if (c === ')') { depth--; continue; }
+              if (!isW(c) || (i > 0 && isW(body[i - 1]))) continue;
+              let j = i;
+              while (j < body.length && isW(body[j])) j++;
+              const w = body.slice(i, j).toUpperCase();
+              if (depth !== 0) { i = j - 1; continue; }
+              if (w === 'END') { block--; i = j - 1; continue; }
+              if (['IF', 'WHILE', 'LOOP', 'REPEAT', 'BEGIN', 'CASE'].includes(w)) { block++; i = j - 1; continue; }
+              if (block === 0 && (w === 'WHEN' || w === 'THEN' || w === 'ELSE')) marks.push({ w, start: i, end: j });
+              i = j - 1;
+          }
+          if (marks.length === 0 || marks[0].w !== 'WHEN') {
+              throw new Error("Syntax Error in CASE statement. Use CASE [expr] WHEN ... THEN ... [ELSE ...] END CASE.");
+          }
+          const operandText = body.slice(0, marks[0].start).trim();
+          const operand = operandText === '' ? null : operandText;
+          const branches = [];
+          let elseBody = null;
+          for (let k = 0; k < marks.length; k++) {
+              if (marks[k].w !== 'WHEN') continue;
+              const thenM = marks[k + 1];
+              if (!thenM || thenM.w !== 'THEN') throw new Error("Syntax Error in CASE statement: WHEN requires THEN.");
+              const nxt = marks[k + 2];
+              branches.push({
+                  when: body.slice(marks[k].end, thenM.start).trim(),
+                  body: body.slice(thenM.end, nxt ? nxt.start : body.length).trim()
+              });
+              k++;
+          }
+          const elseMark = marks.find(x => x.w === 'ELSE');
+          if (elseMark) {
+              const after = marks.filter(x => x.start > elseMark.start)[0];
+              elseBody = body.slice(elseMark.end, after ? after.start : body.length).trim();
+          }
+          return { operand, branches, elseBody };
+      },
+
+      // ハンドラで捕まえられない致命的エラー（時間上限・反復回数上限）
+      _fatalError(msg) {
+          const e = new Error(msg);
+          e.__fatal = true;
+          return e;
+      },
+
+      _truthy(v) {
+          if (v === null || v === undefined) return false;
+          if (typeof v === 'number') return v !== 0;
+          if (typeof v === 'string') return v !== '' && v !== '0';
+          return !!v;
+      },
+
+      // IF cond THEN ... [ELSEIF cond THEN ...]* [ELSE ...] END IF を分解する
+      _parseIfStatement(st) {
+          const body = st.replace(/^if\s+/i, '').replace(/\s+end\s+if$/i, '');
+          const conds = [];
+          let elseBody = null;
+          // トップレベル（ネストした IF/CASE/LOOP の外側）の ELSEIF / ELSE / THEN を探す
+          const marks = [];
+          const isW = (ch) => /[a-zA-Z0-9_]/.test(ch);
+          let depth = 0, block = 0;
+          for (let i = 0; i < body.length; i++) {
+              const c = body[i];
+              if (c === "'" || c === '"') {
+                  let j = i + 1;
+                  while (j < body.length) { if (body[j] === '\\') { j += 2; continue; } if (body[j] === c) break; j++; }
+                  i = j; continue;
+              }
+              if (c === '(') { depth++; continue; }
+              if (c === ')') { depth--; continue; }
+              if (!isW(c) || (i > 0 && isW(body[i - 1]))) continue;
+              let j = i;
+              while (j < body.length && isW(body[j])) j++;
+              const w = body.slice(i, j).toUpperCase();
+              if (depth !== 0) { i = j - 1; continue; }
+              if (w === 'END') { block--; i = j - 1; continue; }
+              if (['IF', 'WHILE', 'LOOP', 'REPEAT', 'BEGIN', 'CASE'].includes(w)) { block++; i = j - 1; continue; }
+              if (block === 0 && (w === 'THEN' || w === 'ELSEIF' || w === 'ELSE')) marks.push({ w, start: i, end: j });
+              i = j - 1;
+          }
+          if (marks.length === 0 || marks[0].w !== 'THEN') throw new Error("Syntax Error in IF. Use IF <cond> THEN ... [ELSEIF <cond> THEN ...] [ELSE ...] END IF.");
+          let cond = body.slice(0, marks[0].start).trim();
+          let cursor = marks[0].end;
+          for (let k = 1; k <= marks.length; k++) {
+              const mk = marks[k];
+              const seg = body.slice(cursor, mk ? mk.start : body.length).trim();
+              if (cond !== null) conds.push({ cond, body: seg });
+              else elseBody = seg;
+              if (!mk) break;
+              if (mk.w === 'ELSE') { cond = null; cursor = mk.end; }
+              else if (mk.w === 'ELSEIF') {
+                  const nxt = marks[k + 1];
+                  if (!nxt || nxt.w !== 'THEN') throw new Error("Syntax Error in IF: ELSEIF requires THEN.");
+                  cond = body.slice(mk.end, nxt.start).trim();
+                  cursor = nxt.end;
+                  k++;
+              } else throw new Error("Syntax Error in IF near THEN.");
+          }
+          return { conds, elseBody };
+      },
+
+      // ストアドプロシージャの実行 (CALL name [(args)])
+      _executeCall(sql, strMap) {
+          const m = sql.match(/^call\s+([a-zA-Z0-9_]+)\s*(?:\(([\s\S]*)\))?$/i);
           if (!m) throw new Error("Syntax Error in CALL.");
           const name = m[1].toLowerCase();
           const proc = this.procedures[name];
-          if (!proc) throw new Error(`Procedure '${name}' not found.`);
+          if (!proc) {
+              const s2 = this._suggestName(name, Object.keys(this.procedures));
+              throw new Error(`Procedure '${name}' not found.${s2 ? ` Did you mean '${s2}'?` : ''}`);
+          }
+          const params = (this.procParams && this.procParams[name]) || [];
+          const argText = (m[2] || '').trim();
+          const args = argText === '' ? [] : this.splitSelectClause(argText);
+          if (args.length !== params.length) {
+              throw new Error(`Procedure '${name}' expects ${params.length} argument(s), got ${args.length}.`);
+          }
+          const scope = Object.create(null);
+          params.forEach((p, i) => {
+              const fn = this.compileCondition(args[i].trim(), strMap || []);
+              const v = fn({}, this.tables, {});
+              scope[p] = v === undefined ? null : v;
+          });
           this._procDepth = (this._procDepth || 0) + 1;
           try {
               if (this._procDepth > 16) throw new Error("Procedure call depth limit exceeded.");
-              let lastRes = null;
-              for (const stmt of proc) {
-                  const res = this.executeQuery(stmt);
-                  if (res.error) throw new Error(`Procedure '${name}': ${res.error}`);
-                  lastRes = res;
+              let r;
+              try {
+                  r = this._runProcBlock(proc, { scope, cursors: Object.create(null), handlers: [], label: null });
+              } catch (e) {
+                  throw new Error(`Procedure '${name}': ${e.message}`);
+              }
+              const lastRes = r.last;
+              if (r.signal && r.signal.type === 'return' && r.signal.value !== null && r.signal.value !== undefined) {
+                  return { data: [{ Result: r.signal.value }], affectedRows: 0 };
               }
               const data = (lastRes && lastRes.data && lastRes.data.length > 0)
                   ? lastRes.data
@@ -301,6 +807,26 @@
                   .map(t => ({ Table: t, Rows: this.tables[t].rowCount, Columns: this.tables[t].getColumnNames().length, Temp: !!this.tables[t].isTemp }));
               return { data, affectedRows: data.length };
           }
+          // SHOW SNAPSHOTS: メモリ内スナップショットの一覧
+          if (/^show\s+snapshots$/i.test(sql.trim())) {
+              const data = Object.keys(this.snapshots).map(n => ({
+                  Snapshot: n, TakenAt: this.snapshots[n].at,
+                  Tables: Object.keys(this.snapshots[n].tables).length, Rows: this.snapshots[n].rows
+              }));
+              return { data, affectedRows: data.length };
+          }
+          // SHOW PROFILE: 直前に完了したクエリの実測値
+          if (/^show\s+profile$/i.test(sql.trim())) {
+              const p = this.lastProfile;
+              const data = p ? [{ Statement: p.sql, DurationMs: p.ms, Rows: p.rows, Error: p.error }] : [];
+              return { data, affectedRows: data.length };
+          }
+          // SHOW SLOW QUERIES: 閾値（slow_query_threshold, 既定 50ms）を超えたクエリの履歴
+          if (/^show\s+slow\s+queries$/i.test(sql.trim())) {
+              const data = this.slowLog.slice().reverse()
+                  .map((p, i) => ({ '#': i + 1, Statement: p.sql, DurationMs: p.ms, Rows: p.rows, Error: p.error }));
+              return { data, affectedRows: data.length };
+          }
           // SHOW FUNCTIONS [LIKE 'pattern']: 対応しているSQL関数の一覧
           const fnM = sql.trim().match(/^show\s+functions(?:\s+like\s+__STR_(\d+)__)?$/i);
           if (fnM) {
@@ -314,6 +840,11 @@
                   LUMINA_FN_REGISTRY[cat].split(' ').forEach(fn => {
                       if (!re || re.test(fn)) data.push({ Function: fn, Category: cat });
                   });
+              });
+              // CREATE FUNCTION で定義したユーザー定義関数も一覧へ含める
+              Object.keys(this.functions).forEach(fn => {
+                  const label = `${fn.toUpperCase()}(${this.functions[fn].params.join(', ')})`;
+                  if (!re || re.test(fn)) data.push({ Function: label, Category: 'User-defined' });
               });
               data.sort((a, b) => a.Function < b.Function ? -1 : (a.Function > b.Function ? 1 : 0));
               return { data, affectedRows: data.length };
@@ -398,7 +929,15 @@
           if (scpM) {
               const name = scpM[1].toLowerCase();
               if (!this.procedures[name]) throw new Error(`Procedure '${name}' not found.`);
-              return { data: [{ Procedure: name, CreateProcedure: `CREATE PROCEDURE ${name} AS BEGIN ${this.procedures[name].join('; ')} END` }], affectedRows: 1 };
+              const ps = (this.procParams && this.procParams[name]) || [];
+              return { data: [{ Procedure: name, CreateProcedure: `CREATE PROCEDURE ${name}${ps.length ? '(' + ps.join(', ') + ')' : ''} AS BEGIN ${this.procedures[name].join('; ')} END` }], affectedRows: 1 };
+          }
+          const scfM = sql.trim().match(/^show\s+create\s+function\s+([a-zA-Z0-9_]+)$/i);
+          if (scfM) {
+              const name = scfM[1].toLowerCase();
+              if (!this.functions[name]) throw new Error(`Function '${name}' not found.`);
+              const f = this.functions[name];
+              return { data: [{ Function: name, CreateFunction: `CREATE FUNCTION ${name}(${f.params.join(', ')}) RETURNS ${f.returns} AS RETURN ${f.body}` }], affectedRows: 1 };
           }
           // SHOW STATUS: データベース全体のサマリ（テーブル数 / 総行数 / 推定メモリ量など）
           if (/^show\s+status$/i.test(sql.trim())) {
@@ -625,6 +1164,319 @@
           throw new Error("Unsupported session statement.");
       },
 
+      // ============ セッション変数 (SET [SESSION] name = value) ============
+      // 実DB向けスクリプトの互換のため未知の名前も受理して記録するが、
+      // LuminaDB が実際に解釈する変数は下表のものだけ。
+      _SESSION_VARS: {
+          statement_timeout: 'int',      // 文単位の実行時間上限 (ms)。0 で無制限
+          read_only: 'bool',             // 読み取り専用モード
+          slow_query_threshold: 'int',   // SHOW SLOW QUERIES に記録する閾値 (ms)
+          seed: 'float'                  // RAND()/RANDOM() の決定的な種（NULL で解除）
+      },
+
+      _executeSetSessionVar(sql, strMap) {
+          const raw = this._restoreStrings(sql, strMap).replace(/;$/, '');
+          const m = raw.match(/^set\s+(?:session\s+|local\s+|global\s+)?([a-zA-Z_][a-zA-Z0-9_.]*)\s*(?::=|=|\s+to\s+)\s*([\s\S]+)$/i);
+          if (!m) throw new Error("Syntax Error in SET. Use SET [SESSION] <name> = <value>.");
+          const name = m[1].toLowerCase().replace(/^@@/, '');
+          let text = m[2].trim().replace(/^'([\s\S]*)'$/, '$1').replace(/^"([\s\S]*)"$/, '$1');
+          const kind = this._SESSION_VARS[name];
+          const asBool = () => {
+              const t = text.toLowerCase();
+              if (['on', 'true', '1', 'yes'].includes(t)) return true;
+              if (['off', 'false', '0', 'no'].includes(t)) return false;
+              throw new Error(`SET ${name}: expected ON/OFF, got '${text}'.`);
+          };
+          const asNum = (intOnly) => {
+              if (/^null$/i.test(text)) return null;
+              const n = Number(text);
+              if (!isFinite(n) || (intOnly && (n < 0 || Math.trunc(n) !== n))) {
+                  throw new Error(`SET ${name}: expected a ${intOnly ? 'non-negative integer' : 'number'}, got '${text}'.`);
+              }
+              return n;
+          };
+          if (kind === 'int') {
+              const n = asNum(true);
+              if (name === 'statement_timeout') this.statementTimeoutMs = n || 0;
+              else this.slowLogThresholdMs = n || 0;
+          } else if (kind === 'bool') {
+              this.readOnly = asBool();
+          } else if (kind === 'float') {
+              // RAND() の種。式ライブラリ側の状態を切り替える
+              const fn = this.compileCondition(`SETSEED(${/^null$/i.test(text) ? 'NULL' : asNum(false)})`, []);
+              fn({}, this.tables, {});
+          }
+          this.sessionSettings[name] = text;
+          return { data: [{ Result: "Success", Message: `Session variable '${name}' set to ${text}.` }], affectedRows: 0 };
+      },
+
+      // ============ スナップショット（メモリ内タイムトラベル） ============
+      // CREATE SNAPSHOT n / RESTORE SNAPSHOT n / DROP SNAPSHOT n。
+      // ブラウザDBでは「壊す前に戻せる」ことが実用上の安全弁になる（BEGIN/ROLLBACK と違い
+      // 複数文・複数トランザクションをまたいで保持できる）。セッション限りで IDB へは保存しない。
+      _snapshotState() {
+          const tables = Object.create(null);
+          for (const tn in this.tables) {
+              if (tn.startsWith('__tmp_')) continue;
+              tables[tn] = this.tables[tn].cloneFull();
+          }
+          return {
+              tables,
+              views: Object.assign(Object.create(null), this.views),
+              procedures: JSON.parse(JSON.stringify(this.procedures)),
+              procParams: JSON.parse(JSON.stringify(this.procParams || {})),
+              userVersion: this.userVersion || 0,
+              triggers: JSON.parse(JSON.stringify(this.triggers)),
+              sequences: JSON.parse(JSON.stringify(this.sequences)),
+              comments: Object.assign(Object.create(null), this.comments),
+              matViews: JSON.parse(JSON.stringify(this.matViews)),
+              functions: JSON.parse(JSON.stringify(this.functions)),
+              rows: Object.keys(tables).reduce((s, k) => s + tables[k].rowCount, 0)
+          };
+      },
+
+      _executeSnapshot(sql) {
+          const m = sql.match(/^(create|drop|restore)\s+snapshot\s+(if\s+not\s+exists\s+|if\s+exists\s+)?([a-zA-Z0-9_]+)\s*$/i);
+          if (!m) throw new Error("Syntax Error. Use CREATE|RESTORE|DROP SNAPSHOT <name>.");
+          const verb = m[1].toLowerCase();
+          const name = m[3].toLowerCase();
+          if (verb === 'create') {
+              if (this.snapshots[name] && /if\s+not\s+exists/i.test(m[2] || '')) {
+                  return { data: [{ Result: "Success", Message: `Snapshot '${name}' already exists. Skipped.` }], affectedRows: 0 };
+              }
+              if (this.inTransaction) throw new Error("CREATE SNAPSHOT cannot run inside a transaction.");
+              const st = this._snapshotState();
+              st.at = this._nowString();
+              this.snapshots[name] = st;
+              return { data: [{ Result: "Success", Message: `Snapshot '${name}' created (${Object.keys(st.tables).length} tables, ${st.rows} rows).` }], affectedRows: 0 };
+          }
+          if (verb === 'drop') {
+              if (!this.snapshots[name]) {
+                  if (/if\s+exists/i.test(m[2] || '')) return { data: [{ Result: "Success", Message: `Snapshot '${name}' does not exist. Skipped.` }], affectedRows: 0 };
+                  throw new Error(`Snapshot '${name}' not found.`);
+              }
+              delete this.snapshots[name];
+              return { data: [{ Result: "Success", Message: `Snapshot '${name}' dropped.` }], affectedRows: 0 };
+          }
+          const st = this.snapshots[name];
+          if (!st) {
+              const s2 = this._suggestName(name, Object.keys(this.snapshots));
+              throw new Error(`Snapshot '${name}' not found.${s2 ? ` Did you mean '${s2}'?` : ''}`);
+          }
+          if (this.inTransaction) throw new Error("RESTORE SNAPSHOT cannot run inside a transaction (COMMIT or ROLLBACK first).");
+          this.tables = Object.create(null);
+          this._attachEngineRef();
+          for (const tn in st.tables) this.tables[tn] = st.tables[tn].cloneFull();
+          // JSON.parse は通常のプロトタイプを持つオブジェクトを返すので、
+          // SQL 由来のキーを入れる辞書は必ず null プロトタイプへ移し替える
+          const nullDict = (o) => Object.assign(Object.create(null), JSON.parse(JSON.stringify(o)));
+          this.views = Object.assign(Object.create(null), st.views);
+          this.procedures = nullDict(st.procedures);
+          this.procParams = nullDict(st.procParams || {});
+          this.userVersion = st.userVersion || 0;
+          this.triggers = nullDict(st.triggers);
+          this.sequences = nullDict(st.sequences);
+          this.comments = Object.assign(Object.create(null), st.comments);
+          this.matViews = nullDict(st.matViews);
+          this.functions = nullDict(st.functions);
+          this.undoLog = [];
+          return { data: [{ Result: "Success", Message: `Snapshot '${name}' restored (${Object.keys(st.tables).length} tables, ${st.rows} rows, taken at ${st.at}).` }], affectedRows: st.rows };
+      },
+
+      // ============ PRAGMA（SQLite 互換のイントロスペクション） ============
+      // ブラウザDBは SQLite 系ツールと同じ語彙で扱えると便利なので、よく使う
+      // table_info / table_list / index_list / foreign_key_list / user_version に対応する。
+      // user_version はスキーマのマイグレーション管理に使う（IDB保存対象）。
+      _executePragma(sql, strMap) {
+          const m = this._restoreStrings(sql, strMap).match(/^pragma\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\(\s*([a-zA-Z0-9_]+)\s*\)|=\s*([\s\S]+?))?\s*$/i);
+          if (!m) throw new Error("Syntax Error in PRAGMA. Use PRAGMA <name>[(<table>)] or PRAGMA <name> = <value>.");
+          const name = m[1].toLowerCase();
+          const arg = m[2] ? m[2].toLowerCase() : null;
+          const assign = m[3] !== undefined ? String(m[3]).trim().replace(/^'([\s\S]*)'$/, '$1') : null;
+
+          if (name === 'user_version') {
+              if (assign !== null) {
+                  const n = Number(assign);
+                  if (!isFinite(n) || Math.trunc(n) !== n) throw new Error("PRAGMA user_version requires an integer.");
+                  this.userVersion = n;
+                  return { data: [{ Result: 'Success', Message: `user_version set to ${n}.` }], affectedRows: 0 };
+              }
+              return { data: [{ user_version: this.userVersion || 0 }], affectedRows: 1 };
+          }
+          if (name === 'table_list') {
+              const data = Object.keys(this.tables).filter(t => !t.startsWith('__tmp_')).map(t => ({
+                  schema: 'main', name: t, type: this.matViews[t] ? 'view' : 'table',
+                  ncol: this.tables[t].getColumnNames().length, wr: 0, strict: 0
+              }));
+              return { data, affectedRows: data.length };
+          }
+          const TABLE_PRAGMAS = ['table_info', 'index_list', 'foreign_key_list'];
+          if (!TABLE_PRAGMAS.includes(name)) {
+              throw new Error(`Unsupported PRAGMA '${name}'. Supported: table_info / table_list / index_list / foreign_key_list / user_version.`);
+          }
+          if (!arg) throw new Error(`PRAGMA ${name} requires a table name, e.g. PRAGMA ${name}(users).`);
+          const t = this.tables[arg];
+          if (!t) throw this._tableNotFound(arg);
+          if (name === 'table_info') {
+              const pks = (t.compositeKeys || []).filter(ck => ck.isPK).flatMap(ck => ck.cols)
+                  .concat(t.primaryKey ? [t.primaryKey] : []);
+              const data = t.getColumnNames().map((c, i) => ({
+                  cid: i, name: c, type: (t.colTypes && t.colTypes[c]) ? t.colTypes[c] : 'ANY',
+                  notnull: (t.notNullCols.includes(c) || pks.includes(c)) ? 1 : 0,
+                  dflt_value: this._isNowMarker(t.defaults[c]) ? 'CURRENT_TIMESTAMP' : (t.defaults[c] === undefined ? null : t.defaults[c]),
+                  pk: pks.includes(c) ? pks.indexOf(c) + 1 : 0
+              }));
+              return { data, affectedRows: data.length };
+          }
+          if (name === 'index_list') {
+              const data = Object.keys(t.indices).map((c, i) => ({
+                  seq: i, name: `idx_${arg}_${c}`, unique: (t.uniqueCols.includes(c) || t.primaryKey === c) ? 1 : 0,
+                  origin: t.primaryKey === c ? 'pk' : (t.uniqueCols.includes(c) ? 'u' : 'c'), partial: 0
+              }));
+              return { data, affectedRows: data.length };
+          }
+          if (name === 'foreign_key_list') {
+              const data = (t.foreignKeys || []).map((fk, i) => ({
+                  id: i, seq: 0, table: fk.refTable, from: fk.col, to: fk.refCol,
+                  on_update: fk.onUpdate || 'RESTRICT', on_delete: fk.onDelete || 'RESTRICT', match: 'NONE'
+              }));
+              return { data, affectedRows: data.length };
+          }
+          throw new Error(`Unsupported PRAGMA '${name}'. Supported: table_info / table_list / index_list / foreign_key_list / user_version.`);
+      },
+
+      // ============ INFORMATION_SCHEMA（標準のカタログビュー） ============
+      // information_schema.<name> を参照するクエリの FROM を一時テーブルへ差し替える。
+      // expandViews より前に呼ばれる（ビュー本文からの参照も同じ経路を通る）
+      _INFO_SCHEMA_VIEWS: ['tables', 'columns', 'views', 'key_column_usage', 'table_constraints', 'schemata', 'routines', 'sequences'],
+
+      expandInfoSchema(sql) {
+          // sqlite_master（SQLite 互換のカタログ表）も同じ仕組みで実体化する
+          if (/\bsqlite_master\b/i.test(sql) && !this.tables['sqlite_master']) {
+              const rows = [];
+              Object.keys(this.tables).filter(t => !t.startsWith('__tmp_')).forEach(t => rows.push({
+                  type: this.matViews[t] ? 'view' : 'table', name: t, tbl_name: t, rootpage: 0,
+                  sql: this.buildCreateTableSQL ? this.buildCreateTableSQL(t) : `CREATE TABLE ${t}`
+              }));
+              Object.keys(this.views).forEach(v => rows.push({
+                  type: 'view', name: v, tbl_name: v, rootpage: 0, sql: `CREATE VIEW ${v} AS ${this.views[v]}`
+              }));
+              Object.keys(this.tables).filter(t => !t.startsWith('__tmp_')).forEach(t =>
+                  Object.keys(this.tables[t].indices).forEach(c => rows.push({
+                      type: 'index', name: `idx_${t}_${c}`, tbl_name: t, rootpage: 0,
+                      sql: `CREATE INDEX idx_${t}_${c} ON ${t} (${c})`
+                  })));
+              this._materializeRows('__tmp_is_sqlite_master', rows);
+              sql = sql.replace(/\bsqlite_master\b/gi, '__tmp_is_sqlite_master');
+          }
+          if (!/information_schema\s*\./i.test(sql)) return sql;
+          return sql.replace(/\binformation_schema\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)/gi, (m, name) => {
+              const key = name.toLowerCase();
+              if (!this._INFO_SCHEMA_VIEWS.includes(key)) {
+                  throw new Error(`INFORMATION_SCHEMA.${name.toUpperCase()} is not available. Supported: ${this._INFO_SCHEMA_VIEWS.map(v => v.toUpperCase()).join(', ')}.`);
+              }
+              const tmp = `__tmp_is_${key}`;
+              this._materializeRows(tmp, this._buildInfoSchemaRows(key));
+              return tmp;
+          });
+      },
+
+      _buildInfoSchemaRows(kind) {
+          const rows = [];
+          const SCHEMA = 'main';
+          const userTables = Object.keys(this.tables).filter(t => !t.startsWith('__tmp_'));
+          if (kind === 'schemata') {
+              return [{ CATALOG_NAME: 'lumina', SCHEMA_NAME: SCHEMA, DEFAULT_CHARACTER_SET_NAME: 'utf8' }];
+          }
+          if (kind === 'tables') {
+              userTables.forEach(tn => {
+                  const t = this.tables[tn];
+                  rows.push({
+                      TABLE_CATALOG: 'lumina', TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn,
+                      TABLE_TYPE: this.matViews[tn] ? 'MATERIALIZED VIEW' : (t.isTemp ? 'LOCAL TEMPORARY' : 'BASE TABLE'),
+                      TABLE_ROWS: t.rowCount, TABLE_COMMENT: this.comments['table:' + tn] || null
+                  });
+              });
+              Object.keys(this.views).forEach(vn => rows.push({
+                  TABLE_CATALOG: 'lumina', TABLE_SCHEMA: SCHEMA, TABLE_NAME: vn,
+                  TABLE_TYPE: 'VIEW', TABLE_ROWS: null, TABLE_COMMENT: this.comments['table:' + vn] || null
+              }));
+              return rows;
+          }
+          if (kind === 'views') {
+              Object.keys(this.views).forEach(vn => rows.push({
+                  TABLE_CATALOG: 'lumina', TABLE_SCHEMA: SCHEMA, TABLE_NAME: vn,
+                  VIEW_DEFINITION: this.views[vn], IS_UPDATABLE: 'NO'
+              }));
+              return rows;
+          }
+          if (kind === 'columns') {
+              userTables.forEach(tn => {
+                  const t = this.tables[tn];
+                  let pos = 0;
+                  for (const c in t.cols) {
+                      pos++;
+                      const isPk = t.primaryKey === c || (t.compositeKeys || []).includes(c);
+                      rows.push({
+                          TABLE_CATALOG: 'lumina', TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn, COLUMN_NAME: c,
+                          ORDINAL_POSITION: pos,
+                          COLUMN_DEFAULT: this._isNowMarker(t.defaults[c]) ? 'CURRENT_TIMESTAMP' : (t.defaults[c] === undefined ? null : t.defaults[c]),
+                          IS_NULLABLE: (t.notNullCols.includes(c) || isPk) ? 'NO' : 'YES',
+                          DATA_TYPE: (t.colTypes && t.colTypes[c]) ? t.colTypes[c] : 'TEXT',
+                          COLUMN_KEY: isPk ? 'PRI' : (t.uniqueCols.includes(c) ? 'UNI' : (t.indices[c] ? 'MUL' : '')),
+                          EXTRA: t.autoIncrementCol === c ? 'auto_increment' : ((t.generatedCols && t.generatedCols[c]) ? 'GENERATED' : ''),
+                          COLUMN_COMMENT: this.comments[`column:${tn}.${c}`] || null
+                      });
+                  }
+              });
+              return rows;
+          }
+          if (kind === 'key_column_usage') {
+              userTables.forEach(tn => {
+                  const t = this.tables[tn];
+                  const pks = t.compositeKeys && t.compositeKeys.length ? t.compositeKeys : (t.primaryKey ? [t.primaryKey] : []);
+                  pks.forEach((c, i) => rows.push({
+                      CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: 'PRIMARY', TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn,
+                      COLUMN_NAME: c, ORDINAL_POSITION: i + 1, REFERENCED_TABLE_NAME: null, REFERENCED_COLUMN_NAME: null
+                  }));
+                  (t.foreignKeys || []).forEach((fk, i) => rows.push({
+                      CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: fk.name || `fk_${tn}_${fk.col}`, TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn,
+                      COLUMN_NAME: fk.col, ORDINAL_POSITION: i + 1, REFERENCED_TABLE_NAME: fk.refTable, REFERENCED_COLUMN_NAME: fk.refCol
+                  }));
+              });
+              return rows;
+          }
+          if (kind === 'table_constraints') {
+              userTables.forEach(tn => {
+                  const t = this.tables[tn];
+                  if (t.primaryKey || (t.compositeKeys || []).length) {
+                      rows.push({ CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: 'PRIMARY', TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn, CONSTRAINT_TYPE: 'PRIMARY KEY' });
+                  }
+                  t.uniqueCols.forEach(c => rows.push({ CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: `uq_${tn}_${c}`, TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn, CONSTRAINT_TYPE: 'UNIQUE' }));
+                  (t.foreignKeys || []).forEach(fk => rows.push({ CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: fk.name || `fk_${tn}_${fk.col}`, TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn, CONSTRAINT_TYPE: 'FOREIGN KEY' }));
+                  (t.checks || []).forEach((ck, i) => rows.push({ CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: ck.name || `chk_${tn}_${i + 1}`, TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn, CONSTRAINT_TYPE: 'CHECK' }));
+              });
+              return rows;
+          }
+          if (kind === 'routines') {
+              Object.keys(this.procedures).forEach(p => rows.push({
+                  ROUTINE_CATALOG: 'lumina', ROUTINE_SCHEMA: SCHEMA, ROUTINE_NAME: p,
+                  ROUTINE_TYPE: 'PROCEDURE', DATA_TYPE: null, ROUTINE_DEFINITION: this.procedures[p].join('; ')
+              }));
+              Object.keys(this.functions).forEach(f => rows.push({
+                  ROUTINE_CATALOG: 'lumina', ROUTINE_SCHEMA: SCHEMA, ROUTINE_NAME: f,
+                  ROUTINE_TYPE: 'FUNCTION', DATA_TYPE: this.functions[f].returns, ROUTINE_DEFINITION: this.functions[f].body
+              }));
+              return rows;
+          }
+          // sequences
+          Object.keys(this.sequences).forEach(s => {
+              const q = this.sequences[s];
+              rows.push({ SEQUENCE_CATALOG: 'lumina', SEQUENCE_SCHEMA: SCHEMA, SEQUENCE_NAME: s, START_VALUE: q.start, INCREMENT: q.increment, LAST_VALUE: q.value });
+          });
+          return rows;
+      },
+
       // SELECT ... INTO <newtable> FROM ... : 結果セットから新テーブルを作成する
       _executeSelectInto(newName, selectSql, strMap) {
           if (this.tables[newName]) throw new Error(`Table '${newName}' already exists.`);
@@ -653,20 +1505,102 @@
       _executeDDL(sql, strMap) {
           let resultSet = [];
           let affectedRows = 0;
-          if (/^create\s+index/i.test(sql)) {
-             const m = sql.match(/create\s+index\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+on\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+)\s*\)/i);
+          if (/^create\s+(unique\s+)?index/i.test(sql)) {
+             // 複数列指定に対応する。LuminaDB のインデックスは単一列ハッシュなので、
+             // 複合指定は各列に個別のインデックスを張る（先頭列で絞れれば十分効く）
+             // 末尾の WHERE 句は部分インデックス（PostgreSQL / SQLite）。
+             // LuminaDB のインデックスは列単位ハッシュなので、条件は「この索引が使える行の
+             // 絞り込み条件」として記録し、一致するクエリでのみ利用する
+             let partialWhere = null;
+             {
+                 const pw = sql.match(/\s+where\s+([\s\S]+)$/i);
+                 if (pw && /^create\s+(unique\s+)?index/i.test(sql)) {
+                     partialWhere = pw[1].trim();
+                     sql = sql.slice(0, pw.index);
+                 }
+             }
+             const m = sql.match(/create\s+(unique\s+)?index\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+on\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)\s*$/i);
              if (m) {
-                const idxName = m[2].toLowerCase();
-                const table = m[3].toLowerCase();
-                const col = m[4].toLowerCase();
-                if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
-                if (m[1] && this.tables[table].indices[col]) {
-                    return { data: [{ Result: "Success", Message: `Index on ${table}(${col}) already exists. Skipped.` }], affectedRows: 0 };
+                const idxName = m[3].toLowerCase();
+                const table = m[4].toLowerCase();
+                const cols = m[5].split(',').map(c => c.trim().toLowerCase());
+                const t = this.tables[table];
+                if (!t) throw this._tableNotFound(table);
+                cols.forEach(c => { if (!t.cols[c]) throw new Error(`Column '${c}' not found in table '${table}'.`); });
+                if (m[2] && cols.every(c => t.indices[c])) {
+                    return { data: [{ Result: "Success", Message: `Index on ${table}(${cols.join(', ')}) already exists. Skipped.` }], affectedRows: 0 };
                 }
                 this._logTableMeta(table);
-                this.tables[table].createIndex(col);
-                resultSet = [{ Result: "Success", Message: `Index '${idxName}' created on ${table}(${col}).` }];
-             } else throw new Error("Syntax Error in CREATE INDEX.");
+                // UNIQUE INDEX は一意制約としても登録する（既存の重複は検出してエラー）
+                if (m[1]) {
+                    cols.forEach(c => {
+                        const seen = new Set();
+                        for (let r = 0; r < t.rowCount; r++) {
+                            const v = t.getValue(c, r);
+                            if (v === null || v === undefined) continue;
+                            const k = String(v);
+                            if (seen.has(k)) throw new Error(`Cannot create UNIQUE index '${idxName}': duplicate value '${v}' in column '${c}'.`);
+                            seen.add(k);
+                        }
+                        if (!t.uniqueCols.includes(c)) t.uniqueCols.push(c);
+                    });
+                }
+                // 部分インデックスの WHERE は構文として受理し、述語を記録する。
+                // 実体は全行インデックス — 条件を満たす行だけを持つ真の部分インデックスの
+                // 上位互換（同じクエリに常に正しく使える。差はメモリ使用量だけ）なので、
+                // 挿入・更新時の索引保守を複雑にせずに済む
+                if (partialWhere) {
+                    // 構文だけでなく列名も検証する（未知の列は行評価まで気づけないため、
+                    // 実データが 1 行でもあればそこで評価して確かめる）
+                    const pf = this.compileCondition(partialWhere, strMap);
+                    if (t.rowCount > 0) pf({ [table]: 0 }, this.tables, { [table]: table });
+                }
+                cols.forEach(c => t.createIndex(c));
+                const whereText = partialWhere ? this._restoreStrings(partialWhere, strMap) : null;
+                this.indexNames = this.indexNames || Object.create(null);
+                this.indexNames[idxName] = { table, cols, unique: !!m[1], where: whereText };
+                resultSet = [{ Result: "Success", Message: `Index '${idxName}' created on ${table}(${cols.join(', ')})${whereText ? ` (partial predicate '${whereText}' recorded; a full index is built)` : ''}.` }];
+             } else throw new Error("Syntax Error in CREATE INDEX. Use CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col[, col...]).");
+          }
+          else if (/^create\s+(?:or\s+replace\s+)?function\b/i.test(sql)) {
+             // ユーザー定義スカラー関数。本体は単一の式（RETURN <expr>）に限定する。
+             // 呼び出し時に式へインライン展開されるため実行コストは組み込み関数と同等。
+             const m = sql.match(/^create\s+(or\s+replace\s+)?function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([\s\S]*?)\)\s*(?:returns\s+([a-zA-Z][a-zA-Z0-9_]*(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)\s*)?(?:as\s+)?(?:begin\s+)?return\s+([\s\S]+?)\s*(?:;\s*end)?\s*$/i);
+             if (!m) throw new Error("Syntax Error in CREATE FUNCTION. Use CREATE [OR REPLACE] FUNCTION name(p1 [type], ...) RETURNS type AS RETURN <expression>.");
+             const name = m[2].toLowerCase();
+             if (!m[1] && this.functions[name]) throw new Error(`Function '${name}' already exists. Use CREATE OR REPLACE FUNCTION.`);
+             // 組み込み関数の上書きは禁止（式コンパイラの写像と衝突するため）
+             if (this._isBuiltinFunctionName(name)) throw new Error(`'${name.toUpperCase()}' is a built-in function and cannot be redefined.`);
+             const params = (m[3] || '').trim() === '' ? [] : this.splitSelectClause(m[3]).map(p => {
+                 const pm = p.trim().match(/^([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+[a-zA-Z][a-zA-Z0-9_]*(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)?$/);
+                 if (!pm) throw new Error(`Invalid parameter declaration '${p.trim()}' in CREATE FUNCTION.`);
+                 return pm[1].toLowerCase();
+             });
+             if (new Set(params).size !== params.length) throw new Error("Duplicate parameter name in CREATE FUNCTION.");
+             const body = this._restoreStrings(m[5].trim().replace(/;$/, ''), strMap);
+             if (body === '') throw new Error("Function body is empty.");
+             this._logFunctionState(name);
+             this.functions[name] = { params, body, returns: m[4] ? m[4].toUpperCase() : 'TEXT' };
+             // 定義時に式としてコンパイルできるか検証する（引数はダミーの 0 で置換）
+             try {
+                 this.compileCondition(params.reduce((b, p) => b.replace(new RegExp('\\b' + p + '\\b', 'gi'), '0'), body), []);
+             } catch (e) {
+                 delete this.functions[name];
+                 throw new Error(`Invalid function body: ${e.message}`);
+             }
+             resultSet = [{ Result: "Success", Message: `Function '${name}' created (${params.length} parameter(s)).` }];
+          }
+          else if (/^drop\s+function\b/i.test(sql)) {
+             const m = sql.match(/^drop\s+function\s+(if\s+exists\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\(\s*\))?\s*$/i);
+             if (!m) throw new Error("Syntax Error in DROP FUNCTION. Use DROP FUNCTION [IF EXISTS] name.");
+             const name = m[2].toLowerCase();
+             if (!this.functions[name]) {
+                 if (m[1]) return { data: [{ Result: "Success", Message: `Function '${name}' does not exist. Skipped.` }], affectedRows: 0 };
+                 throw new Error(`Function '${name}' not found.`);
+             }
+             this._logFunctionState(name);
+             delete this.functions[name];
+             resultSet = [{ Result: "Success", Message: `Function '${name}' dropped.` }];
           }
           else if (/^create\s+materialized\s+view/i.test(sql)) {
              // マテリアライズドビュー: 定義時に結果を実体化し、REFRESH で明示的に再計算する。
@@ -718,19 +1652,34 @@
              } else throw new Error("Syntax Error in CREATE VIEW.");
           }
           else if (/^create\s+(?:or\s+replace\s+)?procedure/i.test(sql)) {
-             const m = sql.match(/^create\s+(or\s+replace\s+)?procedure\s+([a-zA-Z0-9_]+)\s+as\s+([\s\S]+)$/i);
+             // CREATE [OR REPLACE] PROCEDURE name [(p1 [type], ...)] [AS] BEGIN ... END
+             const m = sql.match(/^create\s+(or\s+replace\s+)?procedure\s+([a-zA-Z0-9_]+)\s*(?:\(([\s\S]*?)\))?\s*(?:as\s+)?([\s\S]+)$/i);
              if (m) {
                 const orReplace = !!m[1];
                 const name = m[2].toLowerCase();
                 if (this.procedures[name] && !orReplace) throw new Error(`Procedure '${name}' already exists.`);
                 const replaced = orReplace && !!this.procedures[name];
-                let body = m[3].trim();
-                const beMatch = body.match(/^begin\s+([\s\S]+?)\s*end$/i);
+                const params = (m[3] || '').trim() === '' ? [] : this.splitSelectClause(m[3]).map(p => {
+                    // IN/OUT/INOUT の修飾と型は受理して名前だけ使う（値渡しのみ対応）
+                    const pm = p.trim().match(/^(?:(?:in|out|inout)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+[a-zA-Z][a-zA-Z0-9_]*(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)?$/i);
+                    if (!pm) throw new Error(`Invalid parameter declaration '${p.trim()}' in CREATE PROCEDURE.`);
+                    return pm[1].toLowerCase();
+                });
+                if (new Set(params).size !== params.length) throw new Error("Duplicate parameter name in CREATE PROCEDURE.");
+                let body = this._restoreStrings(m[4].trim(), strMap);
+                // 'AS' だけで本体が続かない場合（AS を任意にしたぶん明示的に弾く）
+                if (/^as$/i.test(body)) throw new Error("Procedure body is empty.");
+                const beMatch = body.match(/^begin\s+([\s\S]+?)\s*end\s*;?$/i);
                 if (beMatch) body = beMatch[1];
-                const statements = body.split(';').map(s => s.trim()).filter(s => s !== '').map(s => this._restoreStrings(s, strMap));
+                // IF / WHILE / LOOP / REPEAT / BEGIN / CASE のブロックを保ったまま文へ分割する
+                const statements = this._splitProcBody(body);
                 if (statements.length === 0) throw new Error("Procedure body is empty.");
+                // 制御構造の構文誤りは CALL 時ではなく定義時に知らせる
+                this._validateProcBody(statements);
                 this._logProcState(name);
                 this.procedures[name] = statements;
+                this.procParams = this.procParams || Object.create(null);
+                this.procParams[name] = params;
                 resultSet = [{ Result: "Success", Message: `Procedure '${name}' ${replaced ? 'replaced' : 'created'} (${statements.length} statements).` }];
              } else throw new Error("Syntax Error in CREATE PROCEDURE.");
           }
@@ -827,6 +1776,7 @@
                 t.checks = JSON.parse(JSON.stringify(src.checks || []));
                 t.compositeKeys = JSON.parse(JSON.stringify(src.compositeKeys || []));
                 t.generatedCols = Object.assign(Object.create(null), src.generatedCols || {});
+                t.onUpdateNowCols = [...(src.onUpdateNowCols || [])];
                 t.isTemp = isTempFlag;
                 Object.keys(src.indices).forEach(c => t.createIndex(c));
                 this.tables[tableName] = t;
@@ -893,7 +1843,17 @@
                         checks.push({ name: tlChk[1] ? tlChk[1].toLowerCase() : null, expr: this._restoreStrings(ex.expr, strMap) });
                         return;
                     }
-                    const fkMatch = d.match(/^foreign\s+key\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*references\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+)\s*\)([\s\S]*)$/i);
+                    // 複数列の FOREIGN KEY は未対応。以前は正規表現に外れて「foreign という
+                    // 列」を作ってしまっていたので、ここで明示的に拒否する
+                    const fkMulti = d.match(/^(?:constraint\s+[a-zA-Z0-9_]+\s+)?foreign\s+key\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)+)\s*\)/i);
+                    if (fkMulti) {
+                        throw new Error(`Multi-column FOREIGN KEY (${fkMulti[1]}) is not supported. Define one single-column foreign key per referencing column.`);
+                    }
+                    const fkMatch = d.match(/^(?:constraint\s+[a-zA-Z0-9_]+\s+)?foreign\s+key\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*references\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+)\s*\)([\s\S]*)$/i);
+                    // FOREIGN KEY だが上のどちらの形にも当てはまらない → 列定義として扱わず明示エラー
+                    if (!fkMatch && /^(?:constraint\s+[a-zA-Z0-9_]+\s+)?foreign\s+key\b/i.test(d)) {
+                        throw new Error(`Syntax Error in FOREIGN KEY definition near '${d.slice(0, 60)}'. Use FOREIGN KEY (col) REFERENCES table (col) [ON DELETE/UPDATE ...].`);
+                    }
                     // PRIMARY KEY / UNIQUE は複数列（複合キー）を受理する
                     const pkMatch = d.match(/^primary\s+key\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)$/i);
                     const uqMatch = d.match(/^(?:constraint\s+[a-zA-Z0-9_]+\s+)?unique\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)$/i);
@@ -955,6 +1915,13 @@
                         if (cchk) { checks.push({ name: null, expr: this._restoreStrings(cchk.expr, strMap) }); def = cchk.rest; }
                         let isPK = false, isUnique = false, notNull = false, autoInc = false;
                         let defaultVal; // undefined = DEFAULT 指定なし
+                        // ON UPDATE CURRENT_TIMESTAMP (MySQL): UPDATE のたびに現在時刻へ更新する列。
+                        // FK の ON UPDATE 参照アクションとは別物なので、REFERENCES を含む定義では拾わない
+                        let onUpdateNow = false;
+                        if (!/\breferences\b/i.test(def) && /\bon\s+update\s+(?:current_timestamp|now\s*\(\s*\))\b/i.test(def)) {
+                            onUpdateNow = true;
+                            def = def.replace(/\bon\s+update\s+(?:current_timestamp|now\s*\(\s*\))\b/i, ' ');
+                        }
                         if (/\bprimary\s+key\b/i.test(def)) { isPK = true; def = def.replace(/\bprimary\s+key\b/i, ' '); }
                         if (/\bunique\b/i.test(def)) { isUnique = true; def = def.replace(/\bunique\b/i, ' '); }
                         if (/\bauto_increment\b/i.test(def)) { autoInc = true; def = def.replace(/\bauto_increment\b/i, ' '); }
@@ -965,7 +1932,7 @@
                             def = def.replace(dm[0], ' ');
                         }
                         let parts = def.trim().split(/\s+/);
-                        colDefs.push({ name: parts[0].toLowerCase(), type: parts.length > 1 && parts[1] ? parts[1].toUpperCase() : 'ANY', isPK, isUnique, notNull, autoInc, defaultVal, hasDefault: dm !== null, generatedExpr });
+                        colDefs.push({ name: parts[0].toLowerCase(), type: parts.length > 1 && parts[1] ? parts[1].toUpperCase() : 'ANY', isPK, isUnique, notNull, autoInc, defaultVal, hasDefault: dm !== null, generatedExpr, onUpdateNow });
                     }
                 });
 
@@ -994,6 +1961,8 @@
                 t.autoIncrementCol = aiCols.length === 1 ? aiCols[0].name : null;
                 t.checks = checks.map(c => ({ name: c.name || null, expr: c.expr }));
                 t.compositeKeys = compositeDefs;
+                // ON UPDATE CURRENT_TIMESTAMP 指定列（UPDATE のたびに現在時刻を書き込む）
+                t.onUpdateNowCols = colDefs.filter(c => c.onUpdateNow).map(c => c.name);
                 // 生成列 (GENERATED ALWAYS AS): 式を保存し、INSERT/UPDATE 時に評価する
                 colDefs.forEach(cd => {
                     if (cd.generatedExpr != null) {
@@ -1463,7 +2432,25 @@
              } else throw new Error("Syntax Error in TRUNCATE TABLE.");
           }
           else if (/^drop\s+index/i.test(sql)) {
-             // CREATE INDEX と対称の構文。インデックス名は列で管理しているため省略可
+             // CREATE INDEX と対称の構文。インデックス名は列で管理しているため省略可。
+             // 列リストを省いた DROP INDEX name [ON table]（MySQL / SQL Server / PostgreSQL 形式）は
+             // CREATE INDEX で記録した名前→列の対応から解決する
+             const byName = sql.match(/^drop\s+index\s+(if\s+exists\s+)?([a-zA-Z0-9_]+)(?:\s+on\s+([a-zA-Z0-9_]+))?\s*$/i);
+             if (byName) {
+                const ifExists2 = !!byName[1];
+                const idxName = byName[2].toLowerCase();
+                const rec = (this.indexNames || {})[idxName];
+                if (!rec || (byName[3] && rec.table !== byName[3].toLowerCase())) {
+                    if (ifExists2) return { data: [{ Result: "Success", Message: `Index '${idxName}' does not exist. Skipped.` }], affectedRows: 0 };
+                    throw new Error(`Index '${idxName}' not found. Use DROP INDEX [IF EXISTS] name ON table (col) to drop an unnamed index.`);
+                }
+                const t2 = this.tables[rec.table];
+                if (!t2) throw this._tableNotFound(rec.table);
+                this._logTableMeta(rec.table);
+                rec.cols.forEach(c => { delete t2.indices[c]; });
+                delete this.indexNames[idxName];
+                return { data: [{ Result: "Success", Message: `Index '${idxName}' on ${rec.table}(${rec.cols.join(', ')}) dropped.` }], affectedRows: 0 };
+             }
              const m = sql.match(/drop\s+index\s+(if\s+exists\s+)?(?:([a-zA-Z0-9_]+)\s+)?on\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+)\s*\)/i);
              if (m) {
                 const ifExists = !!m[1];
@@ -1484,7 +2471,7 @@
           }
           else if (/^drop\s+view/i.test(sql)) {
              // カンマ区切りの複数ビュー指定に対応 (DROP VIEW [IF EXISTS] a, b)
-             const m = sql.match(/^drop\s+view\s+(if\s+exists\s+)?([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)$/i);
+             const m = sql.match(/^drop\s+view\s+(if\s+exists\s+)?([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)(?:\s+(cascade|restrict))?$/i);
              if (m) {
                 const ifExists = !!m[1];
                 const names = m[2].split(',').map(s => s.trim().toLowerCase());
@@ -1527,10 +2514,27 @@
           }
           else if (/^drop\s+table/i.test(sql)) {
              // カンマ区切りの複数テーブル指定に対応 (DROP TABLE [IF EXISTS] a, b, c)
-             const m = sql.match(/^drop\s+table\s+(if\s+exists\s+)?([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)$/i);
+             const m = sql.match(/^drop\s+table\s+(if\s+exists\s+)?([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)(?:\s+(cascade|restrict))?$/i);
              if (m) {
                 const ifExists = !!m[1];
                 const names = m[2].split(',').map(s => s.trim().toLowerCase());
+                // CASCADE: 消す表を参照している他表の外部キー定義も一緒に取り除く。
+                // RESTRICT（既定）は参照が残っていれば拒否する
+                const dropMode = (m[3] || 'RESTRICT').toUpperCase();
+                const refsTo = (tn) => Object.keys(this.tables).filter(o => o !== tn
+                    && (this.tables[o].foreignKeys || []).some(fk => fk.refTable === tn));
+                names.forEach(tn => {
+                    if (!this.tables[tn]) return;
+                    const dependents = refsTo(tn);
+                    if (dependents.length === 0) return;
+                    if (dropMode !== 'CASCADE') {
+                        throw new Error(`Cannot drop table '${tn}': it is referenced by a foreign key on '${dependents[0]}'. Use DROP TABLE ${tn} CASCADE.`);
+                    }
+                    dependents.forEach(o => {
+                        this._logTableMeta(o);
+                        this.tables[o].foreignKeys = this.tables[o].foreignKeys.filter(fk => fk.refTable !== tn);
+                    });
+                });
                 if (names.length === 1) {
                     const table = names[0];
                     if (!this.tables[table]) {
@@ -1570,6 +2574,10 @@
                  freedCapacity += res.freedCapacity;
              }
              resultSet = [{Result:"Success", Message:`Database optimized. (${freedStrings} unused strings freed, capacity reduced by ${freedCapacity} slots)`}];
+          }
+          else {
+             // 未知の DDL を黙って成功させない（対応漏れがサイレントな no-op になるのを防ぐ）
+             throw new Error("Syntax Error or Unsupported Command.");
           }
           return { data: resultSet, affectedRows };
       }

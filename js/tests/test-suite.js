@@ -2174,19 +2174,25 @@
             const original = await loadDB().catch(() => undefined);
             try {
                 await saveDB(db.exportForIDB());
-                // 生のレコードを直接読み、暗号文ラッパーであること（平文のテーブルキーが無いこと）を確認
+                // 生のレコードを直接読み、暗号文ラッパーであること（平文のテーブルキーが無いこと）を確認。
+                // v1.16 からはテーブル単位の差分保存なので 'meta' と 'tbl:<name>' の両方を見る
                 const idb = await initDB();
-                const raw = await new Promise((res, rej) => {
+                const rawGet = (key) => new Promise((res, rej) => {
                     const tx = idb.transaction('snapshots', 'readonly');
-                    const rq = tx.objectStore('snapshots').get('latest');
+                    const rq = tx.objectStore('snapshots').get(key);
                     rq.onsuccess = () => res(rq.result);
                     rq.onerror = () => rej(rq.error);
                 });
-                const isEncrypted = raw && raw.__encrypted__ === true
-                    && raw.data instanceof ArrayBuffer
-                    && raw.iv instanceof Uint8Array
-                    && raw.users === undefined
-                    && typeof raw.__version__ === 'number';
+                const encOk = (rec) => !!rec && rec.__encrypted__ === true
+                    && rec.data instanceof ArrayBuffer
+                    && rec.iv instanceof Uint8Array
+                    && typeof rec.__version__ === 'number';
+                const meta = await rawGet('meta');
+                const tbl = await rawGet('tbl:users');
+                const isEncrypted = encOk(meta) && encOk(tbl)
+                    && meta.tables === undefined && meta.catalog === undefined   // 平文の中身が漏れていない
+                    && tbl.cols === undefined
+                    && (await rawGet('latest')) === undefined;                   // 旧形式は残っていない
                 // 復号ロードで元データへ戻ることを確認
                 const loaded = await loadDB();
                 const eng = new DatabaseEngine();
@@ -2350,6 +2356,60 @@
         //   多段CTE / ウィンドウ / 巨大SQL文 / 深いネスト、〜990件）
         // ============================================================
         ...getV16Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v17.js の getV17Tests()
+        //   v1.14 で追加した SQL コマンド（|| / :: / ILIKE / SIMILAR TO /
+        //   行コンストラクタ / DISTINCT ON / WITH TIES / GROUP BY ALL /
+        //   * EXCLUDE・REPLACE / 複数表 DML / CREATE FUNCTION /
+        //   INFORMATION_SCHEMA / 表関数）とブラウザDB運用機能
+        //   （スナップショット・タイムアウト・読み取り専用・ライブクエリ）の回帰
+        // ============================================================
+        ...getV17Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v18.js の getV18Tests()
+        //   セキュリティ（インジェクション / 識別子検証 / JS脱出 /
+        //   プロトタイプ汚染 / DoSガード / 読み取り専用の強制 /
+        //   API境界 / 出力エスケープ、〜520件）
+        // ============================================================
+        ...getV18Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v19.js の getV19Tests()
+        //   パフォーマンス（較正付きの時間予算 + 計算量スケーリング、〜500件）
+        // ============================================================
+        ...getV19Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v20.js の getV20Tests()
+        //   v1.15 で追加した SQL（日付±INTERVAL / COLLATE / MATCH AGAINST /
+        //   LIKE ANY・ALL / IGNORE NULLS / JSON_TABLE / TABLESAMPLE /
+        //   プロシージャの制御構造 / ON UPDATE CURRENT_TIMESTAMP / PRAGMA /
+        //   sqlite_master / DECLARE @x / EXPLAIN FORMAT / DROP CASCADE）と、
+        //   ブラウザDB必須機能（ワーカー実行・マイグレーション・バックアップ）。
+        //   新しい入口のセキュリティ検査と性能予算も同スイートに含む
+        // ============================================================
+        ...getV20Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v21.js の getV21Tests()
+        //   v1.16: 手続き型の完成（カーソル / DECLARE HANDLER / SIGNAL / CASE 文）、
+        //   OVERLAPS・IS JSON・JSON_EXISTS/QUERY・BETWEEN SYMMETRIC、
+        //   DATE_BIN・TIME_BUCKET・AGE・EXTRACT(EPOCH/DOW/DOY)、
+        //   スキーマ修飾・部分インデックス・FOR UPDATE・CTE ヒント、
+        //   差分永続化・ストリーミング読み出し・タブ間追従
+        // ============================================================
+        ...getV21Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v22.js の getV22Tests()
+        //   v1.17: 配列（ARRAY[...] と関連関数）、回帰・MODE 集計、あいまい照合、
+        //   AT TIME ZONE、時系列 GENERATE_SERIES と WITH ORDINALITY、
+        //   ウィンドウの EXCLUDE / FILTER、式コンパイルキャッシュ、
+        //   CSV 取り込み、リーダー選出
+        // ============================================================
+        ...getV22Tests(),
 
         // Cleanup (New Features)
         { name: "Drop View Stats", sql: "DROP VIEW v_stats", check: r => true },

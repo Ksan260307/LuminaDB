@@ -276,6 +276,170 @@
         { name: "IsNumeric / Chr / Strpos", sql: "SELECT ISNUMERIC('123') AS n1, ISNUMERIC('ab') AS n2, CHR(65) AS c, STRPOS('hello', 'll') AS p" },
         { name: "QuoteName / PatIndex / Replicate", sql: "SELECT QUOTENAME('col name') AS q, PATINDEX('%[0-9]%', 'abc123') AS pos, REPLICATE('ab', 3) AS r" }
       ]},
+      { cat: "Operators & Predicates (v1.14)", cmds: [
+        { name: "String Concat (||)", sql: "SELECT name || ' (' || age || ')' AS label FROM {table}" },
+        { name: "Cast Operator (::)", sql: "SELECT '42'::INTEGER + 1 AS n, age::TEXT AS s FROM {table} LIMIT 3" },
+        { name: "ILIKE (case-insensitive)", sql: "SELECT * FROM {table} WHERE name ILIKE 'a%'" },
+        { name: "SIMILAR TO (SQL standard)", sql: "SELECT * FROM {table} WHERE name SIMILAR TO '(A|B)%'" },
+        { name: "IS [NOT] UNKNOWN", sql: "SELECT id FROM {table} WHERE (age > 100) IS NOT UNKNOWN" },
+        { name: "Row Constructor Compare", sql: "SELECT * FROM {table} WHERE (id, age) = (1, 25)" },
+        { name: "Row Constructor IN", sql: "SELECT * FROM {table} WHERE (id, age) IN ((1, 25), (2, 30))" },
+        { name: "System Variables (@@)", sql: "SELECT @@version AS ver, @@identity AS last_id" }
+      ]},
+      { cat: "Query Shorthands (v1.14)", cmds: [
+        { name: "DISTINCT ON (PostgreSQL)", sql: "SELECT DISTINCT ON (user_id) user_id, amount FROM orders ORDER BY user_id, amount DESC" },
+        { name: "SELECT * EXCLUDE", sql: "SELECT * EXCLUDE (age) FROM {table}" },
+        { name: "SELECT * REPLACE", sql: "SELECT * REPLACE (age * 2 AS age) FROM {table}" },
+        { name: "GROUP BY ALL", sql: "SELECT age, COUNT(*) AS c FROM {table} GROUP BY ALL" },
+        { name: "FETCH FIRST ... WITH TIES", sql: "SELECT * FROM {table} ORDER BY age DESC FETCH FIRST 3 ROWS WITH TIES" },
+        { name: "MINUS (Oracle)", sql: "SELECT id FROM {table} MINUS SELECT 1" },
+        { name: "Derived Table Columns", sql: "SELECT a, b FROM (SELECT id, name FROM {table}) AS d(a, b)" },
+        { name: "FROM (VALUES ...)", sql: "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, label)" },
+        { name: "STRING_SPLIT (table fn)", sql: "SELECT value FROM STRING_SPLIT('a,b,c', ',')" },
+        { name: "UNNEST (table fn)", sql: "SELECT n FROM UNNEST(10, 20, 30) AS u(n)" }
+      ]},
+      { cat: "Multi-table DML (v1.14)", cmds: [
+        { name: "UPDATE ... FROM (PostgreSQL)", sql: "UPDATE orders SET amount = amount + 1 FROM users WHERE orders.user_id = users.id AND users.age > 30" },
+        { name: "UPDATE ... JOIN (MySQL)", sql: "UPDATE orders o JOIN users u ON o.user_id = u.id SET o.amount = 9 WHERE u.age > 30" },
+        { name: "DELETE ... USING (PostgreSQL)", sql: "DELETE FROM orders USING users WHERE orders.user_id = users.id AND users.age > 90" },
+        { name: "DELETE t FROM t JOIN s (MySQL)", sql: "DELETE o FROM orders o JOIN users u ON o.user_id = u.id WHERE u.age > 90" },
+        { name: "INSERT DEFAULT VALUES", sql: "INSERT INTO {table} DEFAULT VALUES" }
+      ]},
+      { cat: "Catalog & Functions (v1.14)", cmds: [
+        { name: "Create Function", sql: "CREATE OR REPLACE FUNCTION tax(amount) RETURNS FLOAT AS RETURN ROUND(amount * 1.1, 2)" },
+        { name: "Use Function", sql: "SELECT price, tax(price) AS with_tax FROM products" },
+        { name: "Drop Function", sql: "DROP FUNCTION IF EXISTS tax" },
+        { name: "Information Schema (Tables)", sql: "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS FROM information_schema.tables" },
+        { name: "Information Schema (Columns)", sql: "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY FROM information_schema.columns WHERE TABLE_NAME = '{table}'" },
+        { name: "Information Schema (Constraints)", sql: "SELECT * FROM information_schema.table_constraints" },
+        { name: "Unique / Multi-column Index", sql: "CREATE UNIQUE INDEX idx_name ON {table} (name)" },
+        { name: "Drop Index by Name", sql: "DROP INDEX IF EXISTS idx_name" }
+      ]},
+      { cat: "Browser DB Operations (v1.14)", cmds: [
+        { name: "Statement Timeout", sql: "SET statement_timeout = 500" },
+        { name: "Read-only Mode", sql: "SET read_only = ON" },
+        { name: "Deterministic RAND", sql: "SET seed = 0.42; SELECT ROUND(RAND() * 100) AS r" },
+        { name: "Create Snapshot", sql: "CREATE SNAPSHOT before_import" },
+        { name: "Restore Snapshot", sql: "RESTORE SNAPSHOT before_import" },
+        { name: "List / Drop Snapshots", sql: "SHOW SNAPSHOTS" },
+        { name: "Last Query Profile", sql: "SHOW PROFILE" },
+        { name: "Slow Query Log", sql: "SHOW SLOW QUERIES" },
+        { name: "JS API (Live Query)", sql: "// const sub = LuminaDB.subscribe('SELECT COUNT(*) AS c FROM users', rows => console.log(rows)); sub.unsubscribe()" },
+        { name: "JS API (Read-only / Timeout)", sql: "// LuminaDB.readOnly(true); LuminaDB.timeout(500)" },
+        { name: "JS API (Snapshot / Restore)", sql: "// LuminaDB.snapshot('p1'); LuminaDB.restore('p1')" },
+        { name: "JS API (JSON I/O)", sql: "// LuminaDB.importJSON('t', [{ id: 1 }], { create: true }); LuminaDB.exportJSON(['t'])" }
+      ]},
+      { cat: "Operators & Search (v1.15)", cmds: [
+        { name: "Date + INTERVAL", sql: "SELECT DATE '2026-01-31' + INTERVAL 1 MONTH AS next_month, NOW() - INTERVAL 7 DAY AS week_ago" },
+        { name: "Interval (string form)", sql: "SELECT DATE '2026-01-01' + INTERVAL '2 weeks' AS d" },
+        { name: "COLLATE (case-insensitive)", sql: "SELECT * FROM {table} WHERE name COLLATE NOCASE = 'alice'" },
+        { name: "COLLATE (natural sort)", sql: "SELECT name FROM {table} ORDER BY name COLLATE NUMERIC" },
+        { name: "COLLATE (accent-insensitive)", sql: "SELECT ('がぎ' COLLATE NOACCENT = 'かき') AS same" },
+        { name: "Full-text MATCH ... AGAINST", sql: "SELECT * FROM {table} WHERE MATCH(name) AGAINST('alice bob')" },
+        { name: "Full-text (boolean mode)", sql: "SELECT * FROM {table} WHERE MATCH(name) AGAINST('+alice -bob' IN BOOLEAN MODE)" },
+        { name: "Full-text (relevance score)", sql: "SELECT name, MATCH(name) AGAINST('alice bob') AS score FROM {table} ORDER BY score DESC" },
+        { name: "LIKE ANY / ALL", sql: "SELECT * FROM {table} WHERE name LIKE ANY ('A%', 'B%')" },
+        { name: "IGNORE NULLS (window)", sql: "SELECT id, LAG(age) IGNORE NULLS OVER (ORDER BY id) AS prev FROM {table}" }
+      ]},
+      { cat: "Tables from JSON & Sampling (v1.15)", cmds: [
+        { name: "JSON_TABLE (array to rows)", sql: "SELECT * FROM JSON_TABLE('[{\"id\":1,\"nm\":\"a\"},{\"id\":2,\"nm\":\"b\"}]', '$[*]' COLUMNS (id INT PATH '$.id', nm TEXT PATH '$.nm')) t" },
+        { name: "JSON_TABLE (nested key)", sql: "SELECT * FROM JSON_TABLE('{\"items\":[{\"v\":1}]}', '$.items[*]' COLUMNS (v INT PATH '$.v')) t" },
+        { name: "TABLESAMPLE (percent)", sql: "SELECT * FROM {table} TABLESAMPLE (25 PERCENT)" },
+        { name: "TABLESAMPLE (fixed rows)", sql: "SELECT * FROM {table} TABLESAMPLE (100 ROWS)" },
+        { name: "TABLESAMPLE (reproducible)", sql: "SELECT * FROM {table} TABLESAMPLE (50 PERCENT) REPEATABLE (42)" }
+      ]},
+      { cat: "Stored Procedure Logic (v1.15)", cmds: [
+        { name: "IF / ELSEIF / ELSE", sql: "CREATE OR REPLACE PROCEDURE grade(s) AS BEGIN\n  DECLARE g TEXT;\n  IF s >= 90 THEN SET g = 'A';\n  ELSEIF s >= 70 THEN SET g = 'B';\n  ELSE SET g = 'C';\n  END IF;\n  RETURN g;\nEND" },
+        { name: "WHILE loop", sql: "CREATE OR REPLACE PROCEDURE total(n) AS BEGIN\n  DECLARE i INT DEFAULT 1;\n  DECLARE s INT DEFAULT 0;\n  WHILE i <= n DO SET s = s + i; SET i = i + 1; END WHILE;\n  RETURN s;\nEND" },
+        { name: "LOOP with LEAVE", sql: "CREATE OR REPLACE PROCEDURE countdown(n) AS BEGIN\n  DECLARE i INT DEFAULT 0;\n  lp: LOOP SET i = i + 1; IF i >= n THEN LEAVE lp; END IF; END LOOP;\n  RETURN i;\nEND" },
+        { name: "REPEAT ... UNTIL", sql: "CREATE OR REPLACE PROCEDURE step2(n) AS BEGIN\n  DECLARE i INT DEFAULT 0;\n  REPEAT SET i = i + 2; UNTIL i >= n END REPEAT;\n  RETURN i;\nEND" },
+        { name: "Call with arguments", sql: "CALL grade(85)" },
+        { name: "Procedure that writes rows", sql: "CREATE OR REPLACE PROCEDURE seed(n) AS BEGIN\n  DECLARE i INT DEFAULT 0;\n  WHILE i < n DO INSERT INTO {table} (id) VALUES (1000 + i); SET i = i + 1; END WHILE;\nEND" }
+      ]},
+      { cat: "Introspection & Schema Ops (v1.15)", cmds: [
+        { name: "PRAGMA table_info", sql: "PRAGMA table_info({table})" },
+        { name: "PRAGMA table_list", sql: "PRAGMA table_list" },
+        { name: "PRAGMA foreign_key_list", sql: "PRAGMA foreign_key_list({table})" },
+        { name: "PRAGMA user_version", sql: "PRAGMA user_version" },
+        { name: "sqlite_master", sql: "SELECT type, name, sql FROM sqlite_master ORDER BY type, name" },
+        { name: "ON UPDATE CURRENT_TIMESTAMP", sql: "CREATE TABLE audit_demo (id INTEGER PRIMARY KEY, v INTEGER, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)" },
+        { name: "DECLARE @var (T-SQL)", sql: "DECLARE @min INT = 25; SELECT * FROM {table} WHERE age > @min" },
+        { name: "EXPLAIN (FORMAT JSON)", sql: "EXPLAIN (FORMAT JSON) SELECT * FROM {table}" },
+        { name: "DROP TABLE ... CASCADE", sql: "DROP TABLE IF EXISTS parent_demo CASCADE" }
+      ]},
+      { cat: "Browser DB Essentials (v1.15)", cmds: [
+        { name: "JS API (run off the UI thread)", sql: "// await LuminaDB.worker.start(); await LuminaDB.worker.sync();\n// const r = await LuminaDB.worker.query('SELECT COUNT(*) FROM big'); await LuminaDB.worker.pull();" },
+        { name: "JS API (worker timeout)", sql: "// await LuminaDB.worker.timeout(2000)   // ワーカー側の文単位タイムアウト" },
+        { name: "JS API (schema migration)", sql: "// LuminaDB.migrate([\n//   { version: 1, up: 'CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)' },\n//   { version: 2, up: api => api.exec('ALTER TABLE notes ADD COLUMN tag TEXT') }\n// ])" },
+        { name: "JS API (schema version)", sql: "// LuminaDB.schemaVersion()      // PRAGMA user_version と同じ値" },
+        { name: "JS API (backup to file)", sql: "// LuminaDB.download('mydb.json')          // ダウンロード\n// LuminaDB.restoreBackup(await file.text()) // 復元" },
+        { name: "JS API (backup as string)", sql: "// const text = LuminaDB.backup()" }
+      ]},
+      { cat: "Cursors & Error Handling (v1.16)", cmds: [
+        { name: "Cursor loop (row by row)", sql: "CREATE OR REPLACE PROCEDURE walk() AS BEGIN\n  DECLARE done INT DEFAULT 0;\n  DECLARE v INT;\n  DECLARE c CURSOR FOR SELECT id FROM {table};\n  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;\n  OPEN c;\n  read_loop: LOOP\n    FETCH c INTO v;\n    IF done = 1 THEN LEAVE read_loop; END IF;\n  END LOOP;\n  CLOSE c;\nEND" },
+        { name: "Catch errors (CONTINUE HANDLER)", sql: "CREATE OR REPLACE PROCEDURE safe() AS BEGIN\n  DECLARE st TEXT DEFAULT 'ok';\n  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET st = 'failed';\n  SELECT * FROM missing_table;\n  RETURN st;\nEND" },
+        { name: "Abort on error (EXIT HANDLER)", sql: "CREATE OR REPLACE PROCEDURE guarded() AS BEGIN\n  DECLARE EXIT HANDLER FOR SQLEXCEPTION SELECT 'aborted' AS status;\n  INSERT INTO {table} (id) VALUES (1);\nEND" },
+        { name: "Raise an error (SIGNAL)", sql: "CREATE OR REPLACE PROCEDURE check_positive(n) AS BEGIN\n  IF n < 0 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'n must be >= 0'; END IF;\n  RETURN n;\nEND" },
+        { name: "Handle a specific SQLSTATE", sql: "// DECLARE CONTINUE HANDLER FOR SQLSTATE '45000' SET msg = 'business rule hit';" },
+        { name: "CASE statement", sql: "CREATE OR REPLACE PROCEDURE label(n) AS BEGIN\n  CASE n\n    WHEN 1 THEN RETURN 'one';\n    WHEN 2 THEN RETURN 'two';\n    ELSE RETURN 'many';\n  END CASE;\nEND" }
+      ]},
+      { cat: "Ranges, JSON & Time Buckets (v1.16)", cmds: [
+        { name: "OVERLAPS (period intersection)", sql: "SELECT (DATE '2026-01-01', DATE '2026-06-01') OVERLAPS (DATE '2026-03-01', DATE '2026-09-01') AS conflicts" },
+        { name: "BETWEEN SYMMETRIC", sql: "SELECT * FROM {table} WHERE age BETWEEN SYMMETRIC 30 AND 25" },
+        { name: "IS JSON", sql: "SELECT * FROM {table} WHERE '{\"a\":1}' IS JSON OBJECT" },
+        { name: "JSON_EXISTS / JSON_QUERY", sql: "SELECT JSON_EXISTS('{\"a\":{\"b\":1}}', '$.a.b') AS has_it, JSON_QUERY('{\"a\":{\"b\":1}}', '$.a') AS sub" },
+        { name: "DATE_BIN / TIME_BUCKET", sql: "SELECT DATE_BIN(INTERVAL 1 HOUR, NOW()) AS hour_bucket" },
+        { name: "Bucketed time series", sql: "SELECT TIME_BUCKET(INTERVAL 1 HOUR, NOW()) AS bucket, COUNT(*) AS n FROM {table} GROUP BY TIME_BUCKET(INTERVAL 1 HOUR, NOW())" },
+        { name: "AGE (interval between dates)", sql: "SELECT AGE(DATE '2028-03-15', DATE '2026-01-20') AS gap" },
+        { name: "EXTRACT EPOCH / DOW / DOY", sql: "SELECT EXTRACT(EPOCH FROM NOW()) AS unix_ts, EXTRACT(DOW FROM NOW()) AS weekday" }
+      ]},
+      { cat: "Schema & Planner Compatibility (v1.16)", cmds: [
+        { name: "Schema-qualified names", sql: "SELECT COUNT(*) FROM main.{table}" },
+        { name: "CREATE / DROP SCHEMA", sql: "CREATE SCHEMA app" },
+        { name: "Partial index", sql: "CREATE INDEX idx_active ON {table} (age) WHERE age > 25" },
+        { name: "SELECT ... FOR UPDATE", sql: "SELECT * FROM {table} WHERE id = 1 FOR UPDATE" },
+        { name: "CTE materialization hint", sql: "WITH c AS MATERIALIZED (SELECT id FROM {table}) SELECT COUNT(*) FROM c" },
+        { name: "EXPLAIN QUERY PLAN", sql: "EXPLAIN QUERY PLAN SELECT * FROM {table} WHERE id = 1" }
+      ]},
+      { cat: "Persistence & Streaming (v1.16)", cmds: [
+        { name: "JS API (batched read)", sql: "// LuminaDB.eachBatch('SELECT * FROM big ORDER BY id', [], 1000, rows => render(rows))" },
+        { name: "JS API (row cursor)", sql: "// for (const row of LuminaDB.cursor('SELECT * FROM big ORDER BY id')) { /* ... */ }" },
+        { name: "JS API (incremental save stats)", sql: "// LuminaDB.saveStats()   // { tables, written, skipped, removed } — 差分保存が効いているかの確認" },
+        { name: "JS API (follow other tabs)", sql: "// LuminaDB.autoReload(true)   // 他タブの保存を自動で読み直す" }
+      ]},
+      { cat: "Arrays & Fuzzy Matching (v1.17)", cmds: [
+        { name: "ARRAY constructor", sql: "SELECT ARRAY_TO_STRING(ARRAY[1, 2, 3], '-') AS joined, ARRAY_LENGTH(ARRAY[1, 2, 3]) AS n" },
+        { name: "Array membership", sql: "SELECT * FROM {table} WHERE id = ANY(ARRAY[1, 2, 3])" },
+        { name: "String ↔ array", sql: "SELECT ARRAY_TO_STRING(STRING_TO_ARRAY('a,b,c', ','), ' | ') AS s" },
+        { name: "Array edit helpers", sql: "SELECT ARRAY_TO_STRING(ARRAY_REMOVE(ARRAY_APPEND(ARRAY[1, 2], 3), 1), ',') AS s" },
+        { name: "Fuzzy search (LEVENSHTEIN)", sql: "SELECT name FROM {table} WHERE LEVENSHTEIN(name, 'Alise') <= 2" },
+        { name: "Rank by SIMILARITY", sql: "SELECT name, SIMILARITY(name, 'Alise') AS score FROM {table} ORDER BY score DESC LIMIT 5" },
+        { name: "Sounds-like (DIFFERENCE)", sql: "SELECT DIFFERENCE('Robert', 'Rupert') AS closeness" },
+        { name: "REGEXP_MATCHES / SPLIT", sql: "SELECT ARRAY_TO_STRING(REGEXP_MATCHES('a1b2', '[0-9]', 'g'), ',') AS digits" },
+        { name: "DIV / SAFE_DIVIDE", sql: "SELECT DIV(7, 2) AS whole, SAFE_DIVIDE(1, 0) AS no_error" }
+      ]},
+      { cat: "Statistics & Time Series (v1.17)", cmds: [
+        { name: "Linear regression", sql: "SELECT REGR_SLOPE(price, stock) AS slope, REGR_INTERCEPT(price, stock) AS intercept, REGR_R2(price, stock) AS r2 FROM products" },
+        { name: "Regression detail", sql: "SELECT REGR_COUNT(price, stock) AS n, REGR_AVGX(price, stock) AS avg_x, REGR_AVGY(price, stock) AS avg_y FROM products" },
+        { name: "MODE (most common value)", sql: "SELECT MODE() WITHIN GROUP (ORDER BY age) AS most_common FROM {table}" },
+        { name: "Hourly buckets (gap-free)", sql: "SELECT value AS hour FROM GENERATE_SERIES(TIMESTAMP '2026-01-01 00:00:00', TIMESTAMP '2026-01-01 23:00:00', INTERVAL 1 HOUR)" },
+        { name: "Daily series + LEFT JOIN", sql: "SELECT d.value AS day, COUNT(o.order_id) AS n\nFROM GENERATE_SERIES(DATE '2026-01-01', DATE '2026-01-07', INTERVAL 1 DAY) d\nLEFT JOIN orders o ON 1 = 0\nGROUP BY d.value ORDER BY day" },
+        { name: "WITH ORDINALITY", sql: "SELECT v, n FROM GENERATE_SERIES(10, 30, 10) WITH ORDINALITY AS t(v, n)" },
+        { name: "AT TIME ZONE", sql: "SELECT NOW() AT TIME ZONE '+09:00' AS tokyo, NOW() AT TIME ZONE 'UTC' AS utc" }
+      ]},
+      { cat: "Window Extras (v1.17)", cmds: [
+        { name: "Running total excluding self", sql: "SELECT id, SUM(age) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) AS others FROM {table}" },
+        { name: "EXCLUDE GROUP / TIES", sql: "SELECT id, COUNT(*) OVER (ORDER BY age RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) AS c FROM {table}" },
+        { name: "Window FILTER", sql: "SELECT id, SUM(age) FILTER (WHERE age > 25) OVER () AS adults_total FROM {table}" },
+        { name: "Window FILTER by partition", sql: "SELECT id, COUNT(*) FILTER (WHERE age > 25) OVER (PARTITION BY age) AS n FROM {table}" }
+      ]},
+      { cat: "CSV, Cache & Coordination (v1.17)", cmds: [
+        { name: "JS API (import CSV text)", sql: "// LuminaDB.importCSV(await file.text(), 'sales', { create: true })\n// opts: { create, header, delimiter, replace }" },
+        { name: "JS API (export a table as CSV)", sql: "// LuminaDB.exportCSV('sales')" },
+        { name: "JS API (compile cache stats)", sql: "// LuminaDB.cacheStats()   // { hits, misses, size, hitRate } — 同じ形のクエリの再コンパイルを省けているか" },
+        { name: "JS API (leader tab election)", sql: "// const h = LuminaDB.onLeader(() => startBackgroundSync());\n// h.release();   // 別タブが自動的に昇格する" },
+        { name: "Maintenance no-ops", sql: "REINDEX" }
+      ]},
       { cat: "External API", cmds: [
         { name: "JS API", sql: "// JSコンソールから: LuminaDB.query('SELECT * FROM users WHERE id = ?', [1])" },
         { name: "JS API (Named Params)", sql: "// LuminaDB.query('SELECT * FROM users WHERE age > :min AND age < @max', { min: 24, max: 31 })" },

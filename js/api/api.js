@@ -64,6 +64,31 @@
     // オブジェクトCRUDヘルパー共用: 識別子検証 / WHERE句の組み立て
     const _validIdent = (s) => typeof s === 'string' && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(s);
 
+    // RFC 4180 の CSV パーサ（引用符内の区切り・改行・二重引用符に対応）。
+    // 行末は CRLF / LF の両方を受け、末尾の空行は捨てる
+    function parseCsv(text, delim) {
+        const rows = [];
+        let row = [], field = '', inQuotes = false;
+        const s = String(text).replace(/^﻿/, '');   // BOM を落とす
+        for (let i = 0; i < s.length; i++) {
+            const ch = s[i];
+            if (inQuotes) {
+                if (ch === '"') {
+                    if (s[i + 1] === '"') { field += '"'; i++; }
+                    else inQuotes = false;
+                } else field += ch;
+                continue;
+            }
+            if (ch === '"' && field === '') { inQuotes = true; continue; }
+            if (ch === delim) { row.push(field); field = ''; continue; }
+            if (ch === '\r') { if (s[i + 1] === '\n') i++; row.push(field); rows.push(row); row = []; field = ''; continue; }
+            if (ch === '\n') { row.push(field); rows.push(row); row = []; field = ''; continue; }
+            field += ch;
+        }
+        if (field !== '' || row.length > 0) { row.push(field); rows.push(row); }
+        return rows.filter(r => !(r.length === 1 && r[0] === ''));
+    }
+
     // where の演算子オブジェクト（{gt: 30, lte: 50} 等）で使えるキー → SQL演算子
     const _WHERE_OPS = { gt: '>', gte: '>=', lt: '<', lte: '<=', ne: '<>', like: 'LIKE' };
 
@@ -280,10 +305,15 @@
                 if (c.error) return { error: c.error };
                 if (typeof renderTree === 'function') renderTree();
                 if (typeof triggerAutoSave === 'function') triggerAutoSave();
+                // COMMIT 後に確定状態で通知する（_ownsTx を先に落とす。落とす前だと抑制される）
+                this._ownsTx = false;
+                this._emit('change', { sql: 'COMMIT', transaction: true });
                 return { data: [{ Result: 'Success', Message: 'Transaction committed.' }], value };
             } catch (e) {
                 db.executeQuery('ROLLBACK');
                 if (typeof renderTree === 'function') renderTree();
+                this._ownsTx = false;
+                this._notifySubscribers();
                 return { error: 'Transaction rolled back: ' + (e && e.message ? e.message : String(e)) };
             } finally {
                 this._ownsTx = false;
@@ -469,6 +499,8 @@
             return this;
         },
         _emit(event, payload) {
+            // 書き込みイベントはライブクエリ（subscribe）の再評価契機でもある
+            if (event === 'change') this._notifySubscribers();
             const list = this._listeners[event];
             if (!list) return;
             // リスナー内の例外・リスト変更に影響されないようコピーへ発火する
@@ -510,6 +542,461 @@
 
         exportSQL() {
             return db.exportSQL();
+        },
+
+        // ================= v1.14: ブラウザDBとしての運用機能 =================
+
+        // --- 読み取り専用モード ---
+        // 埋め込み先（iframe / 外部スクリプト）へ DB を公開するとき、書き込みを一括で塞ぐ。
+        // エンジン側で判定するので UI 操作・postMessage・fetch も同時に読み取り専用になる。
+        //   LuminaDB.readOnly(true)  → 以降 SELECT / SHOW / EXPLAIN 等だけ通す
+        //   LuminaDB.readOnly(true, { lock: true }) にすると SQL の SET read_only = OFF では
+        //   解除できなくなる（解除できるのはホストアプリからの readOnly(false) だけ）
+        readOnly(flag, opts) {
+            if (flag === undefined) return db.readOnly;
+            db.readOnly = !!flag;
+            db.readOnlyLocked = !!flag && !!(opts && opts.lock);
+            this._emit('readonly', { readOnly: db.readOnly, locked: db.readOnlyLocked });
+            return db.readOnly;
+        },
+
+        // --- 文単位のタイムアウト ---
+        // ブラウザではクエリが UI スレッドを止めるため、暴走クエリを時間で切れることが重要。
+        //   LuminaDB.timeout(500) → 以降の文は 500ms を超えるとエラーで中断（0 で解除）
+        timeout(ms) {
+            if (ms === undefined) return db.statementTimeoutMs;
+            const n = Math.trunc(Number(ms));
+            if (!(n >= 0)) throw new Error('timeout() requires a non-negative number of milliseconds.');
+            db.statementTimeoutMs = n;
+            return n;
+        },
+
+        // --- スナップショット（メモリ内タイムトラベル） ---
+        // トランザクションと違い複数文・複数トランザクションをまたいで保持できる。
+        //   const s = LuminaDB.snapshot('before-import');  … 取得
+        //   LuminaDB.restore('before-import');             … 巻き戻し
+        snapshot(name) {
+            if (!_validIdent(name)) return { error: 'Invalid snapshot name.' };
+            return this.query(`CREATE SNAPSHOT ${name}`);
+        },
+        restore(name) {
+            if (!_validIdent(name)) return { error: 'Invalid snapshot name.' };
+            const r = this.query(`RESTORE SNAPSHOT ${name}`);
+            if (!r.error) {
+                if (typeof renderTree === 'function') renderTree();
+                this._notifySubscribers(null);
+            }
+            return r;
+        },
+        snapshots() {
+            const r = db.executeQuery('SHOW SNAPSHOTS');
+            return r.error ? [] : r.data;
+        },
+        dropSnapshot(name) {
+            if (!_validIdent(name)) return { error: 'Invalid snapshot name.' };
+            return this.query(`DROP SNAPSHOT ${name}`);
+        },
+
+        // --- ライブクエリ（購読） ---
+        // SQL の結果を購読し、API 経由の書き込みで結果が変わったときだけ再通知する。
+        // UI を DB に追従させる用途（ブラウザDBならではの使い方）。
+        //   const sub = LuminaDB.subscribe('SELECT COUNT(*) AS c FROM users', rows => render(rows));
+        //   sub.unsubscribe();
+        // 注意: 通知は API 経由（query/exec/insert/update/remove/transaction）の書き込みが
+        // 契機。db.executeQuery を直接呼んだ場合は refresh() で明示的に更新する。
+        _subs: [],
+        _subSeq: 0,
+        subscribe(sql, params, cb) {
+            if (typeof params === 'function') { cb = params; params = undefined; }
+            if (typeof sql !== 'string' || sql.trim() === '') throw new Error('subscribe() requires a non-empty SQL string.');
+            if (typeof cb !== 'function') throw new Error('subscribe() requires a callback function.');
+            if (!isReadOnlySql(sql)) throw new Error('subscribe() only accepts read-only statements.');
+            const self = this;
+            const sub = {
+                id: ++this._subSeq, sql, params, cb, lastSig: null,
+                unsubscribe() { const i = self._subs.indexOf(sub); if (i !== -1) self._subs.splice(i, 1); return true; }
+            };
+            this._subs.push(sub);
+            // 初回は現在値で即座に通知する（購読側が初期表示を別途書かなくてよい）
+            this._runSub(sub, true);
+            return sub;
+        },
+        unsubscribe(sub) {
+            if (!sub) { this._subs = []; return true; }
+            return typeof sub.unsubscribe === 'function' ? sub.unsubscribe() : false;
+        },
+        // 購読しているクエリを再評価する（外部で DB を直接変更した場合の手動トリガ）
+        refresh() { this._notifySubscribers(null); return this._subs.length; },
+
+        _runSub(sub, force) {
+            const r = this.query(sub.sql, sub.params);
+            if (r.error) { sub.lastSig = null; try { sub.cb(null, r.error); } catch (e) { /* 購読側の例外は無視 */ } return; }
+            // 前回と同じ結果なら通知しない（無関係なテーブルへの書き込みで再描画しない）
+            const sig = JSON.stringify(r.data);
+            if (!force && sig === sub.lastSig) return;
+            sub.lastSig = sig;
+            try { sub.cb(r.data, null); } catch (e) { /* 購読側の例外は無視 */ }
+        },
+        _notifySubscribers() {
+            // 購読コールバック内での書き込みによる再入を防ぐ（1段で打ち切る）。
+            // transaction(fn) の実行中は未コミットの中間状態を配らず、COMMIT / ROLLBACK 後にまとめて通知する
+            if (this._subs.length === 0 || this._notifying || this._ownsTx) return;
+            this._notifying = true;
+            try { this._subs.slice().forEach(s => this._runSub(s, false)); }
+            finally { this._notifying = false; }
+        },
+
+        // --- JSON 入出力 ---
+        // CSV / SQL ダンプに加えて、アプリの JS データ構造と直接やり取りする経路。
+        importJSON(table, rows, opts) {
+            if (!_validIdent(table)) return { error: 'Invalid table name.' };
+            if (!Array.isArray(rows)) return { error: 'importJSON() requires an array of row objects.' };
+            if (rows.length === 0) return { data: [], scannedRows: 0 };
+            opts = opts || {};
+            if (!db.tables[String(table).toLowerCase()]) {
+                if (!opts.create) return { error: `Table '${table}' not found. Pass { create: true } to create it from the data.` };
+                const cols = Object.keys(rows[0]);
+                if (cols.length === 0 || !cols.every(_validIdent)) return { error: 'Cannot infer a valid schema from the first row.' };
+                const typeOf = (v) => typeof v === 'number' ? 'FLOAT' : (typeof v === 'boolean' ? 'BOOLEAN' : 'TEXT');
+                const c = db.executeQuery(`CREATE TABLE ${table} (${cols.map(k => `${k} ${typeOf(rows[0][k])}`).join(', ')})`);
+                if (c.error) return c;
+            }
+            return this.insert(table, rows);
+        },
+        exportJSON(tables) {
+            const names = Array.isArray(tables) ? tables : Object.keys(db.tables).filter(t => !t.startsWith('__tmp_'));
+            const out = {};
+            names.forEach(t => {
+                if (!_validIdent(t)) throw new Error(`Invalid table name '${t}'.`);
+                const r = db.executeQuery(`SELECT * FROM ${t}`);
+                if (r.error) throw new Error(r.error);
+                out[t] = r.data;
+            });
+            return out;
+        },
+
+        // --- 計測 ---
+        profile() { const r = db.executeQuery('SHOW PROFILE'); return r.error ? null : (r.data[0] || null); },
+        slowQueries() { const r = db.executeQuery('SHOW SLOW QUERIES'); return r.error ? [] : r.data; },
+
+        // ================= v1.15: ブラウザDBの必須機能 =================
+
+        // --- スキーマ版数とマイグレーション ---
+        // ブラウザDBは「利用者の端末に古いスキーマが残り続ける」のが常態なので、
+        // 起動時に版数を見て差分だけ適用する仕組みが要る。PRAGMA user_version を版数に使う。
+        //   LuminaDB.migrate([
+        //     { version: 1, up: 'CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)' },
+        //     { version: 2, up: api => api.exec('ALTER TABLE notes ADD COLUMN tag TEXT') }
+        //   ])
+        schemaVersion(v) {
+            if (v === undefined) {
+                const r = db.executeQuery('PRAGMA user_version');
+                return r.error ? 0 : r.data[0].user_version;
+            }
+            const n = Math.trunc(Number(v));
+            if (!(n >= 0)) throw new Error('schemaVersion() requires a non-negative integer.');
+            const r = db.executeQuery(`PRAGMA user_version = ${n}`);
+            if (r.error) throw new Error(r.error);
+            return n;
+        },
+
+        migrate(steps) {
+            if (!Array.isArray(steps) || steps.length === 0) return { error: 'migrate() requires a non-empty array of steps.' };
+            const sorted = steps.slice().sort((a, b) => a.version - b.version);
+            for (const s of sorted) {
+                if (!Number.isInteger(s.version) || s.version < 1) return { error: 'Each migration step needs an integer version >= 1.' };
+                if (typeof s.up !== 'string' && typeof s.up !== 'function') return { error: `Migration ${s.version}: 'up' must be a SQL string or a function.` };
+            }
+            const dup = sorted.map(s => s.version).find((v, i, a) => a.indexOf(v) !== i);
+            if (dup !== undefined) return { error: `Duplicate migration version ${dup}.` };
+            const from = this.schemaVersion();
+            const pending = sorted.filter(s => s.version > from);
+            if (pending.length === 0) return { applied: [], from, to: from };
+            // 途中で失敗しても元へ戻せるよう、開始前にスナップショットを取る
+            const guard = '__migrate_guard';
+            db.executeQuery(`DROP SNAPSHOT IF EXISTS ${guard}`);
+            const snap = db.executeQuery(`CREATE SNAPSHOT ${guard}`);
+            const applied = [];
+            try {
+                for (const s of pending) {
+                    const r = typeof s.up === 'string' ? db.executeScript(s.up) : s.up(this);
+                    if (r && r.error) throw new Error(r.error);
+                    if (r && typeof r.failed === 'number' && r.failed > 0) {
+                        const bad = (r.results || []).find(x => x.error);
+                        throw new Error(bad ? bad.error : `${r.failed} statement(s) failed.`);
+                    }
+                    this.schemaVersion(s.version);
+                    applied.push(s.version);
+                }
+            } catch (e) {
+                if (!snap.error) { db.executeQuery(`RESTORE SNAPSHOT ${guard}`); db.executeQuery(`DROP SNAPSHOT ${guard}`); }
+                if (typeof renderTree === 'function') renderTree();
+                return { error: `Migration to version ${pending[applied.length] ? pending[applied.length].version : '?'} failed and was rolled back: ${e.message}`, from, to: this.schemaVersion(), applied };
+            }
+            if (!snap.error) db.executeQuery(`DROP SNAPSHOT ${guard}`);
+            if (typeof renderTree === 'function') renderTree();
+            if (typeof triggerAutoSave === 'function') triggerAutoSave();
+            this._emit('change', { sql: 'MIGRATE', applied });
+            return { applied, from, to: this.schemaVersion() };
+        },
+
+        // --- バックアップ（完全な状態をファイル 1 個で往復させる） ---
+        backup() { return serializeBackup(db.exportForIDB()); },
+        download(filename) { return downloadBackup(filename); },
+        restoreBackup(text) {
+            let dump;
+            try { dump = parseBackup(text); } catch (e) { return { error: e.message }; }
+            if (db.inTransaction) return { error: 'Cannot restore a backup while a transaction is active.' };
+            db.importFromIDB(dump);
+            if (typeof renderTree === 'function') renderTree();
+            if (typeof triggerAutoSave === 'function') triggerAutoSave();
+            this._emit('change', { sql: 'RESTORE BACKUP' });
+            this._notifySubscribers();
+            return { data: [{ Result: 'Success', Message: `Backup restored (${Object.keys(db.tables).length} tables).` }] };
+        },
+
+        // --- 大きな結果のページ処理（ピークメモリを抑える） ---
+        // rows() は全件を一度に配列へ載せるので、数十万行だとメモリが跳ねる。
+        // eachBatch は LIMIT/OFFSET で切って渡すため、常に batch 件ぶんしか保持しない。
+        // 一貫した結果になるよう、SQL には安定した ORDER BY を付けること。
+        //   LuminaDB.eachBatch('SELECT * FROM big ORDER BY id', [], 1000, rows => render(rows))
+        eachBatch(sql, params, batch, cb) {
+            if (typeof params === 'function') { cb = params; batch = 1000; params = undefined; }
+            else if (typeof batch === 'function') { cb = batch; batch = 1000; }
+            if (typeof sql !== 'string' || sql.trim() === '') throw new Error('eachBatch() requires a non-empty SQL string.');
+            if (typeof cb !== 'function') throw new Error('eachBatch() requires a callback function.');
+            const size = Math.max(1, Math.trunc(Number(batch) || 1000));
+            if (!isReadOnlySql(sql)) throw new Error('eachBatch() only accepts read-only statements.');
+            if (/\blimit\b|\boffset\b/i.test(sql)) throw new Error('eachBatch() adds its own LIMIT/OFFSET; remove them from the query.');
+            let offset = 0, total = 0, batches = 0;
+            for (;;) {
+                const r = this.query(`${sql.trim().replace(/;\s*$/, '')} LIMIT ${size} OFFSET ${offset}`, params);
+                if (r.error) throw new Error(r.error);
+                const rows = r.data;
+                if (rows.length === 0) break;
+                total += rows.length;
+                if (cb(rows, batches++) === false) break;   // false を返すと打ち切り
+                if (rows.length < size) break;
+                offset += size;
+            }
+            return { rows: total, batches };
+        },
+
+        // 反復子として取り出す形（for...of で回せる）
+        *cursor(sql, params, batch) {
+            const size = Math.max(1, Math.trunc(Number(batch) || 1000));
+            if (!isReadOnlySql(sql)) throw new Error('cursor() only accepts read-only statements.');
+            if (/\blimit\b|\boffset\b/i.test(sql)) throw new Error('cursor() adds its own LIMIT/OFFSET; remove them from the query.');
+            let offset = 0;
+            for (;;) {
+                const r = this.query(`${String(sql).trim().replace(/;\s*$/, '')} LIMIT ${size} OFFSET ${offset}`, params);
+                if (r.error) throw new Error(r.error);
+                if (r.data.length === 0) return;
+                for (const row of r.data) yield row;
+                if (r.data.length < size) return;
+                offset += size;
+            }
+        },
+
+        // --- 永続化の状態 ---
+        // 直近の自動保存で「何テーブル書いて、何テーブル省いたか」。差分保存が効いているかの確認用
+        saveStats() { return (typeof getSaveStats === 'function') ? getSaveStats() : null; },
+        // 他タブの保存へ自動追従するか（既定は警告のみ）
+        autoReload(flag) {
+            if (typeof setAutoReload !== 'function') return false;
+            return flag === undefined ? setAutoReload(undefined) : setAutoReload(flag);
+        },
+
+        // --- CSV 取り込み（RFC 4180。File / fetch のテキストをそのまま渡せる） ---
+        //   LuminaDB.importCSV(text, 'sales', { create: true })
+        // opts: { create, header (既定 true), delimiter (既定 ','), replace, types }
+        importCSV(text, table, opts) {
+            if (typeof text !== 'string') return { error: 'importCSV() requires the CSV text as a string.' };
+            if (!_validIdent(table)) return { error: 'Invalid table name.' };
+            opts = opts || {};
+            const delim = String(opts.delimiter || ',');
+            if (delim.length !== 1) return { error: 'delimiter must be a single character.' };
+            const rowsRaw = parseCsv(text, delim);
+            if (rowsRaw.length === 0) return { error: 'CSV is empty.' };
+            const header = opts.header !== false;
+            let cols;
+            if (header) {
+                cols = rowsRaw[0].map(h => String(h).trim().toLowerCase().replace(/[^a-z0-9_]/g, '_'));
+                rowsRaw.shift();
+            } else {
+                cols = rowsRaw[0].map((_, i) => 'column' + (i + 1));
+            }
+            if (cols.length === 0 || !cols.every(_validIdent)) return { error: 'Cannot derive valid column names from the CSV header.' };
+            if (new Set(cols).size !== cols.length) return { error: 'Duplicate column names in the CSV header.' };
+            // 値の型は列ごとに推定する（全行が数値なら数値、真偽なら真偽、空欄は NULL）
+            const isNum = (v) => v !== '' && !isNaN(Number(v));
+            const isBool = (v) => /^(true|false)$/i.test(v);
+            const kinds = cols.map((_, i) => {
+                let num = true, bool = true, seen = false;
+                for (const r of rowsRaw) {
+                    const v = r[i];
+                    if (v === undefined || v === '') continue;
+                    seen = true;
+                    if (!isNum(v)) num = false;
+                    if (!isBool(v)) bool = false;
+                    if (!num && !bool) break;
+                }
+                return !seen ? 'TEXT' : (num ? 'FLOAT' : (bool ? 'BOOLEAN' : 'TEXT'));
+            });
+            const conv = (v, k) => {
+                if (v === undefined || v === '') return null;
+                if (k === 'FLOAT') return Number(v);
+                if (k === 'BOOLEAN') return /^true$/i.test(v);
+                return v;
+            };
+            const exists = !!db.tables[String(table).toLowerCase()];
+            if (!exists) {
+                if (!opts.create) return { error: `Table '${table}' not found. Pass { create: true } to create it from the CSV header.` };
+                const c = db.executeQuery(`CREATE TABLE ${table} (${cols.map((n, i) => `${n} ${kinds[i]}`).join(', ')})`);
+                if (c.error) return c;
+            } else if (opts.replace) {
+                const d = this.query(`DELETE FROM ${table}`);
+                if (d.error) return d;
+            }
+            const objs = rowsRaw.map(r => {
+                const o = {};
+                cols.forEach((n, i) => { o[n] = conv(r[i], kinds[i]); });
+                return o;
+            });
+            if (objs.length === 0) return { data: [], scannedRows: 0, rows: 0, columns: cols };
+            const r = this.insert(table, objs);
+            if (r.error) return r;
+            r.rows = objs.length;
+            r.columns = cols;
+            return r;
+        },
+
+        // 表または任意のクエリを CSV 文字列で返す（csv() の表版）
+        exportCSV(table) {
+            if (!_validIdent(table)) throw new Error('Invalid table name.');
+            return this.csv(`SELECT * FROM ${table}`);
+        },
+
+        // --- リーダー選出（Web Locks）---
+        // 複数タブが開いていても「定期集計・同期などの重い仕事は 1 タブだけ」にしたい。
+        // ロックを保持し続けるタブがリーダーで、閉じると次のタブが自動的に昇格する。
+        _leader: false,
+        isLeader() { return this._leader; },
+        onLeader(cb) {
+            if (typeof cb !== 'function') throw new Error('onLeader() requires a callback function.');
+            if (!(typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request)) {
+                // Web Locks が無い環境では単独タブとみなして即リーダーにする
+                this._leader = true;
+                try { cb(); } catch (e) { /* 呼び出し側の例外は無視 */ }
+                return { release() { return false; } };
+            }
+            const self2 = this;
+            let releaseFn = null;
+            const held = new Promise(res => { releaseFn = res; });
+            navigator.locks.request('luminadb-leader', () => {
+                self2._leader = true;
+                try { cb(); } catch (e) { /* 同上 */ }
+                return held;   // 解放されるまでロックを保持し続ける
+            }).then(() => { self2._leader = false; });
+            return { release() { if (releaseFn) { releaseFn(); releaseFn = null; return true; } return false; } };
+        },
+
+        // --- 式コンパイルキャッシュの状態（性能診断用） ---
+        cacheStats() {
+            const st = DatabaseEngine._exprCacheStats;
+            const total = st.hit + st.miss;
+            return { hits: st.hit, misses: st.miss, size: DatabaseEngine._exprCache.size,
+                     max: DatabaseEngine._exprCacheMax,
+                     hitRate: total ? Number((st.hit / total).toFixed(4)) : 0 };
+        },
+        clearCache() {
+            DatabaseEngine._exprCache.clear();
+            DatabaseEngine._exprCacheStats.hit = 0;
+            DatabaseEngine._exprCacheStats.miss = 0;
+            return true;
+        },
+
+        // --- ワーカー実行（UI スレッドを止めない） ---
+        // 重いクエリは別スレッドの複製 DB で実行する。使い方:
+        //   await LuminaDB.worker.start();
+        //   await LuminaDB.worker.sync();                    // 現在の DB を転送
+        //   const r = await LuminaDB.worker.query('SELECT ...');
+        //   await LuminaDB.worker.pull();                    // 書き込んだ場合は書き戻す
+        worker: {
+            _w: null, _seq: 0, _pending: null, url: 'js/worker/lumina-worker.js',
+            supported() { return typeof Worker !== 'undefined'; },
+            running() { return !!this._w; },
+            start(url) {
+                if (this._w) return Promise.resolve({ started: false, reason: 'already running' });
+                if (!this.supported()) return Promise.reject(new Error('Web Workers are not available in this environment.'));
+                const self2 = this;
+                return new Promise((resolve, reject) => {
+                    let w;
+                    try { w = new Worker(url || this.url); }
+                    catch (e) { reject(new Error(`Failed to start the worker (${e.message}). file:// では Worker を起動できません。ローカルサーバー経由で開いてください。`)); return; }
+                    self2._pending = new Map();
+                    w.onmessage = (e) => {
+                        const m = e.data || {};
+                        const p = self2._pending.get(m.id);
+                        if (!p) return;
+                        self2._pending.delete(m.id);
+                        if (m.ok) p.resolve(m.result); else p.reject(new Error(m.error));
+                    };
+                    w.onerror = (e) => {
+                        const err = new Error(`Worker error: ${e.message || 'failed to load'}`);
+                        self2._pending.forEach(p => p.reject(err));
+                        self2._pending.clear();
+                        if (self2._w === w) { try { w.terminate(); } catch (e2) {} self2._w = null; }
+                        reject(err);
+                    };
+                    self2._w = w;
+                    // 起動確認まで待ってから解決する（読み込み失敗をここで検出する）
+                    self2._call('ping', {}).then(r => resolve({ started: true, version: r.version })).catch(reject);
+                });
+            },
+            stop() {
+                if (!this._w) return false;
+                try { this._w.terminate(); } catch (e) { /* 既に停止 */ }
+                if (this._pending) { this._pending.forEach(p => p.reject(new Error('Worker stopped.'))); this._pending.clear(); }
+                this._w = null;
+                return true;
+            },
+            _call(op, msg) {
+                if (!this._w) return Promise.reject(new Error('Worker is not running. Call LuminaDB.worker.start() first.'));
+                const id = ++this._seq;
+                const self2 = this;
+                return new Promise((resolve, reject) => {
+                    self2._pending.set(id, { resolve, reject });
+                    self2._w.postMessage(Object.assign({ id, op }, msg));
+                });
+            },
+            // メインスレッドの現在の状態をワーカーへ複製する
+            sync() { return this._call('sync', { dump: db.exportForIDB() }); },
+            // ワーカー側の状態をメインスレッドへ書き戻す
+            pull() {
+                const self2 = this;
+                return this._call('dump', {}).then(dump => {
+                    if (db.inTransaction) throw new Error('Cannot pull into the main thread while a transaction is active.');
+                    db.importFromIDB(dump);
+                    if (typeof renderTree === 'function') renderTree();
+                    if (typeof triggerAutoSave === 'function') triggerAutoSave();
+                    LuminaDB._emit('change', { sql: 'WORKER PULL' });
+                    return { tables: Object.keys(db.tables).length };
+                });
+            },
+            query(sql, params) {
+                let bound;
+                try { bound = bindQueryParams(sql, params); } catch (e) { return Promise.reject(new Error(e.message)); }
+                return this._call('query', { sql: bound });
+            },
+            exec(script) { return this._call('exec', { sql: String(script) }); },
+            rows(sql, params) {
+                return this.query(sql, params).then(r => { if (r.error) throw new Error(r.error); return r.data; });
+            },
+            timeout(ms) { return this._call('timeout', { ms }); },
+            readOnly(v) { return this._call('readOnly', { value: !!v }); },
+            reset() { return this._call('reset', {}); },
+            tables() { return this._call('tables', {}); }
         }
     };
     window.LuminaDB = LuminaDB;

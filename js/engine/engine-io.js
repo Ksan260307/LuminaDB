@@ -5,12 +5,16 @@
 
       exportForIDB() {
         let dump = Object.create(null); // キーはテーブル名（SQL由来）のため null プロトタイプ
-        for(let tName in this.tables) {
+        // 列名も SQL 由来なので '__proto__' という列名を持つ表が存在し得る。
+        // for..in と素の {} を使うと (a) 汚染済み Object.prototype の余計なキーを拾い、
+        // (b) cols['__proto__'] = x がプロトタイプ差し替えになって列が消えるため、
+        // Object.keys と null プロトタイプ辞書で組み立てる
+        for(const tName of Object.keys(this.tables)) {
           const t = this.tables[tName];
           if (t.isTemp) continue; // TEMPORARY テーブルは永続化しない
           dump[tName] = {
             rowCount: t.rowCount, capacity: t.capacity,
-            strPools: t.strPools, strMaps: t.strMaps, cols: {},
+            strPools: t.strPools, strMaps: t.strMaps, cols: Object.create(null),
             colTypes: t.colTypes,
             foreignKeys: t.foreignKeys,
             primaryKey: t.primaryKey,
@@ -21,21 +25,28 @@
             checks: t.checks,
             compositeKeys: t.compositeKeys,
             generatedCols: t.generatedCols,
+            onUpdateNowCols: t.onUpdateNowCols || [],
+            // 差分保存用の指紋。前回保存時と同じなら中身は書き直さない
+            // （変更世代・行数・容量の3点。値の上書きは version、行の増減は rowCount が拾う）
+            fp: `${t.version || 0}:${t.rowCount}:${t.capacity}`,
             indexCols: Object.keys(t.indices)
           };
-          for(let c in t.cols) {
+          for(const c of Object.keys(t.cols)) {
             dump[tName].cols[c] = {
               num: t.cols[c].num.slice(0, t.rowCount),
               meta: t.cols[c].meta.slice(0, t.rowCount)
             };
           }
         }
-        dump.__views__ = Object.assign({}, this.views);
+        dump.__views__ = Object.assign(Object.create(null), this.views);
         dump.__procedures__ = JSON.parse(JSON.stringify(this.procedures));
         dump.__triggers__ = JSON.parse(JSON.stringify(this.triggers));
         dump.__sequences__ = JSON.parse(JSON.stringify(this.sequences));
-        dump.__comments__ = Object.assign({}, this.comments);
+        dump.__comments__ = Object.assign(Object.create(null), this.comments);
         dump.__matviews__ = JSON.parse(JSON.stringify(this.matViews));
+        dump.__functions__ = JSON.parse(JSON.stringify(this.functions));
+        dump.__procparams__ = JSON.parse(JSON.stringify(this.procParams || {}));
+        dump.__userversion__ = this.userVersion || 0;
         return dump;
       },
 
@@ -49,12 +60,16 @@
         this.sequences = Object.assign(Object.create(null), (dump && dump.__sequences__) ? JSON.parse(JSON.stringify(dump.__sequences__)) : {});
         this.comments = Object.assign(Object.create(null), (dump && dump.__comments__) || {});
         this.matViews = Object.assign(Object.create(null), (dump && dump.__matviews__) ? JSON.parse(JSON.stringify(dump.__matviews__)) : {});
-        for(let tName in dump) {
+        this.functions = Object.assign(Object.create(null), (dump && dump.__functions__) ? JSON.parse(JSON.stringify(dump.__functions__)) : {});
+        this.procParams = Object.assign(Object.create(null), (dump && dump.__procparams__) ? JSON.parse(JSON.stringify(dump.__procparams__)) : {});
+        this.userVersion = (dump && typeof dump.__userversion__ === 'number') ? dump.__userversion__ : 0;
+        // for..in ではなく Object.keys（汚染された Object.prototype のキーを拾わないため）
+        for(const tName of Object.keys(dump)) {
           if (tName.startsWith('__')) continue;
           const dt = dump[tName];
           const t = new Table(Math.max(dt.capacity, dt.rowCount));
           t.rowCount = dt.rowCount;
-          for(let c in dt.cols) {
+          for(const c of Object.keys(dt.cols || {})) {
             t.addColumn(c, dt.colTypes && dt.colTypes[c] ? dt.colTypes[c] : 'ANY');
             t.cols[c].num.set(dt.cols[c].num);
             t.cols[c].meta.set(dt.cols[c].meta);
@@ -62,7 +77,7 @@
           // strPools はコピーし、strMaps は保存データを信用せずプールから再構築する
           t.strPools = Object.create(null);
           t.strMaps = Object.create(null);
-          for (const c in dt.strPools) {
+          for (const c of Object.keys(dt.strPools || {})) {
             t.strPools[c] = [...dt.strPools[c]];
             const map = Object.create(null);
             t.strPools[c].forEach((s, i) => { map[s] = i; });
@@ -78,6 +93,7 @@
           t.checks = Array.isArray(dt.checks) ? dt.checks.map(c => ({ name: c.name || null, expr: c.expr })) : [];
           t.compositeKeys = Array.isArray(dt.compositeKeys) ? dt.compositeKeys.map(ck => ({ cols: [...ck.cols], isPK: !!ck.isPK })) : [];
           t.generatedCols = Object.assign(Object.create(null), dt.generatedCols || {});
+          t.onUpdateNowCols = Array.isArray(dt.onUpdateNowCols) ? [...dt.onUpdateNowCols] : [];
           t.rebuildIndices();
           // PK / UNIQUE の自動インデックスに加え、ユーザー作成インデックスも復元する
           [...(t.primaryKey ? [t.primaryKey] : []), ...t.uniqueCols, ...(dt.indexCols || [])].forEach(c => { if (t.cols[c]) t.createIndex(c); });
@@ -88,13 +104,39 @@
       // SQLテキストを ';' 区切りで文へ分割する（エンジン内蔵版）。
       // 文字列リテラル内の ';' は保護し、引用符二重化 ('') とバックスラッシュ
       // エスケープ (\') の両方を認識する。コメント (-- 行 / ブロック) 内も区切らない
+      // ルーチン定義 (CREATE PROCEDURE / TRIGGER / FUNCTION) の本体は ';' を含むので、
+      // BEGIN...END や IF...END IF のブロックが閉じるまで文を切らない。
+      // トランザクションの BEGIN と取り違えないよう、「今組み立て中の文がルーチン定義か」
+      // で判定する（素の BEGIN; INSERT; COMMIT; は従来どおり 3 文に割れる）
+      _isRoutineDef(text) {
+          return /^\s*create\s+(?:or\s+replace\s+)?(?:procedure|trigger|function)\b/i.test(text);
+      },
+
       splitStatements(text) {
           const statements = [];
           let currentStmt = '';
           let inString = false;
           let stringChar = '';
+          let blockDepth = 0;
+          const isWordChar = (ch) => /[a-zA-Z0-9_]/.test(ch);
           for (let i = 0; i < text.length; i++) {
               const char = text[i];
+              // ルーチン定義の中だけブロックの開閉を数える
+              if (!inString && isWordChar(char) && (i === 0 || !isWordChar(text[i - 1])) && this._isRoutineDef(currentStmt)) {
+                  let j = i;
+                  while (j < text.length && isWordChar(text[j])) j++;
+                  const w = text.slice(i, j).toUpperCase();
+                  if (w === 'END') {
+                      blockDepth--;
+                      const em = /^\s+(IF|WHILE|LOOP|REPEAT|CASE)\b/i.exec(text.slice(j));
+                      if (em) { currentStmt += text.slice(i, j + em[0].length); i = j + em[0].length - 1; continue; }
+                  } else if (['BEGIN', 'IF', 'WHILE', 'LOOP', 'REPEAT', 'CASE'].includes(w)) {
+                      blockDepth++;
+                  }
+                  currentStmt += text.slice(i, j);
+                  i = j - 1;
+                  continue;
+              }
               if (inString) {
                   if (char === '\\') {
                       currentStmt += char;
@@ -126,9 +168,13 @@
                       inString = true;
                       stringChar = char;
                       currentStmt += char;
-                  } else if (char === ';') {
+                  } else if (char === ';' && blockDepth <= 0) {
                       if (currentStmt.trim() !== '') statements.push(currentStmt.trim());
                       currentStmt = '';
+                      blockDepth = 0;
+                  } else if (char === ';') {
+                      // ルーチン本体の中の ';' は文の区切りではないのでそのまま取り込む
+                      currentStmt += char;
                   } else {
                       currentStmt += char;
                   }

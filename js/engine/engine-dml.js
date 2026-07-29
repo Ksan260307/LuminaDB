@@ -1084,6 +1084,16 @@
           const ret = this._extractReturning(sql);
           sql = ret.sql;
 
+          // INSERT INTO t DEFAULT VALUES (SQL標準 / PostgreSQL): 全列を DEFAULT で1行挿入する
+          const dvM = sql.match(/^(insert(?:\s+(?:or\s+)?ignore)?\s+into\s+([a-zA-Z0-9_]+))\s+default\s+values\s*$/i);
+          if (dvM) {
+              const tName = dvM[2].toLowerCase();
+              if (!this.tables[tName]) throw this._tableNotFound(tName);
+              const cols = this.tables[tName].getColumnNames();
+              if (cols.length === 0) throw new Error(`Table '${tName}' has no columns.`);
+              sql = `${dvM[1]} (${cols.join(', ')}) VALUES (${cols.map(() => 'DEFAULT').join(', ')})`;
+          }
+
           // 挿入モード: REPLACE INTO / INSERT (OR) IGNORE / ON DUPLICATE KEY UPDATE / ON CONFLICT
           const isReplaceStmt = /^replace\s+into\b/i.test(sql);
           let isIgnore = /^insert\s+(?:or\s+)?ignore\s+into\b/i.test(sql);
@@ -1222,6 +1232,145 @@
           return { data: resultSet, affectedRows };
       },
 
+      // ============ 複数表 UPDATE / DELETE ============
+      // UPDATE t SET ... FROM s WHERE ...        (PostgreSQL / SQL Server)
+      // UPDATE t JOIN s ON ... SET ... [WHERE]   (MySQL)
+      // DELETE FROM t USING s WHERE ...          (PostgreSQL)
+      // DELETE t FROM t JOIN s ON ... [WHERE]    (MySQL)
+      // を、既存の相関サブクエリ機構で実行できる単一表の形へ書き換える。
+      //   代入値  : (SELECT <式> FROM s WHERE <条件>)     … 相関スカラサブクエリ
+      //   対象絞込: EXISTS (SELECT 1 FROM s WHERE <条件>) … 相関 EXISTS
+      // 文字列は既に __STR_N__ へ退避済みなのでリテラル中のキーワードには反応しない。
+      // expandSubqueries より前（executeQuery のディスパッチ直前）に呼ぶこと。
+      // 括弧の外（トップレベル）に現れる最初のキーワード位置を返す。無ければ -1。
+      // サブクエリ内の FROM / WHERE を句の区切りと誤認しないために必要
+      _topLevelKeyword(sql, word, startAt) {
+          const w = word.toLowerCase(), len = w.length;
+          let depth = 0;
+          for (let i = 0; i < sql.length; i++) {
+              const c = sql[i];
+              if (c === '(') { depth++; continue; }
+              if (c === ')') { depth--; continue; }
+              if (depth !== 0 || i < (startAt || 0)) continue;
+              if (sql.substr(i, len).toLowerCase() !== w) continue;
+              if (i > 0 && /[a-zA-Z0-9_]/.test(sql[i - 1])) continue;
+              const after = sql[i + len];
+              if (after !== undefined && /[a-zA-Z0-9_]/.test(after)) continue;
+              return i;
+          }
+          return -1;
+      },
+
+      _rewriteMultiTableDml(sql) {
+          if (!/\b(using|join)\b/i.test(sql) && !/^update\b/i.test(sql)) return sql;
+          // 末尾の RETURNING / ORDER BY / LIMIT は書き換え対象外なので退避して後で戻す
+          let tail = '';
+          const grab = (re) => { const mm = sql.match(re); if (mm) { tail = mm[0] + tail; sql = sql.slice(0, mm.index); } };
+          grab(/\s+returning\s+[\s\S]+$/i);
+          grab(/\s+limit\s+\d+\s*$/i);
+          grab(/\s+order\s+by\s+[\s\S]+$/i);
+
+          const qual = (text, alias, table) => (alias === table) ? text
+              : text.replace(new RegExp('\\b' + alias + '\\s*\\.', 'gi'), table + '.');
+
+          const build = (tgt, tAlias, src, sAlias, cond, setStr) => {
+              if (tgt === src) throw new Error("Multi-table UPDATE/DELETE requires two different tables (self-join is not supported).");
+              const tTbl = this.tables[tgt], sTbl = this.tables[src];
+              if (!tTbl) throw this._tableNotFound(tgt);
+              if (!sTbl) throw this._tableNotFound(src);
+              // サブクエリ内では FROM が src なので、対象表の列を修飾なしで書かれると
+              // 解決できない。src に無い名前だけを <target>. で明示的に修飾する
+              const IDENT = /__STR_\d+__|\b[a-zA-Z_][a-zA-Z0-9_]*\s*\.\s*[a-zA-Z_][a-zA-Z0-9_]*|\b[a-zA-Z_][a-zA-Z0-9_]*\s*\(|\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+              const qualifyTarget = (text) => text.replace(IDENT, (mm, bare) => {
+                  if (!bare) return mm;
+                  const lc = bare.toLowerCase();
+                  return (tTbl.cols[lc] && !sTbl.cols[lc]) ? `${tgt}.${bare}` : mm;
+              });
+              let c = qualifyTarget(qual(qual(cond.trim(), tAlias, tgt), sAlias, src));
+              const exists = `EXISTS (SELECT 1 FROM ${src} WHERE ${c})`;
+              if (setStr === null) return `DELETE FROM ${tgt} WHERE ${exists}${tail}`;
+              const sets = this.splitSelectClause(setStr).map(part => {
+                  const eq = part.indexOf('=');
+                  if (eq === -1) throw new Error("Syntax Error in SET clause.");
+                  const col = qual(part.slice(0, eq).trim(), tAlias, tgt).replace(new RegExp('^' + tgt + '\\s*\\.', 'i'), '');
+                  const expr = qual(part.slice(eq + 1).trim(), sAlias, src);
+                  // ソース表を参照する代入だけを相関スカラサブクエリへ包む
+                  const usesSrc = new RegExp('\\b' + src + '\\s*\\.', 'i').test(expr);
+                  return `${col} = ${usesSrc ? `(SELECT ${qualifyTarget(expr)} FROM ${src} WHERE ${c})` : expr}`;
+              });
+              return `UPDATE ${tgt} SET ${sets.join(', ')} WHERE ${exists}${tail}`;
+          };
+
+          // 「テーブル名 [AS] 別名」を切り出す（余分な語が残る場合は対象外＝書き換えない）
+          const nameAlias = (text) => {
+              const mm = text.trim().match(/^([a-zA-Z0-9_]+)(?:\s+(?:as\s+)?([a-zA-Z0-9_]+))?$/i);
+              return mm ? { table: mm[1].toLowerCase(), alias: (mm[2] || mm[1]).toLowerCase() } : null;
+          };
+          const TL = (w, from) => this._topLevelKeyword(sql, w, from);
+
+          if (/^update\b/i.test(sql)) {
+              const setIdx = TL('set', 0);
+              if (setIdx === -1) return sql + tail;
+              const joinIdx = TL('join', 0);
+              // UPDATE t [a] [INNER|LEFT|...] JOIN s [b] ON <cond> SET <sets> [WHERE <w>]
+              if (joinIdx !== -1 && joinIdx < setIdx) {
+                  const onIdx = TL('on', joinIdx + 4);
+                  if (onIdx === -1 || onIdx > setIdx) return sql + tail;
+                  const head = sql.slice(6, joinIdx).replace(/\s+(inner|left|right|cross)\s*$/i, '');
+                  const tgt = nameAlias(head);
+                  const src = nameAlias(sql.slice(joinIdx + 4, onIdx));
+                  if (!tgt || !src) return sql + tail;
+                  const whereIdx = TL('where', setIdx + 3);
+                  const sets = sql.slice(setIdx + 3, whereIdx === -1 ? sql.length : whereIdx);
+                  const on = sql.slice(onIdx + 2, setIdx);
+                  const cond = whereIdx === -1 ? on : `(${on}) AND (${sql.slice(whereIdx + 5)})`;
+                  return build(tgt.table, tgt.alias, src.table, src.alias, cond, sets);
+              }
+              // UPDATE t [a] SET <sets> FROM s [b] WHERE <cond>
+              const fromIdx = TL('from', setIdx + 3);
+              if (fromIdx === -1) return sql + tail;
+              const whereIdx = TL('where', fromIdx + 4);
+              if (whereIdx === -1) throw new Error("UPDATE ... FROM requires a WHERE clause that joins the two tables.");
+              const tgt = nameAlias(sql.slice(6, setIdx));
+              const src = nameAlias(sql.slice(fromIdx + 4, whereIdx));
+              if (!tgt || !src) return sql + tail;
+              return build(tgt.table, tgt.alias, src.table, src.alias, sql.slice(whereIdx + 5), sql.slice(setIdx + 3, fromIdx));
+          }
+
+          // DELETE FROM t [a] USING s [b] WHERE <cond>
+          const usingIdx = TL('using', 0);
+          if (usingIdx !== -1) {
+              const fromIdx = TL('from', 0);
+              if (fromIdx === -1 || fromIdx > usingIdx) return sql + tail;
+              const whereIdx = TL('where', usingIdx + 5);
+              if (whereIdx === -1) throw new Error("DELETE ... USING requires a WHERE clause that joins the two tables.");
+              const tgt = nameAlias(sql.slice(fromIdx + 4, usingIdx));
+              const src = nameAlias(sql.slice(usingIdx + 5, whereIdx));
+              if (!tgt || !src) return sql + tail;
+              return build(tgt.table, tgt.alias, src.table, src.alias, sql.slice(whereIdx + 5), null);
+          }
+          // DELETE t FROM t [a] JOIN s [b] ON <cond> [WHERE <w>]
+          const jIdx = TL('join', 0);
+          if (jIdx !== -1) {
+              const fromIdx = TL('from', 0);
+              const onIdx = TL('on', jIdx + 4);
+              if (fromIdx === -1 || fromIdx > jIdx || onIdx === -1) return sql + tail;
+              const lead = sql.slice(6, fromIdx).trim();
+              const head = sql.slice(fromIdx + 4, jIdx).replace(/\s+(inner|left|right|cross)\s*$/i, '');
+              const tgt = nameAlias(head);
+              const src = nameAlias(sql.slice(jIdx + 4, onIdx));
+              if (!tgt || !src) return sql + tail;
+              if (lead !== '' && lead.toLowerCase() !== tgt.table && lead.toLowerCase() !== tgt.alias) {
+                  throw new Error(`Multi-table DELETE can only delete from the first table ('${tgt.table}').`);
+              }
+              const whereIdx = TL('where', onIdx + 2);
+              const on = sql.slice(onIdx + 2, whereIdx === -1 ? sql.length : whereIdx);
+              const cond = whereIdx === -1 ? on : `(${on}) AND (${sql.slice(whereIdx + 5)})`;
+              return build(tgt.table, tgt.alias, src.table, src.alias, cond, null);
+          }
+          return sql + tail;
+      },
+
       _executeUpdate(sql, strMap) {
           let resultSet = [];
           let affectedRows = 0;
@@ -1350,6 +1499,13 @@
                      tData.setValue(c, idx, changes[c]);
                  });
              });
+
+             // Phase 2a: ON UPDATE CURRENT_TIMESTAMP の列を現在時刻へ（明示代入があればそちらを優先）
+             const touchCols = (tData.onUpdateNowCols || []).filter(c => tData.cols[c] && !setEvaluators.some(ev => ev.col === c));
+             if (touchCols.length > 0 && pending.length > 0) {
+                 const now = this._nowString();
+                 pending.forEach(({ idx }) => touchCols.forEach(c => tData.setValue(c, idx, now)));
+             }
 
              // Phase 2b: 生成列を再評価する（依存元の列が更新された後）
              const updGenFns = this._compileGeneratedCols(tData, null);

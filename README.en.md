@@ -4,7 +4,7 @@
 
 A build-free, in-memory SQL database engine that runs entirely in the browser. Open a single HTML file and you get a full SQL engine (DQL / DML / DDL), transactions, window functions, triggers, views, commercial-DB commands such as `MERGE` / `TOP` / `ON CONFLICT`, and 270+ built-in functions — with no server.
 
-> Version: **v1.13.0** / Self-contained tests: **5,082** (all passing)
+> Version: **v1.17.0** / Self-contained tests: **7,091** (all passing — including 780+ security and 490+ performance tests)
 
 ---
 
@@ -48,21 +48,36 @@ ORDER BY o.amount DESC;
 
 | Category | Supported |
 |----------|-----------|
-| **DQL** | `SELECT` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` (ordinal, expression, `NULLS FIRST/LAST`) / `LIMIT`, `OFFSET`, `FETCH FIRST` / `TOP n [PERCENT]` (SQL Server) / `DISTINCT` |
+| **DQL** | `SELECT` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` (ordinal, expression, `NULLS FIRST/LAST`) / `LIMIT`, `OFFSET`, `FETCH FIRST` (**`WITH TIES`**) / `TOP n [PERCENT]` (SQL Server) / `DISTINCT` / **`DISTINCT ON (...)`** (PostgreSQL) / **`SELECT * EXCLUDE (...)`, `* REPLACE (expr AS col)`** |
 | **Joins** | `INNER` / `LEFT` / `RIGHT` / **`FULL OUTER`** / `CROSS` / comma join / `USING` / `NATURAL` / **`CROSS APPLY`, `OUTER APPLY`, `LATERAL`** |
-| **Set ops** | `UNION` / `INTERSECT` / `EXCEPT` (with `ALL`) |
-| **Subqueries** | scalar / `IN` / `EXISTS` / correlated / **quantified comparison `= ANY`, `> ALL`, `SOME`** |
+| **Set ops** | `UNION` / `INTERSECT` / `EXCEPT` / **`MINUS`** (Oracle) — all with `ALL` |
+| **Subqueries** | scalar / `IN` / `EXISTS` / correlated / **quantified comparison `= ANY`, `> ALL`, `SOME`** / **derived-table column lists (`(SELECT ...) AS t(a, b)`)** / **`FROM (VALUES ...) AS t(a, b)`** |
 | **CTEs** | `WITH` / `WITH RECURSIVE` (with column lists) |
-| **Window functions** | `ROW_NUMBER` / `RANK` / `LAG` / `LEAD` / frame specs (**`ROWS` / `RANGE` / `GROUPS`**) / named windows (`WINDOW` clause) / `QUALIFY` (**inline window functions supported**) |
-| **Aggregates** | many aggregate functions / **aggregates nested in expressions (`ROUND(AVG(x), 2)`, `100.0 * SUM(a) / SUM(b)`)** / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / **`CUBE`, `GROUPING SETS`** / `GROUPING()` / **`WITHIN GROUP (ORDER BY ...)`** / `GROUP_CONCAT` |
-| **DML** | `INSERT` (multi-row, `SELECT`, `SET`, `DEFAULT`) / `UPDATE` / `DELETE` (`ORDER BY`, `LIMIT`) / `REPLACE` / `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO NOTHING`, `DO UPDATE` (PostgreSQL, `EXCLUDED`) / `MERGE INTO ... USING ... WHEN MATCHED/NOT MATCHED` (Oracle/SQL Server) / `RETURNING` |
-| **DDL** | `CREATE / ALTER / DROP TABLE` / `VIEW` / **`MATERIALIZED VIEW` (with `REFRESH`)** / `INDEX` / `TRIGGER` / `PROCEDURE` / `SEQUENCE` / `CREATE TABLE AS` & `LIKE` / **`SELECT ... INTO`** / **`COMMENT ON`** / `TEMPORARY` |
-| **Constraints** | `PRIMARY KEY` (composite) / `UNIQUE` / `NOT NULL` / `DEFAULT` (incl. `CURRENT_TIMESTAMP`) / `CHECK` / `FOREIGN KEY` (`ON DELETE/UPDATE` actions) / `AUTO_INCREMENT` / **identity columns (`GENERATED ALWAYS AS IDENTITY`, `IDENTITY(1,1)`)** / generated columns (`GENERATED ALWAYS AS`) |
+| **Window functions** | `ROW_NUMBER` / `RANK` / `LAG` / `LEAD` / frame specs (**`ROWS` / `RANGE` / `GROUPS`**, **`EXCLUDE CURRENT ROW\|GROUP\|TIES\|NO OTHERS`**) / named windows (`WINDOW` clause) / `QUALIFY` / **`IGNORE NULLS`, `RESPECT NULLS`** / **`FILTER (WHERE ...) OVER (...)`** |
+| **Aggregates** | many aggregate functions / **aggregates nested in expressions (`ROUND(AVG(x), 2)`, `100.0 * SUM(a) / SUM(b)`)** / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / **`CUBE`, `GROUPING SETS`** / **`GROUP BY ALL`** / `GROUPING()` / **`WITHIN GROUP (ORDER BY ...)`** / `GROUP_CONCAT` |
+| **DML** | `INSERT` (multi-row, `SELECT`, `SET`, `DEFAULT`, **`DEFAULT VALUES`**) / `UPDATE` / `DELETE` (`ORDER BY`, `LIMIT`) / `REPLACE` / `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO NOTHING`, `DO UPDATE` (PostgreSQL, `EXCLUDED`) / `MERGE INTO ... USING ... WHEN MATCHED/NOT MATCHED` (Oracle/SQL Server) / **multi-table `UPDATE ... FROM`, `UPDATE ... JOIN`, `DELETE ... USING`, `DELETE t FROM t JOIN s`** / `RETURNING` |
+| **DDL** | `CREATE / ALTER / DROP TABLE` (**`CASCADE`, `RESTRICT`**) / `VIEW` / **`MATERIALIZED VIEW` (with `REFRESH`)** / `INDEX` (**multi-column, `UNIQUE`, `DROP INDEX` by name**) / `TRIGGER` / `PROCEDURE` / `SEQUENCE` / **`FUNCTION` (user-defined scalar functions)** / `CREATE TABLE AS` & `LIKE` / **`SELECT ... INTO`** / **`COMMENT ON`** / `TEMPORARY` |
+| **Constraints** | `PRIMARY KEY` (composite) / `UNIQUE` / `NOT NULL` / `DEFAULT` (incl. `CURRENT_TIMESTAMP`) / **`ON UPDATE CURRENT_TIMESTAMP`** / `CHECK` / `FOREIGN KEY` (`ON DELETE/UPDATE` actions) / `AUTO_INCREMENT` / **identity columns (`GENERATED ALWAYS AS IDENTITY`, `IDENTITY(1,1)`)** / generated columns (`GENERATED ALWAYS AS`) |
 | **Transactions** | `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` |
 | **Row reshaping** | **`PIVOT` / `UNPIVOT`** (`UNPIVOT` skips NULL rows) |
-| **Null-safe comparison** | **`IS [NOT] DISTINCT FROM`** / **`<=>`** |
-| **Session statements** | **`SET TRANSACTION ISOLATION LEVEL`** / **`LOCK`, `UNLOCK TABLES`** / **`GRANT`, `REVOKE`** / **`DISCARD`** (accepted for script compatibility) |
-| **Other** | prepared statements (`PREPARE`/`EXECUTE`/`DEALLOCATE`) / user variables (`SET @x`) / `EXPLAIN` & `EXPLAIN ANALYZE` / `VALUES` statement / `TABLE` statement / `SHOW *` (incl. **`STORAGE`, `SETTINGS`, `COMMENTS`, `MATERIALIZED VIEWS`**), `DESCRIBE`, `CHECK TABLE`, `ANALYZE TABLE` |
+| **Null-safe comparison** | **`IS [NOT] DISTINCT FROM`** / **`<=>`** / **`IS [NOT] UNKNOWN`** |
+| **Operators & predicates** | **`\|\|` (string concatenation)** / **`::` (cast)** / **`ILIKE`** / **`SIMILAR TO`** / **row constructors** / **`COLLATE` (`NOCASE`, `BINARY`, `NOACCENT`, `NUMERIC`)** / **`LIKE ANY`, `LIKE ALL`** / **date ± `INTERVAL`** |
+| **Full-text search** | **`MATCH (col, ...) AGAINST ('terms' [IN BOOLEAN\|NATURAL LANGUAGE MODE])`** — `+`required / `-`excluded / `"phrase"` / `term*` prefix, usable as a relevance score |
+| **Table functions** | `GENERATE_SERIES` (**numeric ranges and timestamp ranges with an `INTERVAL` step**) / `STRING_SPLIT(str, sep)` / `UNNEST(a, b, ...)` / **`JSON_TABLE` (JSON → rows)** / **`WITH ORDINALITY`** |
+| **Arrays** | **`ARRAY[...]` constructor** / **`ARRAY_LENGTH`, `ARRAY_POSITION`, `ARRAY_CONTAINS`, `ARRAY_APPEND`, `ARRAY_PREPEND`, `ARRAY_REMOVE`, `ARRAY_SORT`, `ARRAY_TO_STRING`, `STRING_TO_ARRAY`** / **`= ANY(ARRAY[...])`** |
+| **Sampling** | **`TABLESAMPLE [BERNOULLI\|SYSTEM] (n PERCENT\|n ROWS) [REPEATABLE (seed)]`** |
+| **Ranges & time series** | **`(s1, e1) OVERLAPS (s2, e2)`** / **`BETWEEN SYMMETRIC`** / **`DATE_BIN`, `TIME_BUCKET`** / **`AGE(a, b)`** / **`EXTRACT(EPOCH\|DOW\|DOY FROM ...)`** / **`AT TIME ZONE`** |
+| **Statistical aggregates** | **`REGR_SLOPE`, `REGR_INTERCEPT`, `REGR_R2`, `REGR_COUNT`, `REGR_AVGX`, `REGR_AVGY`, `REGR_SXX`, `REGR_SYY`, `REGR_SXY`** / **`MODE() WITHIN GROUP (ORDER BY x)`** |
+| **Fuzzy matching** | **`LEVENSHTEIN` (`EDIT_DISTANCE`)** / **`SIMILARITY` (0–1)** / **`DIFFERENCE` (SOUNDEX closeness)** / **`REGEXP_MATCHES`, `REGEXP_SPLIT_TO_ARRAY`** |
+| **JSON predicates** | **`<expr> IS [NOT] JSON [VALUE\|OBJECT\|ARRAY\|SCALAR]`** / **`JSON_EXISTS`** / **`JSON_QUERY`** |
+| **Procedural** | **`DECLARE` / `SET` / `IF`, `ELSEIF`, `ELSE` / `WHILE`, `DO` / `LOOP`, `LEAVE`, `ITERATE` / `REPEAT`, `UNTIL` / `CASE` statement / `RETURN`** inside `CREATE PROCEDURE`, with arguments (`CALL p(1, 2)`) |
+| **Cursors** | **`DECLARE <name> CURSOR FOR` / `OPEN` / `FETCH ... INTO` / `CLOSE`** (multi-column `FETCH`) |
+| **Error handling** | **`DECLARE {CONTINUE\|EXIT} HANDLER FOR {NOT FOUND\|SQLEXCEPTION\|SQLSTATE 'xxxxx'}`** / **`SIGNAL`, `RESIGNAL`** with `SET MESSAGE_TEXT` |
+| **Catalog** | **`INFORMATION_SCHEMA.TABLES / COLUMNS / VIEWS / TABLE_CONSTRAINTS / KEY_COLUMN_USAGE / ROUTINES / SEQUENCES / SCHEMATA`** / **`PRAGMA table_info`, `table_list`, `index_list`, `foreign_key_list`, `user_version`** / **`sqlite_master`** |
+| **Compatibility syntax** | **schema-qualified `main.t` / `public.t`** / **`CREATE`, `DROP SCHEMA`** / **partial indexes** / **`SELECT ... FOR UPDATE\|SHARE [NOWAIT\|SKIP LOCKED]`** / **`WITH ... AS [NOT] MATERIALIZED`** / **`EXPLAIN QUERY PLAN`** / **`REINDEX`, `CHECKPOINT`, `FLUSH`, `CLUSTER`** (accepted) / **`SHOW CREATE FUNCTION`** |
+| **Session statements** | **`SET TRANSACTION ISOLATION LEVEL`** / **`LOCK`, `UNLOCK TABLES`** / **`GRANT`, `REVOKE`** / **`DISCARD`** (accepted for script compatibility) / **`SET statement_timeout`, `read_only`, `seed`, `slow_query_threshold`** / **system variables `@@version`, `@@identity`** |
+| **Snapshots** | **`CREATE / RESTORE / DROP SNAPSHOT`**, **`SHOW SNAPSHOTS`** (in-memory time travel) |
+| **Other** | prepared statements (`PREPARE`/`EXECUTE`/`DEALLOCATE`) / user variables (`SET @x`, **`DECLARE @x`**) / `EXPLAIN` (**`(FORMAT JSON)`**) & `EXPLAIN ANALYZE` / `VALUES` statement / `TABLE` statement / `SHOW *` (incl. **`STORAGE`, `SETTINGS`, `COMMENTS`, `MATERIALIZED VIEWS`, `SNAPSHOTS`, `PROFILE`, `SLOW QUERIES`**), `DESCRIBE`, `CHECK TABLE`, `ANALYZE TABLE` |
 
 ### Built-in functions (270+)
 
@@ -166,6 +181,116 @@ LuminaDB handles failure modes a server database never sees: storage quotas, bro
 - **Usage visibility** — `SHOW STORAGE` (the database's own estimated size) and `LuminaDB.storage()` (browser usage, quota, persistence state).
 - **Persistent storage** — `LuminaDB.persist()` asks the browser for storage that is not evicted under disk pressure.
 
+### Added in v1.14
+
+In a browser, a query blocks the UI thread and the database shares the page's privilege space. These five features address exactly that.
+
+| Feature | Why it matters | SQL | JS API |
+|---------|----------------|-----|--------|
+| **Statement timeout** | A runaway query can no longer freeze the page | `SET statement_timeout = 500` | `LuminaDB.timeout(500)` |
+| **Read-only mode** | Expose the database safely to an iframe or third-party script | `SET read_only = ON` | `LuminaDB.readOnly(true, { lock: true })` |
+| **Snapshots** | In-memory time travel — get back to a known good state | `CREATE / RESTORE / DROP SNAPSHOT s` | `LuminaDB.snapshot('s')` / `restore('s')` |
+| **Live queries** | Keep the UI in sync with writes | — | `LuminaDB.subscribe(sql, rows => ...)` |
+| **Profile & slow-query log** | See which queries actually cost you | `SHOW PROFILE` / `SHOW SLOW QUERIES` | `LuminaDB.profile()` / `slowQueries()` |
+
+### Added in v1.15 — the three things a browser database really needs
+
+| Feature | Problem it solves | API |
+|---------|-------------------|-----|
+| **Worker execution** | Queries own the UI thread; a heavy aggregate freezes the page | `LuminaDB.worker.*` — runs on a replica in a separate thread, optionally written back |
+| **Schema migrations** | Old schemas live forever on users' devices | `LuminaDB.migrate([...])` + `PRAGMA user_version` |
+| **Backup import/export** | IndexedDB disappears with the browser profile | `LuminaDB.download()` / `backup()` / `restoreBackup()` |
+
+```js
+// 1. Run the heavy query off the UI thread — the page stays responsive
+await LuminaDB.worker.start();
+await LuminaDB.worker.sync();                        // copy the current DB into the worker
+const r = await LuminaDB.worker.query('SELECT g, COUNT(*) FROM big GROUP BY g');
+await LuminaDB.worker.pull();                        // write worker-side changes back
+LuminaDB.worker.stop();
+
+// 2. Apply only what is missing; a failure rolls the whole run back via a snapshot
+LuminaDB.migrate([
+  { version: 1, up: 'CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)' },
+  { version: 2, up: 'ALTER TABLE notes ADD COLUMN tag TEXT' },
+  { version: 3, up: api => api.exec("INSERT INTO notes (id, body) VALUES (1, 'hello')") }
+]);
+// → { applied: [1, 2, 3], from: 0, to: 3 }
+
+// 3. Round-trip the complete state (schema, data, views, functions, version) as one file
+LuminaDB.download('mydb.json');
+LuminaDB.restoreBackup(await file.text());
+```
+
+Saves are now serialized with the **Web Locks API**; optimistic locking alone still left a
+window between reading the version and writing it back.
+
+### Added in v1.16 — three more browser-database essentials
+
+| Feature | Problem it solves | API |
+|---------|-------------------|-----|
+| **Incremental persistence** | Changing one row re-serialized and re-encrypted the entire database | Automatic, per table (`LuminaDB.saveStats()` shows the breakdown) |
+| **Batched reads** | `rows()` materializes everything, which breaks on large tables | `LuminaDB.eachBatch()` / `LuminaDB.cursor()` |
+| **Cross-tab follow & unload guard** | You never notice another tab's writes; you close with unsaved work | `LuminaDB.autoReload(true)` plus an automatic `beforeunload` guard |
+
+Each table carries a `version:rowCount:capacity` fingerprint, and tables whose fingerprint is
+unchanged are not rewritten. Measured on a 60,000-row database: a full first save takes 25 ms,
+while a save after touching one small table takes **2 ms** (a no-op save is 1 ms, 0 tables written).
+
+### Added in v1.17
+
+| Feature | Problem it solves | API |
+|---------|-------------------|-----|
+| **Expression compile cache** | Hundreds of small queries make compilation, not execution, the bottleneck | Automatic (`LuminaDB.cacheStats()`) |
+| **CSV import / export** | No JS API path from a `File` or a fetched string into a table | `LuminaDB.importCSV()` / `exportCSV()` |
+| **Leader-tab election** | Every open tab runs the same periodic job | `LuminaDB.onLeader(cb)` / `isLeader()` |
+
+The cache is an LRU keyed by expression text (500 entries by default). Expressions that fold
+run-time state into the generated code — user variables, `LAST_INSERT_ID()`, sequences, user-defined
+functions — are never cached. Repeating the same query measures about **2× faster**.
+
+```js
+// RFC 4180 CSV: quoted commas, embedded newlines and doubled quotes; blanks become NULL,
+// column types are inferred per column
+LuminaDB.importCSV(await file.text(), 'sales', { create: true });
+const csv = LuminaDB.exportCSV('sales');
+
+// Only the leader tab runs the background job; another tab takes over when it closes
+const handle = LuminaDB.onLeader(() => startBackgroundSync());
+handle.release();
+
+LuminaDB.cacheStats();  // { hits: 204, misses: 1, size: 1, max: 500, hitRate: 0.995 }
+```
+
+```js
+LuminaDB.saveStats();   // { tables: 5, written: 1, skipped: 4, removed: 0, full: false }
+
+// Process a large result a page at a time — peak memory stays at one batch
+LuminaDB.eachBatch('SELECT * FROM big ORDER BY id', [], 1000, rows => render(rows));
+for (const row of LuminaDB.cursor('SELECT * FROM big ORDER BY id')) { /* ... */ }
+
+// Follow other tabs automatically (only when this tab has no unsaved changes)
+LuminaDB.autoReload(true);
+```
+
+```js
+// Live query: fires only when the result actually changes (unrelated writes do not trigger it)
+const sub = LuminaDB.subscribe('SELECT COUNT(*) AS c FROM users', rows => render(rows[0].c));
+sub.unsubscribe();
+
+// Publish read-only. With lock: true, SQL's SET read_only = OFF cannot re-enable writes.
+LuminaDB.readOnly(true, { lock: true });
+
+// Snapshot before a risky operation, roll back if it fails
+LuminaDB.snapshot('before_import');
+try { LuminaDB.importJSON('users', rows); } catch (e) { LuminaDB.restore('before_import'); }
+
+// JSON I/O and a deterministic RAND() seed (reproducible test data)
+LuminaDB.importJSON('metrics', [{ id: 1, v: 10 }], { create: true });
+const dump = LuminaDB.exportJSON(['metrics']);
+LuminaDB.query("SET seed = 0.42");
+```
+
 ```js
 await LuminaDB.storage();
 // { supported: true, usage: 12345678, quota: 9876543210, usagePercent: 0.12,
@@ -198,7 +323,8 @@ js/
 │   ├── engine-transaction.js Transactions / savepoints
 │   ├── engine-io.js         SQL dump import/export / IndexedDB serialization
 │   └── table.js             Columnar table (TypedArray storage)
-├── storage/idb.js       IndexedDB persistence (AES-GCM encryption, optimistic lock)
+├── storage/idb.js       IndexedDB persistence (AES-GCM, Web Locks, backup import/export)
+├── worker/              Worker-thread engine (keeps the UI thread free)
 ├── ui/                  UI (state / editor / results / table-tree / schema-editor /
 │                        help / modals / data-io / query-runner / console)
 ├── api/api.js           External API (window.LuminaDB / fetch / postMessage)
@@ -209,7 +335,21 @@ js/
 
 ## Testing
 
-The 2,000+ self-contained tests can be run two ways.
+The 7,000+ self-contained tests can be run two ways. The main suites are:
+
+| Suite | Tests | Focus |
+|-------|-------|-------|
+| `test-suite*.js` (v1–v16) | ~5,300 | SQL syntax, functions, UI, persistence |
+| `test-suite-v17.js` | 247 | Regression coverage for the v1.14 syntax and operational features |
+| `test-suite-v18.js` | 679 | **Security** (injection, identifier validation, JS escape, prototype pollution, DoS guards, read-only enforcement, API boundaries, output escaping) |
+| `test-suite-v19.js` | 433 | **Performance** (calibrated time budgets, complexity scaling, absolute safety net) |
+| `test-suite-v20.js` | 275 | v1.15 syntax and the browser-DB essentials, including security checks and time budgets for the new entry points (procedure locals, `JSON_TABLE` paths, `MATCH` terms, backup import, worker messages) |
+| `test-suite-v21.js` | 185 | v1.16 procedural SQL (cursors, handlers, `SIGNAL`, `CASE` statement), range/JSON/time-series predicates, incremental persistence and streaming reads — including security checks on cursor values and `SIGNAL` message text |
+| `test-suite-v22.js` | 180 | v1.17 arrays, regression aggregates, fuzzy matching, time-series generation, window extras, the compile cache, CSV import and leader election — including security checks on CSV fields/headers and array elements |
+
+The security suite takes 28 attacker-controlled payloads and pushes each through 10 entry points (`?` binding, named binding, `insert`, `update`, `select`, `remove`, `prepare`, SQL prepared statements, `WHERE`, `LIKE`), asserting every time that the payload **(a) is never evaluated as JS, (b) never changes the SQL structure, and (c) round-trips unchanged as data**.
+
+The performance suite first calibrates against a measured 20,000-row scan and expresses every budget as a multiple of it. That avoids false positives on slow machines while still catching `O(n) → O(n^2)` regressions. Absolute ceilings (e.g. a 20,000-row scan under 300 ms) are pinned as well, so a uniform slowdown cannot hide inside the calibration.
 
 ### 1. Real-browser headless test (recommended, high fidelity)
 

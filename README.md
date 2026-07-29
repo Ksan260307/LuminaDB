@@ -4,7 +4,7 @@
 
 ブラウザだけで完結する、ビルド不要の in-memory SQL データベースエンジンです。単一の HTML ファイルを開くだけで、本格的な SQL（DQL / DML / DDL）・トランザクション・ウィンドウ関数・トリガー・ビュー・`MERGE` / `TOP` / `ON CONFLICT` などの商用 DB コマンド・270 以上の組み込み関数を、サーバーなしで実行できます。
 
-> バージョン: **v1.13.0** / 自己完結テスト **5,082 件**（全パス）
+> バージョン: **v1.17.0** / 自己完結テスト **7,091 件**（全パス。うちセキュリティ 780 件超 / パフォーマンス 490 件超）
 
 ---
 
@@ -17,6 +17,7 @@
 - **永続化** — IndexedDB へ **AES-GCM 暗号化**で保存。タブ間の上書きを防ぐ楽観ロック付き。
 - **外部 API** — `window.LuminaDB`（JS API）、`fetch('lumina://...')`、`postMessage` の 3 経路でアプリから利用可能。
 - **充実した UI** — シンタックスハイライト付きエディタ、Table Editor、検索付きコマンドリファレンス、実行ログコンソールなど。
+- **ブラウザDBの運用機能** — **式コンパイルキャッシュ**、**差分永続化（変更のあった表だけ書く）**、**ワーカー実行（UI を止めない）**、**スキーマ・マイグレーション**、**バックアップ / CSV のファイル入出力**、**バッチ読み出し**、**タブのリーダー選出**、文単位タイムアウト、読み取り専用モード、メモリ内スナップショット（タイムトラベル）、ライブクエリ購読、プロファイル / 遅いクエリログ。
 
 ---
 
@@ -48,21 +49,36 @@ ORDER BY o.amount DESC;
 
 | 分類 | 対応内容 |
 |------|----------|
-| **DQL** | `SELECT` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY`（序数・式・`NULLS FIRST/LAST`）/ `LIMIT`・`OFFSET`・`FETCH FIRST` / `TOP n [PERCENT]`（SQL Server）/ `DISTINCT` |
+| **DQL** | `SELECT` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY`（序数・式・`NULLS FIRST/LAST`）/ `LIMIT`・`OFFSET`・`FETCH FIRST`（**`WITH TIES`** 対応）/ `TOP n [PERCENT]`（SQL Server）/ `DISTINCT` / **`DISTINCT ON (...)`**（PostgreSQL）/ **`SELECT * EXCLUDE (...)`・`* REPLACE (expr AS col)`** |
 | **結合** | `INNER` / `LEFT` / `RIGHT` / **`FULL OUTER`** / `CROSS` / カンマ結合 / `USING` / `NATURAL` / **`CROSS APPLY`・`OUTER APPLY`・`LATERAL`** |
-| **集合演算** | `UNION` / `INTERSECT` / `EXCEPT`（`ALL` 対応） |
-| **サブクエリ** | スカラー / `IN` / `EXISTS` / 相関サブクエリ / **量化比較 `= ANY`・`> ALL`・`SOME`** |
+| **集合演算** | `UNION` / `INTERSECT` / `EXCEPT` / **`MINUS`**（Oracle）（いずれも `ALL` 対応） |
+| **サブクエリ** | スカラー / `IN` / `EXISTS` / 相関サブクエリ / **量化比較 `= ANY`・`> ALL`・`SOME`** / **派生表の列リスト（`(SELECT ...) AS t(a, b)`）** / **`FROM (VALUES ...) AS t(a, b)`** |
 | **CTE** | `WITH` / `WITH RECURSIVE`（列リスト対応） |
-| **ウィンドウ関数** | `ROW_NUMBER` / `RANK` / `LAG` / `LEAD` / フレーム指定（**`ROWS` / `RANGE` / `GROUPS`**）/ named window（`WINDOW` 句）/ `QUALIFY`（**ウィンドウ関数の直書き可**） |
-| **集計** | 多数の集計関数 / **式に内包した集計（`ROUND(AVG(x), 2)`・`100.0 * SUM(a) / SUM(b)`）** / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / **`CUBE`・`GROUPING SETS`** / `GROUPING()` / **`WITHIN GROUP (ORDER BY ...)`** / `GROUP_CONCAT` |
-| **DML** | `INSERT`（複数行・`SELECT`・`SET`・`DEFAULT`）/ `UPDATE` / `DELETE`（`ORDER BY`・`LIMIT`）/ `REPLACE` / `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO NOTHING`・`DO UPDATE`（PostgreSQL・`EXCLUDED`）/ `MERGE INTO ... USING ... WHEN MATCHED/NOT MATCHED`（Oracle/SQL Server）/ `RETURNING` |
-| **DDL** | `CREATE / ALTER / DROP TABLE` / `VIEW` / **`MATERIALIZED VIEW`（`REFRESH` 付き）** / `INDEX` / `TRIGGER` / `PROCEDURE` / `SEQUENCE` / `CREATE TABLE AS`・`LIKE` / **`SELECT ... INTO`** / **`COMMENT ON`** / `TEMPORARY` |
-| **制約** | `PRIMARY KEY`（複合可）/ `UNIQUE` / `NOT NULL` / `DEFAULT`（`CURRENT_TIMESTAMP` 含む）/ `CHECK` / `FOREIGN KEY`（`ON DELETE/UPDATE` 参照アクション）/ `AUTO_INCREMENT` / **識別列（`GENERATED ALWAYS AS IDENTITY`・`IDENTITY(1,1)`）** / 生成列（`GENERATED ALWAYS AS`） |
+| **ウィンドウ関数** | `ROW_NUMBER` / `RANK` / `LAG` / `LEAD` / フレーム指定（**`ROWS` / `RANGE` / `GROUPS`**、**`EXCLUDE CURRENT ROW\|GROUP\|TIES\|NO OTHERS`**）/ named window（`WINDOW` 句）/ `QUALIFY`（**ウィンドウ関数の直書き可**）/ **`IGNORE NULLS`・`RESPECT NULLS`** / **`FILTER (WHERE ...) OVER (...)`** |
+| **集計** | 多数の集計関数 / **式に内包した集計（`ROUND(AVG(x), 2)`・`100.0 * SUM(a) / SUM(b)`）** / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / **`CUBE`・`GROUPING SETS`** / **`GROUP BY ALL`** / `GROUPING()` / **`WITHIN GROUP (ORDER BY ...)`** / `GROUP_CONCAT` |
+| **DML** | `INSERT`（複数行・`SELECT`・`SET`・`DEFAULT`・**`DEFAULT VALUES`**）/ `UPDATE` / `DELETE`（`ORDER BY`・`LIMIT`）/ `REPLACE` / `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO NOTHING`・`DO UPDATE`（PostgreSQL・`EXCLUDED`）/ `MERGE INTO ... USING ... WHEN MATCHED/NOT MATCHED`（Oracle/SQL Server）/ **複数表 `UPDATE ... FROM`・`UPDATE ... JOIN`・`DELETE ... USING`・`DELETE t FROM t JOIN s`** / `RETURNING` |
+| **DDL** | `CREATE / ALTER / DROP TABLE`（**`CASCADE`・`RESTRICT`**） / `VIEW` / **`MATERIALIZED VIEW`（`REFRESH` 付き）** / `INDEX`（**複合列・`UNIQUE`・名前指定の `DROP INDEX`**）/ `TRIGGER` / `PROCEDURE` / `SEQUENCE` / **`FUNCTION`（ユーザー定義スカラー関数）** / `CREATE TABLE AS`・`LIKE` / **`SELECT ... INTO`** / **`COMMENT ON`** / `TEMPORARY` |
+| **制約** | `PRIMARY KEY`（複合可）/ `UNIQUE` / `NOT NULL` / `DEFAULT`（`CURRENT_TIMESTAMP` 含む）/ **`ON UPDATE CURRENT_TIMESTAMP`** / `CHECK` / `FOREIGN KEY`（`ON DELETE/UPDATE` 参照アクション）/ `AUTO_INCREMENT` / **識別列（`GENERATED ALWAYS AS IDENTITY`・`IDENTITY(1,1)`）** / 生成列（`GENERATED ALWAYS AS`） |
 | **トランザクション** | `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` |
 | **行変換** | **`PIVOT` / `UNPIVOT`**（縦横変換。`UNPIVOT` は NULL 行を除外） |
-| **NULL 安全比較** | **`IS [NOT] DISTINCT FROM`** / **`<=>`** |
-| **セッション文** | **`SET TRANSACTION ISOLATION LEVEL`** / **`LOCK`・`UNLOCK TABLES`** / **`GRANT`・`REVOKE`** / **`DISCARD`**（スクリプト互換のため受理） |
-| **その他** | プリペアドステートメント（`PREPARE`/`EXECUTE`/`DEALLOCATE`）/ ユーザー変数（`SET @x`）/ `EXPLAIN`・`EXPLAIN ANALYZE` / `VALUES` 文 / `TABLE` 文 / `SHOW *`（**`STORAGE`・`SETTINGS`・`COMMENTS`・`MATERIALIZED VIEWS`** 含む）・`DESCRIBE`・`CHECK TABLE`・`ANALYZE TABLE` |
+| **NULL 安全比較** | **`IS [NOT] DISTINCT FROM`** / **`<=>`** / **`IS [NOT] UNKNOWN`** |
+| **演算子・述語** | **`\|\|`（文字列連結）** / **`::`（キャスト）** / **`ILIKE`** / **`SIMILAR TO`** / **行コンストラクタ `(a, b) = (c, d)`・`(a, b) IN ((1,2), (3,4))`** / **`COLLATE`（`NOCASE`・`BINARY`・`NOACCENT`・`NUMERIC`）** / **`LIKE ANY`・`LIKE ALL`** / **日付 ± `INTERVAL`** |
+| **全文検索** | **`MATCH (col, ...) AGAINST ('語' [IN BOOLEAN\|NATURAL LANGUAGE MODE])`**（`+`必須 / `-`除外 / `"句"` / `語*` 前方一致・スコア取得可） |
+| **表関数** | `GENERATE_SERIES`（**数値だけでなく「時刻 + `INTERVAL` 刻み」も生成**）/ `STRING_SPLIT(str, sep)` / `UNNEST(a, b, ...)` / **`JSON_TABLE`（JSON → 行）** / **`WITH ORDINALITY`** |
+| **配列** | **`ARRAY[...]` コンストラクタ** / **`ARRAY_LENGTH`・`ARRAY_POSITION`・`ARRAY_CONTAINS`・`ARRAY_APPEND`・`ARRAY_PREPEND`・`ARRAY_REMOVE`・`ARRAY_SORT`・`ARRAY_TO_STRING`・`STRING_TO_ARRAY`** / **`= ANY(ARRAY[...])`** |
+| **サンプリング** | **`TABLESAMPLE [BERNOULLI\|SYSTEM] (n PERCENT\|n ROWS) [REPEATABLE (seed)]`** |
+| **期間・時系列** | **`(s1, e1) OVERLAPS (s2, e2)`** / **`BETWEEN SYMMETRIC`** / **`DATE_BIN`・`TIME_BUCKET`**（時刻の区間丸め）/ **`AGE(a, b)`** / **`EXTRACT(EPOCH\|DOW\|DOY FROM ...)`** / **`AT TIME ZONE`** |
+| **統計集計** | **`REGR_SLOPE`・`REGR_INTERCEPT`・`REGR_R2`・`REGR_COUNT`・`REGR_AVGX`・`REGR_AVGY`・`REGR_SXX`・`REGR_SYY`・`REGR_SXY`**（単回帰）/ **`MODE() WITHIN GROUP (ORDER BY x)`** |
+| **あいまい照合** | **`LEVENSHTEIN`（`EDIT_DISTANCE`）** / **`SIMILARITY`（0〜1）** / **`DIFFERENCE`（SOUNDEX 一致度）** / **`REGEXP_MATCHES`・`REGEXP_SPLIT_TO_ARRAY`** |
+| **JSON 述語** | **`<expr> IS [NOT] JSON [VALUE\|OBJECT\|ARRAY\|SCALAR]`** / **`JSON_EXISTS`** / **`JSON_QUERY`** |
+| **手続き型** | **`DECLARE` / `SET` / `IF`・`ELSEIF`・`ELSE` / `WHILE`・`DO` / `LOOP`・`LEAVE`・`ITERATE` / `REPEAT`・`UNTIL` / `CASE`文 / `RETURN`**（`CREATE PROCEDURE` 本体。引数付き `CALL p(1, 2)` 可） |
+| **カーソル** | **`DECLARE <名> CURSOR FOR` / `OPEN` / `FETCH ... INTO` / `CLOSE`**（複数列 `FETCH` 可） |
+| **例外処理** | **`DECLARE {CONTINUE\|EXIT} HANDLER FOR {NOT FOUND\|SQLEXCEPTION\|SQLSTATE 'xxxxx'}`** / **`SIGNAL`・`RESIGNAL`**（`SET MESSAGE_TEXT`） |
+| **カタログ** | **`INFORMATION_SCHEMA.TABLES / COLUMNS / VIEWS / TABLE_CONSTRAINTS / KEY_COLUMN_USAGE / ROUTINES / SEQUENCES / SCHEMATA`** / **`PRAGMA table_info`・`table_list`・`index_list`・`foreign_key_list`・`user_version`** / **`sqlite_master`** |
+| **互換構文** | **スキーマ修飾 `main.t`・`public.t`** / **`CREATE`・`DROP SCHEMA`** / **部分インデックス `CREATE INDEX ... WHERE`** / **`SELECT ... FOR UPDATE\|SHARE [NOWAIT\|SKIP LOCKED]`** / **`WITH ... AS [NOT] MATERIALIZED`** / **`EXPLAIN QUERY PLAN`** / **`REINDEX`・`CHECKPOINT`・`FLUSH`・`CLUSTER`**（受理のみ）/ **`SHOW CREATE FUNCTION`** |
+| **セッション文** | **`SET TRANSACTION ISOLATION LEVEL`** / **`LOCK`・`UNLOCK TABLES`** / **`GRANT`・`REVOKE`** / **`DISCARD`**（スクリプト互換のため受理）/ **`SET statement_timeout`・`read_only`・`seed`・`slow_query_threshold`** / **システム変数 `@@version`・`@@identity`** |
+| **スナップショット** | **`CREATE / RESTORE / DROP SNAPSHOT`**・**`SHOW SNAPSHOTS`**（メモリ内タイムトラベル） |
+| **その他** | プリペアドステートメント（`PREPARE`/`EXECUTE`/`DEALLOCATE`）/ ユーザー変数（`SET @x`・**`DECLARE @x`**）/ `EXPLAIN`（**`(FORMAT JSON)`**）・`EXPLAIN ANALYZE` / `VALUES` 文 / `TABLE` 文 / `SHOW *`（**`STORAGE`・`SETTINGS`・`COMMENTS`・`MATERIALIZED VIEWS`・`SNAPSHOTS`・`PROFILE`・`SLOW QUERIES`** 含む）・`DESCRIBE`・`CHECK TABLE`・`ANALYZE TABLE` |
 
 ### 組み込み関数（270 以上）
 
@@ -93,6 +109,139 @@ INSERT INTO target (id, val) VALUES (1, 100)
 
 -- SQL Server 風 TOP
 SELECT TOP 3 * FROM users ORDER BY age DESC;
+```
+
+### v1.14 で追加した構文（抜粋）
+
+```sql
+-- 連結演算子 / キャスト演算子 / ILIKE / 行コンストラクタ
+SELECT name || ' (' || age::TEXT || ')' AS label FROM users WHERE name ILIKE 'a%';
+SELECT * FROM users WHERE (id, age) IN ((1, 25), (2, 30));
+
+-- 列を選び直す短縮記法（DuckDB / Snowflake 風）
+SELECT * EXCLUDE (age) FROM users;
+SELECT * REPLACE (age * 2 AS age) FROM users;
+SELECT age, COUNT(*) FROM users GROUP BY ALL;
+
+-- 各グループの先頭 1 行 / 同値を含めた上位 n 件
+SELECT DISTINCT ON (user_id) user_id, amount FROM orders ORDER BY user_id, amount DESC;
+SELECT * FROM users ORDER BY age DESC FETCH FIRST 3 ROWS WITH TIES;
+
+-- 複数表の UPDATE / DELETE
+UPDATE orders o SET amount = amount + 1 FROM users u WHERE o.user_id = u.id AND u.age > 30;
+DELETE FROM orders USING users WHERE orders.user_id = users.id AND users.age > 90;
+
+-- ユーザー定義スカラー関数（呼び出し箇所へ式として展開される）
+CREATE FUNCTION tax(amount) RETURNS FLOAT AS RETURN ROUND(amount * 1.1, 2);
+SELECT price, tax(price) AS with_tax FROM products;
+
+-- カタログ / 表関数 / 派生表
+SELECT COLUMN_NAME, DATA_TYPE, COLUMN_KEY FROM information_schema.columns WHERE TABLE_NAME = 'users';
+SELECT value FROM STRING_SPLIT('a,b,c', ',');
+SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, label);
+```
+
+### v1.15 で追加した構文（抜粋）
+
+```sql
+-- 日付演算 / 照合順 / 全文検索
+SELECT DATE '2026-01-31' + INTERVAL 1 MONTH AS eom, NOW() - INTERVAL '7 days' AS week_ago;
+SELECT * FROM users WHERE name COLLATE NOCASE = 'alice' ORDER BY name COLLATE NUMERIC;
+SELECT name, MATCH(name) AGAINST('alice bob') AS score
+FROM users WHERE MATCH(name) AGAINST('+alice -bob' IN BOOLEAN MODE);
+
+-- 欠測を飛ばして前の値を引く（IGNORE NULLS）
+SELECT id, LAG(v) IGNORE NULLS OVER (ORDER BY id) AS carried FROM readings;
+
+-- JSON をそのまま表として扱う（API 応答の取り込みに）
+SELECT * FROM JSON_TABLE('[{"id":1,"nm":"a"},{"id":2,"nm":"b"}]', '$[*]'
+                         COLUMNS (id INT PATH '$.id', nm TEXT PATH '$.nm')) t;
+
+-- 大きな表の概算集計（REPEATABLE で再現可能）
+SELECT AVG(price) FROM products TABLESAMPLE (10 PERCENT) REPEATABLE (42);
+
+-- ストアドプロシージャの制御構造
+CREATE PROCEDURE grade(s) AS BEGIN
+  DECLARE g TEXT;
+  IF s >= 90 THEN SET g = 'A';
+  ELSEIF s >= 70 THEN SET g = 'B';
+  ELSE SET g = 'C';
+  END IF;
+  RETURN g;
+END;
+CALL grade(85);   -- 'B'
+
+-- 更新時刻の自動記録 / イントロスペクション
+CREATE TABLE audit (id INTEGER PRIMARY KEY, v INTEGER,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP);
+PRAGMA table_info(audit);
+SELECT type, name FROM sqlite_master;
+EXPLAIN (FORMAT JSON) SELECT * FROM users;
+```
+
+### v1.16 で追加した構文（抜粋）
+
+```sql
+-- カーソル + 例外ハンドラ（MySQL ルーチンの定番形）
+CREATE PROCEDURE archive() AS BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE uid INT;
+  DECLARE c CURSOR FOR SELECT id FROM users WHERE age > 30;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+  OPEN c;
+  read_loop: LOOP
+    FETCH c INTO uid;
+    IF done = 1 THEN LEAVE read_loop; END IF;
+    INSERT INTO archived (id) VALUES (uid);
+  END LOOP;
+  CLOSE c;
+END;
+
+-- 業務エラーを明示的に上げる / 受け止める
+CREATE PROCEDURE withdraw(amount) AS BEGIN
+  IF amount <= 0 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'amount must be positive'; END IF;
+  RETURN amount;
+END;
+
+-- 期間の重なり / 時系列バケット / JSON 述語
+SELECT (DATE '2026-01-01', DATE '2026-06-01') OVERLAPS (DATE '2026-03-01', DATE '2026-09-01') AS conflicts;
+SELECT TIME_BUCKET(INTERVAL 1 HOUR, ts) AS bucket, SUM(amount) FROM events GROUP BY TIME_BUCKET(INTERVAL 1 HOUR, ts);
+SELECT AGE(DATE '2028-03-15', DATE '2026-01-20') AS gap;      -- '2 years 1 mon 24 days'
+SELECT * FROM docs WHERE body IS JSON OBJECT AND JSON_EXISTS(body, '$.meta.id');
+
+-- 実 DB 向けスクリプトの互換構文
+SELECT * FROM main.users WHERE id = 1 FOR UPDATE;
+CREATE INDEX idx_adult ON users (age) WHERE age >= 18;
+WITH c AS MATERIALIZED (SELECT id FROM users) SELECT COUNT(*) FROM c;
+EXPLAIN QUERY PLAN SELECT * FROM users WHERE id = 1;
+```
+
+### v1.17 で追加した構文（抜粋）
+
+```sql
+-- 配列とあいまい検索（クライアント側の名寄せ・検索に）
+SELECT ARRAY_TO_STRING(ARRAY[1, 2, 3], '-') AS joined;
+SELECT * FROM users WHERE id = ANY(ARRAY[1, 2, 3]);
+SELECT name, SIMILARITY(name, 'Alise') AS score
+FROM users WHERE LEVENSHTEIN(name, 'Alise') <= 2 ORDER BY score DESC;
+
+-- 単回帰と最頻値
+SELECT REGR_SLOPE(price, stock) AS slope, REGR_R2(price, stock) AS r2 FROM products;
+SELECT MODE() WITHIN GROUP (ORDER BY age) AS most_common FROM users;
+
+-- 欠測のない時系列（バケットを先に作って LEFT JOIN する定番形）
+SELECT d.value AS day, COUNT(o.order_id) AS n
+FROM GENERATE_SERIES(DATE '2026-01-01', DATE '2026-01-07', INTERVAL 1 DAY) d
+LEFT JOIN orders o ON DATE_BIN(INTERVAL 1 DAY, o.created_at) = d.value
+GROUP BY d.value ORDER BY day;
+
+SELECT v, n FROM GENERATE_SERIES(10, 30, 10) WITH ORDINALITY AS t(v, n);
+SELECT NOW() AT TIME ZONE '+09:00' AS tokyo;
+
+-- ウィンドウ関数の EXCLUDE と FILTER
+SELECT id, SUM(age) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                          EXCLUDE CURRENT ROW) AS others_total FROM users;
+SELECT id, SUM(age) FILTER (WHERE age > 25) OVER () AS adults_total FROM users;
 ```
 
 ---
@@ -166,6 +315,117 @@ fetch('lumina://tables').then(r => r.json());
 - **使用量の可視化** — `SHOW STORAGE`（DB 自身の概算サイズ）と `LuminaDB.storage()`（ブラウザの使用量・上限・永続化状態）で確認できます。
 - **永続化ストレージの要求** — `LuminaDB.persist()` でディスク逼迫時の自動退避を防ぐ永続化を要求できます。
 
+### v1.14 で追加した運用機能
+
+ブラウザではクエリが UI スレッドを占有し、DB がページと同じ権限空間に置かれます。そこに効く 5 つの機能を追加しました。
+
+| 機能 | 用途 | SQL | JS API |
+|------|------|-----|--------|
+| **文単位タイムアウト** | 暴走クエリで画面が固まるのを防ぐ | `SET statement_timeout = 500` | `LuminaDB.timeout(500)` |
+| **読み取り専用モード** | iframe / 外部スクリプトへ安全に公開する | `SET read_only = ON` | `LuminaDB.readOnly(true, { lock: true })` |
+| **スナップショット** | 取り込み前に戻れる「メモリ内タイムトラベル」 | `CREATE / RESTORE / DROP SNAPSHOT s` | `LuminaDB.snapshot('s')` / `restore('s')` |
+| **ライブクエリ** | 書き込みに追従して UI を更新する | — | `LuminaDB.subscribe(sql, rows => ...)` |
+| **プロファイル / 遅いクエリログ** | どのクエリが重いかを可視化する | `SHOW PROFILE` / `SHOW SLOW QUERIES` | `LuminaDB.profile()` / `slowQueries()` |
+
+### v1.15 で追加した「ブラウザDBに必須」の 3 機能
+
+| 機能 | 解決する問題 | 使い方 |
+|------|--------------|--------|
+| **ワーカー実行** | クエリが UI スレッドを占有し、重い集計の間だけ画面が固まる | `LuminaDB.worker.*`（別スレッドの複製 DB で実行し、必要なら書き戻す） |
+| **スキーマ・マイグレーション** | 利用者の端末に古いスキーマが残り続ける | `LuminaDB.migrate([...])` + `PRAGMA user_version` |
+| **バックアップ入出力** | IndexedDB はブラウザを消せば消える。手元に取り出す経路が要る | `LuminaDB.download()` / `LuminaDB.backup()` / `LuminaDB.restoreBackup()` |
+
+```js
+// 1. 重いクエリを UI スレッドの外で走らせる（画面は固まらない）
+await LuminaDB.worker.start();
+await LuminaDB.worker.sync();                        // 現在の DB をワーカーへ複製
+const r = await LuminaDB.worker.query('SELECT g, COUNT(*) FROM big GROUP BY g');
+await LuminaDB.worker.pull();                        // ワーカー側で書いた結果を戻す
+LuminaDB.worker.stop();
+
+// 2. 版数を見て差分だけ適用する（途中で失敗したらスナップショットで自動ロールバック）
+LuminaDB.migrate([
+  { version: 1, up: 'CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)' },
+  { version: 2, up: 'ALTER TABLE notes ADD COLUMN tag TEXT' },
+  { version: 3, up: api => api.exec("INSERT INTO notes (id, body) VALUES (1, 'hello')") }
+]);
+// → { applied: [1, 2, 3], from: 0, to: 3 }
+
+// 3. 完全な状態（スキーマ・データ・ビュー・関数・版数）を 1 ファイルで往復
+LuminaDB.download('mydb.json');
+LuminaDB.restoreBackup(await file.text());
+```
+
+保存の排他は **Web Locks API** で直列化されるようになりました（従来の楽観ロックだけでは
+「バージョン読み取り → 書き込み」の間に他タブが割り込む窓が残っていました）。
+
+### v1.16 で追加した「ブラウザDBに必須」の 3 機能
+
+| 機能 | 解決する問題 | 使い方 |
+|------|--------------|--------|
+| **差分永続化** | 1 行変えただけでも DB 全体を再直列化・再暗号化していた | 自動（テーブル単位。`LuminaDB.saveStats()` で内訳を確認） |
+| **バッチ読み出し** | `rows()` は全件をメモリへ載せるので大きな表で破綻する | `LuminaDB.eachBatch()` / `LuminaDB.cursor()` |
+| **タブ間の追従・離脱保護** | 他タブの更新に気づけない / 未保存のまま閉じてしまう | `LuminaDB.autoReload(true)` と `beforeunload` ガード（自動） |
+
+差分永続化はテーブルごとに「変更世代 : 行数 : 容量」の指紋を持ち、前回保存と同じ表は
+書き直しません。60,000 行の DB で実測すると、初回の全保存 25ms に対し、小さな表を 1 つ
+更新しただけの保存は **2ms**（変更なしの保存は 1ms・書き込み 0 テーブル）です。
+
+### v1.17 で追加したブラウザDB機能
+
+| 機能 | 解決する問題 | API |
+|------|--------------|-----|
+| **式コンパイルキャッシュ** | 同じ形のクエリを何百回も投げると、毎回の式コンパイルが支配的になる | 自動（`LuminaDB.cacheStats()` でヒット率を確認） |
+| **CSV 取り込み / 書き出し** | ファイルやフェッチしたテキストを表に落とす経路が JS API に無かった | `LuminaDB.importCSV()` / `exportCSV()` |
+| **タブのリーダー選出** | 複数タブで同じ定期処理が重複して走る | `LuminaDB.onLeader(cb)` / `isLeader()` |
+
+式キャッシュは式テキストをキーにした LRU（既定 500 件）です。ユーザー変数・`LAST_INSERT_ID()`・
+シーケンス・ユーザー定義関数など「実行時点の状態を式へ畳み込む」構文が含まれる場合はキャッシュしません。
+同一クエリの反復では実測で **約 2 倍** 速くなります。
+
+```js
+// CSV（RFC 4180: 引用符内のカンマ・改行・二重引用符に対応。空欄は NULL、型は列ごとに推定）
+LuminaDB.importCSV(await file.text(), 'sales', { create: true });
+LuminaDB.importCSV(text, 'sales', { replace: true, delimiter: ';' });
+const csv = LuminaDB.exportCSV('sales');
+
+// リーダータブだけが重い定期処理を担う（閉じると別タブが自動昇格）
+const handle = LuminaDB.onLeader(() => startBackgroundSync());
+handle.release();
+
+LuminaDB.cacheStats();  // { hits: 204, misses: 1, size: 1, max: 500, hitRate: 0.995 }
+```
+
+```js
+// 差分保存が効いているかの確認
+LuminaDB.saveStats();   // { tables: 5, written: 1, skipped: 4, removed: 0, full: false }
+
+// 大きな結果を一定件数ずつ処理する（ピークメモリは batch 件ぶんだけ）
+LuminaDB.eachBatch('SELECT * FROM big ORDER BY id', [], 1000, rows => render(rows));
+for (const row of LuminaDB.cursor('SELECT * FROM big ORDER BY id')) { /* ... */ }
+
+// 他タブの保存に自動追従（未保存の変更が無いときだけ読み直す）
+LuminaDB.autoReload(true);
+```
+
+```js
+// ライブクエリ: 結果が変わったときだけコールバックされる（無関係な書き込みでは呼ばれない）
+const sub = LuminaDB.subscribe('SELECT COUNT(*) AS c FROM users', rows => render(rows[0].c));
+sub.unsubscribe();
+
+// 読み取り専用で公開する（lock: true にすると SQL の SET read_only = OFF では解除できない）
+LuminaDB.readOnly(true, { lock: true });
+
+// 壊す前にスナップショットを取り、失敗したら戻す
+LuminaDB.snapshot('before_import');
+try { LuminaDB.importJSON('users', rows); } catch (e) { LuminaDB.restore('before_import'); }
+
+// JSON 入出力 / 決定的な乱数（テストデータの再現）
+LuminaDB.importJSON('metrics', [{ id: 1, v: 10 }], { create: true });
+const dump = LuminaDB.exportJSON(['metrics']);
+LuminaDB.query("SET seed = 0.42");   // 以降 RAND() が再現可能になる
+```
+
 ```js
 await LuminaDB.storage();
 // { supported: true, usage: 12345678, quota: 9876543210, usagePercent: 0.12,
@@ -198,7 +458,8 @@ js/
 │   ├── engine-transaction.js トランザクション / セーブポイント
 │   ├── engine-io.js         SQL ダンプ入出力 / IndexedDB シリアライズ
 │   └── table.js             列指向テーブル（TypedArray ストレージ）
-├── storage/idb.js       IndexedDB 永続化（AES-GCM 暗号化・楽観ロック）
+├── storage/idb.js       IndexedDB 永続化（AES-GCM 暗号化・Web Locks 排他・バックアップ）
+├── worker/              ワーカースレッド版エンジン（UI を止めない実行）
 ├── ui/                  画面（state / editor / results / table-tree / schema-editor /
 │                        help / modals / data-io / query-runner / console）
 ├── api/api.js           外部 API（window.LuminaDB / fetch / postMessage）
@@ -209,7 +470,21 @@ js/
 
 ## テスト
 
-2,000 件超の自己完結テストを 2 通りで実行できます。
+7,000 件超の自己完結テストを 2 通りで実行できます。内訳の主なものは以下のとおりです。
+
+| スイート | 件数 | 内容 |
+|----------|------|------|
+| `test-suite*.js`（v1〜v16） | 約 5,300 | SQL 構文・関数・UI・永続化の機能テスト |
+| `test-suite-v17.js` | 247 | v1.14 で追加した構文と運用機能の回帰 |
+| `test-suite-v18.js` | 679 | **セキュリティ**（インジェクション / 識別子検証 / JS 脱出 / プロトタイプ汚染 / DoS ガード / 読み取り専用の強制 / API 境界 / 出力エスケープ） |
+| `test-suite-v19.js` | 433 | **パフォーマンス**（較正付きの時間予算・計算量スケーリング・絶対値の安全網） |
+| `test-suite-v20.js` | 275 | v1.15 の構文とブラウザDB必須機能。新しい入口（プロシージャのローカル変数・`JSON_TABLE` のパス・`MATCH` の検索語・バックアップの取り込み・ワーカーのメッセージ）に対するセキュリティ検査と性能予算を含む |
+| `test-suite-v21.js` | 185 | v1.16 の手続き型（カーソル・ハンドラ・`SIGNAL`・`CASE` 文）、期間/JSON/時系列の述語、差分永続化・ストリーミング読み出し。カーソルが返す値と `SIGNAL` の本文に対するセキュリティ検査を含む |
+| `test-suite-v22.js` | 180 | v1.17 の配列・回帰集計・あいまい照合・時系列生成・ウィンドウ拡張、式キャッシュ・CSV 取り込み・リーダー選出。CSV のフィールド/ヘッダーと配列要素に対するセキュリティ検査を含む |
+
+セキュリティテストは「攻撃者が制御できる文字列」を 28 種類用意し、10 通りの入口（`?` バインド / 名前付きバインド / `insert` / `update` / `select` / `remove` / `prepare` / SQL プリペアド / `WHERE` / `LIKE`）へ総当たりで流し込み、**(a) JS として実行されない・(b) SQL の構造が変わらない・(c) 値としてそのまま往復する** の 3 点を毎回検査します。
+
+パフォーマンステストは、まず 20,000 行のスキャン 1 回を実測して基準値に較正し、以降の予算をその倍数で表します。実行環境の速さによる偽陽性を避けつつ、`O(n) → O(n^2)` のような劣化を確実に検出できます。較正が一緒に緩むケースに備えて、絶対値の上限（例: 20,000 行スキャンが 300ms 未満）も併せて固定しています。
 
 ### 1. 実ブラウザ・ヘッドレステスト（推奨・高信頼）
 

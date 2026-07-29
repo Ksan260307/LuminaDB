@@ -25,6 +25,11 @@
             this.compositeKeys = [];
             // 生成列 (GENERATED ALWAYS AS): col -> 式テキスト（STORED相当。INSERT/UPDATE時に評価）
             this.generatedCols = Object.create(null);
+            // ON UPDATE CURRENT_TIMESTAMP を持つ列名（UPDATE 時に自動更新）
+            this.onUpdateNowCols = [];
+            // 変更世代。setValue / 列操作のたびに増える。IndexedDB の差分保存で
+            // 「この表は前回保存から変わったか」を O(1) で判定するために使う
+            this.version = 0;
             // CREATE TEMPORARY TABLE で作られたテーブル（IDB保存・SQLエクスポート対象外）
             this.isTemp = false;
         }
@@ -32,6 +37,7 @@
         addColumn(col, type = 'ANY') {
             col = col.toLowerCase();
             if (this.cols[col]) return;
+            this.version++;
             this.colTypes[col] = type;
             // 32-bit packing for Memory efficiency and Cache Locality
             // Type(8bit) + String Index(24bit) packed into a single Uint32Array
@@ -45,6 +51,7 @@
         }
 
         renameColumn(oldCol, newCol) {
+            this.version++;
             oldCol = oldCol.toLowerCase();
             newCol = newCol.toLowerCase();
             if (!this.cols[oldCol] || this.cols[newCol] || oldCol === newCol) return;
@@ -102,6 +109,7 @@
         }
 
         changeColumnType(col, newType) {
+            this.version++;
             col = col.toLowerCase();
             const c = this.cols[col];
             if (!c || this.colTypes[col] === newType) return;
@@ -151,6 +159,7 @@
         }
 
         grow() {
+            this.version++;
             const newCap = this.capacity === 0 ? 10000 : this.capacity * 2;
             for (let col in this.cols) {
                 const c = this.cols[col];
@@ -164,6 +173,7 @@
             col = col.toLowerCase();
             const c = this.cols[col];
             if (!c) return;
+            this.version++;   // 差分保存用の変更世代（整数 1 加算のみ）
             const expectedType = this.colTypes[col] || 'ANY';
 
             // Type Checking & Casting
@@ -372,6 +382,8 @@
             t.defaults = Object.assign(Object.create(null), this.defaults || {});
             t.autoIncrementCol = this.autoIncrementCol;
             t.checks = JSON.parse(JSON.stringify(this.checks || []));
+            t.onUpdateNowCols = [...(this.onUpdateNowCols || [])];
+            t.version = this.version;
             t.compositeKeys = JSON.parse(JSON.stringify(this.compositeKeys || []));
             t.generatedCols = Object.assign(Object.create(null), this.generatedCols || {});
             t.isTemp = !!this.isTemp;
@@ -403,6 +415,7 @@
 
         // 未参照文字列のGCと予約容量の縮小（VACUUM / OPTIMIZE 用）
         vacuum() {
+            this.version++;
             let freedStrings = 0;
             for (const col in this.cols) {
                 const oldPool = this.strPools[col];

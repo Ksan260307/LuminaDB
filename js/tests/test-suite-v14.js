@@ -267,7 +267,9 @@
         }},
         { name: "V14Br: Quota Error Message Mapped", fn: () => {
             // saveDB がクォータ超過を分かる文言へ変換していること（実装の存在確認）
-            return /QuotaExceededError/.test(saveDB.toString()) && /ストレージ上限/.test(saveDB.toString());
+            // v1.15 で保存本体は saveDBLocked へ切り出された（Web Locks で直列化するため）
+            const src = saveDB.toString() + (typeof saveDBLocked === 'function' ? saveDBLocked.toString() : '');
+            return /QuotaExceededError/.test(src) && /ストレージ上限/.test(src);
         }},
         { name: "V14Br: Storage Info Helper", fn: async () => {
             const i = await getStorageInfo();

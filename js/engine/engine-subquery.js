@@ -132,8 +132,16 @@
                   expandedSql = expandedSql.slice(0, match.start) + `(${valsStr})` + expandedSql.slice(match.end + 1);
               } else if (/\bFROM\s*$/i.test(beforeStr.trim()) || /\bJOIN\s*$/i.test(beforeStr.trim())) {
                   const tmpName = '__tmp_' + Math.floor(Math.random()*1000000);
-                  this._materializeRows(tmpName, subResult.data);
-                  expandedSql = expandedSql.slice(0, match.start) + tmpName + expandedSql.slice(match.end + 1);
+                  // 派生表の列リスト: FROM (SELECT ...) [AS] t(a, b) — 列名を位置で差し替える
+                  let after = expandedSql.slice(match.end + 1);
+                  let colNames = null;
+                  const alM = after.match(/^\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\)/i);
+                  if (alM) {
+                      colNames = alM[2].split(',').map(c => c.trim().toLowerCase());
+                      after = ` ${alM[1]}` + after.slice(alM[0].length);
+                  }
+                  this._materializeRows(tmpName, subResult.data, colNames);
+                  expandedSql = expandedSql.slice(0, match.start) + tmpName + after;
               } else {
                   let val = subResult.data.length > 0 ? Object.values(subResult.data[0])[0] : null;
                   if (typeof val === 'string') {
@@ -171,24 +179,241 @@
       // テーブル関数 GENERATE_SERIES(start, stop [, step]) を一時テーブルへ実体化して
       // FROM/JOIN 句のテーブル名に置換する。列名は 'value'（AS t(n) の列リストで変更可）。
       // expandSubqueries より前に呼ぶ（サブクエリ引数は非対応、定数式のみ）
-      expandTableFunctions(sql, strMap) {
-          if (!/generate_series/i.test(sql)) return sql;
-          const re = /\b(FROM|JOIN)\s+GENERATE_SERIES\s*\(((?:[^()]|\([^()]*\))*)\)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))?)?/gi;
-          return sql.replace(re, (m, kw, args, aliasName, colName) => {
-              const parts = this.splitSelectClause(args).map(a => {
-                  const fn = this.compileCondition(a.trim(), strMap);
-                  return Number(fn({}, this.tables, {}));
+      // FROM (VALUES (...), (...)) [AS] alias [(c1, c2, ...)] — 表値コンストラクタを
+      // 派生表として使う形（SQL標準 / PostgreSQL / SQL Server）。
+      // findInnerSubquery は '(SELECT' しか拾わないため、専用の前処理として実体化する。
+      expandValuesTables(sql, strMap) {
+          if (!/\(\s*values\b/i.test(sql)) return sql;
+          for (let guard = 0; guard < 32; guard++) {
+              const m = sql.match(/\b(FROM|JOIN)\s+\(\s*VALUES\b/i);
+              if (!m) break;
+              const open = sql.indexOf('(', m.index + m[1].length);
+              const close = this._scanBalanced(sql, open);
+              if (close === -1) throw new Error("Syntax Error: unbalanced parentheses in FROM (VALUES ...).");
+              const res = this._executeValuesStatement(sql.slice(open + 1, close).trim(), strMap);
+              let after = sql.slice(close + 1);
+              let alias = null, colNames = null;
+              const alM = after.match(/^\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\))?/i);
+              if (alM) {
+                  alias = alM[1];
+                  if (alM[2]) colNames = alM[2].split(',').map(c => c.trim().toLowerCase());
+                  after = after.slice(alM[0].length);
+              }
+              const tmpName = '__tmp_values_' + (this._tmpCounter = (this._tmpCounter || 0) + 1);
+              this._materializeRows(tmpName, res.data, colNames);
+              sql = sql.slice(0, m.index) + `${m[1]} ${tmpName}${alias ? ' ' + alias : ''}` + after;
+          }
+          return sql;
+      },
+
+      // FROM JSON_TABLE(<json>, '<row path>' COLUMNS (col TYPE PATH '<path>', ...)) [AS] alias
+      // JSON 配列を行へ展開する（MySQL 8 / Oracle）。ブラウザDBでは API 応答をそのまま
+      // 表として扱えると便利なので、行パスは '$' と '$[*]' に対応する。
+      _expandJsonTable(sql, strMap) {
+          if (!/\bjson_table\s*\(/i.test(sql)) return sql;
+          for (let guard = 0; guard < 16; guard++) {
+              const m = sql.match(/\b(FROM|JOIN)\s+JSON_TABLE\s*\(/i);
+              if (!m) break;
+              const open = sql.indexOf('(', m.index + m[1].length);
+              const close = this._scanBalanced(sql, open);
+              if (close === -1) throw new Error("Syntax Error in JSON_TABLE: unbalanced parentheses.");
+              const inner = sql.slice(open + 1, close);
+              const colsAt = inner.search(/\bCOLUMNS\s*\(/i);
+              if (colsAt === -1) throw new Error("Syntax Error in JSON_TABLE. Use JSON_TABLE(json, '$[*]' COLUMNS (col TYPE PATH '$.x', ...)).");
+              const head = this.splitSelectClause(inner.slice(0, colsAt)).map(x => x.trim()).filter(x => x !== '');
+              if (head.length !== 2) throw new Error("JSON_TABLE requires a JSON document and a row path.");
+              const colOpen = inner.indexOf('(', colsAt);
+              const colClose = this._scanBalanced(inner, colOpen);
+              if (colClose === -1) throw new Error("Syntax Error in JSON_TABLE COLUMNS list.");
+              const specs = this.splitSelectClause(inner.slice(colOpen + 1, colClose)).map(part => {
+                  const cm = part.trim().match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z][a-zA-Z0-9_]*(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)?\s*(?:PATH\s+(__STR_\d+__|'[^']*'))?$/i);
+                  if (!cm) throw new Error(`Invalid JSON_TABLE column definition '${part.trim()}'.`);
+                  const pathTok = cm[3];
+                  const path = pathTok ? (/^__STR_/.test(pathTok) ? this._unquoteLiteral(strMap[Number(pathTok.match(/\d+/)[0])]) : pathTok.slice(1, -1)) : ('$.' + cm[1]);
+                  return { name: cm[1].toLowerCase(), type: (cm[2] || 'TEXT').toUpperCase().replace(/\s*\(.*$/, ''), path };
               });
-              if (parts.length < 2 || parts.length > 3) throw new Error("GENERATE_SERIES requires 2 or 3 arguments (start, stop [, step]).");
-              const start = parts[0], stop = parts[1], step = parts.length === 3 ? parts[2] : 1;
-              if (!isFinite(start) || !isFinite(stop) || !isFinite(step)) throw new Error("GENERATE_SERIES arguments must be finite numbers.");
-              if (step === 0) throw new Error("GENERATE_SERIES step must not be zero.");
-              const col = colName ? colName.toLowerCase() : 'value';
+              if (specs.length === 0) throw new Error("JSON_TABLE requires at least one column.");
+              const jsonVal = this.compileCondition(head[0], strMap)({}, this.tables, {});
+              const rowPath = (this.compileCondition(head[1], strMap)({}, this.tables, {}) || '$');
+              let doc;
+              try { doc = jsonVal == null ? null : (typeof jsonVal === 'string' ? JSON.parse(jsonVal) : jsonVal); }
+              catch (e) { throw new Error("JSON_TABLE: the first argument is not valid JSON."); }
+              const rp = String(rowPath).replace(/\s+/g, '');
+              let items;
+              if (rp === '$' ) items = (doc === null ? [] : [doc]);
+              else if (rp === '$[*]') items = Array.isArray(doc) ? doc : (doc === null ? [] : [doc]);
+              else {
+                  const km = rp.match(/^\$\.([a-zA-Z_][a-zA-Z0-9_]*)(\[\*\])?$/);
+                  if (!km) throw new Error(`Unsupported JSON_TABLE row path '${rowPath}'. Use '$', '$[*]' or '$.key[*]'.`);
+                  const sub = (doc && typeof doc === 'object') ? doc[km[1]] : undefined;
+                  items = km[2] ? (Array.isArray(sub) ? sub : []) : (sub === undefined ? [] : [sub]);
+              }
+              const pick = (obj, path) => {
+                  const p = String(path).replace(/\s+/g, '');
+                  if (p === '$') return obj;
+                  const parts = p.replace(/^\$/, '').match(/\.[a-zA-Z_][a-zA-Z0-9_]*|\[\d+\]/g) || [];
+                  let cur = obj;
+                  for (const seg of parts) {
+                      if (cur === null || typeof cur !== 'object') return null;
+                      cur = seg[0] === '[' ? cur[Number(seg.slice(1, -1))] : cur[seg.slice(1)];
+                      if (cur === undefined) return null;
+                  }
+                  return cur === undefined ? null : cur;
+              };
+              const coerce = (v, t) => {
+                  if (v === null || v === undefined) return null;
+                  if (typeof v === 'object') return JSON.stringify(v);
+                  if (/INT/.test(t)) { const n = Math.trunc(Number(v)); return isNaN(n) ? null : n; }
+                  if (/DEC|NUM|FLOAT|DOUBLE|REAL/.test(t)) { const n = Number(v); return isNaN(n) ? null : n; }
+                  if (/BOOL/.test(t)) return v === true || v === 1 || String(v).toLowerCase() === 'true';
+                  return typeof v === 'string' ? v : String(v);
+              };
+              const rows = items.map(it => {
+                  const o = {};
+                  specs.forEach(sp => { o[sp.name] = coerce(pick(it, sp.path), sp.type); });
+                  return o;
+              });
+              let after = sql.slice(close + 1);
+              let alias = null;
+              const alM = after.match(/^\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)/i);
+              if (alM && !/^(where|group|order|having|limit|offset|join|inner|left|right|full|cross|union|on|qualify|window|fetch)$/i.test(alM[1])) {
+                  alias = alM[1];
+                  after = after.slice(alM[0].length);
+              }
+              const tmpName = '__tmp_jt_' + (this._tmpCounter = (this._tmpCounter || 0) + 1);
+              this._materializeRows(tmpName, rows, specs.map(sp => sp.name));
+              sql = sql.slice(0, m.index) + `${m[1]} ${tmpName}${alias ? ' ' + alias : ''}` + after;
+          }
+          return sql;
+      },
+
+      // FROM <table> TABLESAMPLE [BERNOULLI|SYSTEM] (n [PERCENT]) [REPEATABLE (seed)]
+      // 大きな表の概算集計を高速に取るための行サンプリング（SQL標準 / PostgreSQL）
+      _expandTableSample(sql, strMap) {
+          if (!/\btablesample\b/i.test(sql)) return sql;
+          for (let guard = 0; guard < 16; guard++) {
+              // 表名は FROM / JOIN の直後に限定する（先頭の 'FROM' 自体を表名と取り違えないため）
+              const m = sql.match(/\b(FROM|JOIN)\s+([a-zA-Z0-9_]+)(?:\s+(?:AS\s+)?(?!TABLESAMPLE\b)([a-zA-Z0-9_]+))?\s+TABLESAMPLE\s+(?:(BERNOULLI|SYSTEM)\s*)?\(\s*(\d+(?:\.\d+)?)\s*(PERCENT|ROWS)?\s*\)(?:\s*REPEATABLE\s*\(\s*(-?\d+(?:\.\d+)?)\s*\))?/i);
+              if (!m) break;
+              const kw = m[1];
+              const src = m[2].toLowerCase();
+              const alias = m[3] || m[2];
+              const t = this.tables[src];
+              if (!t) throw this._tableNotFound(src);
+              const amount = Number(m[5]);
+              const byRows = (m[6] || 'PERCENT').toUpperCase() === 'ROWS';
+              if (!byRows && (amount < 0 || amount > 100)) throw new Error("TABLESAMPLE percentage must be between 0 and 100.");
+              // REPEATABLE(seed) 指定時は決定的（Lehmer MINSTD）に選ぶ
+              let seed = m[7] !== undefined ? (Math.abs(Math.trunc(Number(m[7]))) % 2147483646) + 1 : null;
+              const rnd = () => { if (seed === null) return Math.random(); seed = (seed * 48271) % 2147483647; return (seed - 1) / 2147483646; };
+              const want = byRows ? Math.min(t.rowCount, Math.trunc(amount)) : null;
+              const cols = t.getColumnNames();
               const rows = [];
+              for (let i = 0; i < t.rowCount; i++) {
+                  if (byRows) {
+                      // 残り行から必要数を選ぶ（各行の採択確率を均一に保つ）
+                      const remaining = t.rowCount - i;
+                      if (rows.length >= want) break;
+                      if (rnd() >= (want - rows.length) / remaining) continue;
+                  } else if (rnd() * 100 >= amount) continue;
+                  const o = {};
+                  cols.forEach(c => { o[c] = t.getValue(c, i); });
+                  rows.push(o);
+              }
+              const tmpName = '__tmp_sample_' + (this._tmpCounter = (this._tmpCounter || 0) + 1);
+              this._materializeRows(tmpName, rows, cols);
+              sql = sql.slice(0, m.index) + `${kw} ${tmpName} ${alias}` + sql.slice(m.index + m[0].length);
+          }
+          return sql;
+      },
+
+      expandTableFunctions(sql, strMap) {
+          sql = this.expandValuesTables(sql, strMap);
+          sql = this._expandJsonTable(sql, strMap);
+          sql = this._expandTableSample(sql, strMap);
+          sql = this._expandSplitFunctions(sql, strMap);
+          if (!/generate_series/i.test(sql)) return sql;
+          // 数値系列に加えて「時刻の系列」も生成できる:
+          //   GENERATE_SERIES(TIMESTAMP '...', TIMESTAMP '...', INTERVAL 1 HOUR)
+          // 時系列レポートの欠測補完（バケットを先に全部作って LEFT JOIN する）で要る
+          const re = /\b(FROM|JOIN)\s+GENERATE_SERIES\s*\(((?:[^()]|\([^()]*\))*)\)(?:\s+WITH\s+ORDINALITY)?(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\))?)?/gi;
+          return sql.replace(re, (m, kw, args, aliasName, colList) => {
+              const withOrd = /\bWITH\s+ORDINALITY\b/i.test(m);
+              const cols = colList ? colList.split(',').map(c => c.trim().toLowerCase()) : null;
+              const col = (cols && cols[0]) ? cols[0] : 'value';
+              const ordCol = (cols && cols[1]) ? cols[1] : 'ordinality';
+              const argTexts = this.splitSelectClause(args).map(a => a.trim());
+              if (argTexts.length < 2 || argTexts.length > 3) throw new Error("GENERATE_SERIES requires 2 or 3 arguments (start, stop [, step]).");
+              const vals = argTexts.map(a => this.compileCondition(a, strMap)({}, this.tables, {}));
               const GUARD = 1000000;
-              if (step > 0) { for (let v = start; v <= stop; v += step) { rows.push({ [col]: v }); if (rows.length > GUARD) throw new Error("GENERATE_SERIES exceeded 1,000,000 rows."); } }
-              else { for (let v = start; v >= stop; v += step) { rows.push({ [col]: v }); if (rows.length > GUARD) throw new Error("GENERATE_SERIES exceeded 1,000,000 rows."); } }
+              const rows = [];
+              const isTimeSeries = argTexts.length === 3 && /\bINTERVAL\b/i.test(argTexts[2]);
+              if (isTimeSeries) {
+                  const t0 = new Date(String(vals[0]).replace(' ', 'T') + 'Z');
+                  const t1 = new Date(String(vals[1]).replace(' ', 'T') + 'Z');
+                  if (isNaN(t0.getTime()) || isNaN(t1.getTime())) throw new Error("GENERATE_SERIES: start and stop must be valid timestamps.");
+                  const iv = vals[2];
+                  if (!iv || typeof iv !== 'object' || iv.__interval === undefined) throw new Error("GENERATE_SERIES: the step must be an INTERVAL when generating timestamps.");
+                  if (iv.__interval === 0) throw new Error("GENERATE_SERIES step must not be zero.");
+                  const fwd = iv.__interval > 0;
+                  const fmt = (d) => d.toISOString().replace('T', ' ').slice(0, 19);
+                  const MS = { WEEK: 604800000, DAY: 86400000, HOUR: 3600000, MINUTE: 60000, SECOND: 1000 };
+                  let cur = new Date(t0.getTime());
+                  while (fwd ? cur.getTime() <= t1.getTime() : cur.getTime() >= t1.getTime()) {
+                      rows.push({ [col]: fmt(cur) });
+                      if (rows.length > GUARD) throw new Error("GENERATE_SERIES exceeded 1,000,000 rows.");
+                      if (iv.unit === 'MONTH' || iv.unit === 'QUARTER' || iv.unit === 'YEAR') {
+                          const mo = iv.unit === 'YEAR' ? iv.__interval * 12 : (iv.unit === 'QUARTER' ? iv.__interval * 3 : iv.__interval);
+                          const nd = new Date(cur.getTime());
+                          const day = nd.getUTCDate();
+                          nd.setUTCDate(1);
+                          nd.setUTCMonth(nd.getUTCMonth() + mo);
+                          const dim = new Date(Date.UTC(nd.getUTCFullYear(), nd.getUTCMonth() + 1, 0)).getUTCDate();
+                          nd.setUTCDate(Math.min(day, dim));
+                          cur = nd;
+                      } else {
+                          cur = new Date(cur.getTime() + (MS[iv.unit] || MS.SECOND) * iv.__interval);
+                      }
+                  }
+              } else {
+                  const nums = vals.map(Number);
+                  const start = nums[0], stop = nums[1], step = nums.length === 3 ? nums[2] : 1;
+                  if (!isFinite(start) || !isFinite(stop) || !isFinite(step)) throw new Error("GENERATE_SERIES arguments must be finite numbers.");
+                  if (step === 0) throw new Error("GENERATE_SERIES step must not be zero.");
+                  if (step > 0) { for (let v = start; v <= stop; v += step) { rows.push({ [col]: v }); if (rows.length > GUARD) throw new Error("GENERATE_SERIES exceeded 1,000,000 rows."); } }
+                  else { for (let v = start; v >= stop; v += step) { rows.push({ [col]: v }); if (rows.length > GUARD) throw new Error("GENERATE_SERIES exceeded 1,000,000 rows."); } }
+              }
+              // WITH ORDINALITY: 1 始まりの連番列を添える（SQL標準）
+              if (withOrd) rows.forEach((r, i) => { r[ordCol] = i + 1; });
               const tmpName = '__tmp_series_' + (this._tmpCounter = (this._tmpCounter || 0) + 1);
+              this._materializeRows(tmpName, rows, withOrd ? [col, ordCol] : [col]);
+              return `${kw} ${tmpName}${aliasName ? ' ' + aliasName : ''}`;
+          });
+      },
+
+      // 文字列/配列を行へ展開する表関数:
+      //   STRING_SPLIT(str, delim)  (SQL Server) → 列 value
+      //   UNNEST(a, b, c)           (PostgreSQL の配列展開に相当。要素をそのまま行にする)
+      _expandSplitFunctions(sql, strMap) {
+          if (!/\b(string_split|unnest)\s*\(/i.test(sql)) return sql;
+          const re = /\b(FROM|JOIN)\s+(STRING_SPLIT|UNNEST)\s*\(((?:[^()]|\([^()]*\))*)\)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))?)?/gi;
+          return sql.replace(re, (m, kw, fn, args, aliasName, colName) => {
+              const parts = this.splitSelectClause(args).map(a => this.compileCondition(a.trim(), strMap)({}, this.tables, {}));
+              const col = colName ? colName.toLowerCase() : 'value';
+              let rows;
+              if (fn.toUpperCase() === 'STRING_SPLIT') {
+                  if (parts.length !== 2) throw new Error("STRING_SPLIT requires 2 arguments (string, separator).");
+                  if (parts[0] === null || parts[0] === undefined) rows = [];
+                  else {
+                      const sep = String(parts[1]);
+                      if (sep === '') throw new Error("STRING_SPLIT separator must not be empty.");
+                      rows = String(parts[0]).split(sep).map(v => ({ [col]: v }));
+                  }
+              } else {
+                  if (parts.length === 0) throw new Error("UNNEST requires at least one argument.");
+                  rows = parts.map(v => ({ [col]: v === undefined ? null : v }));
+              }
+              const tmpName = '__tmp_split_' + (this._tmpCounter = (this._tmpCounter || 0) + 1);
               this._materializeRows(tmpName, rows, [col]);
               return `${kw} ${tmpName}${aliasName ? ' ' + aliasName : ''}`;
           });
@@ -510,7 +735,7 @@
               return `${kw} ${workName} ${cteName}${aliasPart || ''}`;
           });
           const runSeg = (segSql) => {
-              const expanded = this.expandSubqueries(this.expandRelationalOps(this.expandTableFunctions(this.expandViews(segSql, strMap), strMap), strMap), strMap);
+              const expanded = this.expandSubqueries(this.expandRelationalOps(this.expandTableFunctions(this.expandViews(this.expandInfoSchema(segSql), strMap), strMap), strMap), strMap);
               const r = this.executeQuery(expanded, true, strMap);
               if (r.error) throw new Error(`Recursive CTE '${cteName}': ${r.error}`);
               return r.data;
@@ -581,8 +806,10 @@
               return text;
           };
           while (true) {
-              // 列リスト付きの WITH name(col1, col2) AS ( ... ) にも対応する
-              const m = rest.match(/^([a-zA-Z0-9_]+)(?:\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\))?\s+as\s*\(/i);
+              // 列リスト付きの WITH name(col1, col2) AS ( ... ) にも対応する。
+              // AS [NOT] MATERIALIZED（PostgreSQL の最適化ヒント）は受理して無視する
+              // — LuminaDB は CTE を常に実体化するので MATERIALIZED と同じ挙動になる
+              const m = rest.match(/^([a-zA-Z0-9_]+)(?:\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\))?\s+as\s*(?:(?:not\s+)?materialized\s*)?\(/i);
               if (!m) throw new Error("Syntax Error in WITH clause. Use WITH name [(col, ...)] AS (SELECT ...).");
               const name = m[1].toLowerCase();
               const colNames = m[2] ? m[2].split(',').map(c => c.trim().toLowerCase()) : null;
@@ -601,7 +828,7 @@
                   // 自己参照あり → 再帰CTE（サブクエリ展開は各セグメントの実行時に行う）
                   this._materializeRecursiveCTE(name, body, tmpName, strMap, colNames);
               } else {
-                  body = this.expandSubqueries(this.expandRelationalOps(this.expandTableFunctions(this.expandViews(body, strMap), strMap), strMap), strMap);
+                  body = this.expandSubqueries(this.expandRelationalOps(this.expandTableFunctions(this.expandViews(this.expandInfoSchema(body), strMap), strMap), strMap), strMap);
                   const res = this.executeQuery(body, true, strMap);
                   if (res.error) throw new Error(`CTE '${name}': ${res.error}`);
                   this._materializeRows(tmpName, res.data, colNames);
@@ -645,11 +872,12 @@
               const ch = sql[i];
               if (ch === '(') depth++;
               else if (ch === ')') depth--;
-              else if (depth === 0 && /[uieUIE]/.test(ch) && i > 0 && /[\s)]/.test(sql[i - 1])) {
-                  const m = sql.slice(i).match(/^(UNION\s+ALL|UNION\s+DISTINCT|UNION|INTERSECT\s+ALL|INTERSECT|EXCEPT\s+ALL|EXCEPT)\b/i);
+              else if (depth === 0 && /[uiemUIEM]/.test(ch) && i > 0 && /[\s)]/.test(sql[i - 1])) {
+                  // MINUS / MINUS ALL は Oracle における EXCEPT の別名
+                  const m = sql.slice(i).match(/^(UNION\s+ALL|UNION\s+DISTINCT|UNION|INTERSECT\s+ALL|INTERSECT|EXCEPT\s+ALL|EXCEPT|MINUS\s+ALL|MINUS)\b/i);
                   if (m) {
                       parts.push({ sql: sql.slice(segStart, i).trim(), op: pendingOp });
-                      pendingOp = m[1].toUpperCase().replace(/\s+/g, ' ');
+                      pendingOp = m[1].toUpperCase().replace(/\s+/g, ' ').replace(/^MINUS/, 'EXCEPT');
                       i += m[0].length;
                       segStart = i;
                       continue;

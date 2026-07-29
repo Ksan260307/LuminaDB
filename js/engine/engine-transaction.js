@@ -110,6 +110,14 @@
           this.undoLog.push({ type: 'PROC_STATE', name, prev: cur ? [...cur] : undefined });
       },
 
+      // CREATE/DROP FUNCTION の undo ログ（変更前の定義を保存）
+      _logFunctionState(name) {
+          name = name.toLowerCase();
+          if (!this.inTransaction) return;
+          const cur = this.functions[name];
+          this.undoLog.push({ type: 'FUNC_STATE', name, prev: cur ? JSON.parse(JSON.stringify(cur)) : undefined });
+      },
+
       // CREATE/DROP TRIGGER の undo ログ（変更前の定義を保存）
       _logTriggerState(name) {
           name = name.toLowerCase();
@@ -184,6 +192,9 @@
           } else if (log.type === 'SEQ_STATE') {
               if (log.prev === undefined) delete this.sequences[log.name];
               else this.sequences[log.name] = { ...log.prev };
+          } else if (log.type === 'FUNC_STATE') {
+              if (log.prev === undefined) delete this.functions[log.name];
+              else this.functions[log.name] = JSON.parse(JSON.stringify(log.prev));
           }
           // type === 'SAVEPOINT' はマーカーのため何もしない
       },
