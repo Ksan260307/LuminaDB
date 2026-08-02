@@ -174,7 +174,8 @@
         allowedOrigins: [window.location.origin],
 
         // クエリ実行。params 指定時は '?' プレースホルダをバインドする
-        // 戻り値はエンジンと同じ { data, executionTime, scannedRows } または { error }
+        // 戻り値はエンジンと同じ { data, executionTime, scannedRows } または { error }。
+        // 警告が出た文では warnings: [{ Level, Code, Message }] が付く（SHOW WARNINGS と同じ内容）
         query(sql, params) {
             if (typeof sql !== 'string' || sql.trim() === '') return { error: 'Empty query' };
             let bound;

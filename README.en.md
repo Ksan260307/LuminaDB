@@ -4,7 +4,7 @@
 
 A build-free, in-memory SQL database engine that runs entirely in the browser. Open a single HTML file and you get a full SQL engine (DQL / DML / DDL), transactions, window functions, triggers, views, commercial-DB commands such as `MERGE` / `TOP` / `ON CONFLICT`, and 270+ built-in functions — with no server.
 
-> Version: **v1.17.0** / Self-contained tests: **7,091** (all passing — including 780+ security and 490+ performance tests)
+> Version: **v1.22.0** / Self-contained tests: **7,772** (all passing — including 780+ security and 490+ performance tests)
 
 ---
 
@@ -237,6 +237,302 @@ Each table carries a `version:rowCount:capacity` fingerprint, and tables whose f
 unchanged are not rewritten. Measured on a 60,000-row database: a full first save takes 25 ms,
 while a save after touching one small table takes **2 ms** (a no-op save is 1 ms, 0 tables written).
 
+### Added in v1.22 — date arithmetic, hierarchical queries, analytic functions
+
+```sql
+-- Date arithmetic (previously string concatenation or NULL)
+SELECT DATE '2026-01-01' + 30                AS due;      -- 2026-01-31
+SELECT CURRENT_DATE - 7                      AS week_ago;
+SELECT DATE '2026-03-01' - DATE '2026-01-01' AS days;     -- 59
+SELECT nm, hire + 90 AS probation_end FROM emp;           -- works on DATE columns too
+
+-- Oracle hierarchical queries
+SELECT nm, LEVEL, SYS_CONNECT_BY_PATH(nm, '/') AS path, CONNECT_BY_ISLEAF AS leaf
+FROM emp
+START WITH mgr IS NULL
+CONNECT BY PRIOR id = mgr
+ORDER SIBLINGS BY nm;
+
+SELECT name FROM users WHERE ROWNUM <= 3;                 -- the classic top-n idiom
+SELECT nm FROM (SELECT nm FROM emp ORDER BY sal DESC) WHERE ROWNUM <= 3;
+
+-- Analytic functions
+SELECT nm, RATIO_TO_REPORT(sal) OVER (PARTITION BY dept)          AS share FROM emp;
+SELECT DISTINCT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sal) OVER () AS median FROM emp;
+SELECT NTH_VALUE(nm, 2) FROM LAST OVER (ORDER BY id)              AS second_last FROM emp;
+SELECT MAX(sal) KEEP (DENSE_RANK FIRST ORDER BY hire)             AS earliest_hire_sal FROM emp;
+
+-- DDL fixes and additions
+TRUNCATE TABLE t1, t2;                                    -- previously only the first table was emptied
+ALTER TABLE t ADD COLUMN len INTEGER GENERATED ALWAYS AS (LENGTH(nm)) STORED;
+CREATE INDEX ix ON t (nm) INCLUDE (v);
+CREATE INDEX CONCURRENTLY ix2 ON t (v);
+SET CONSTRAINTS ALL IMMEDIATE;
+SHOW SCHEMAS;
+SHOW TRANSACTION ISOLATION LEVEL;
+
+-- RETURNING now works with upserts (only rows actually written come back)
+INSERT INTO t (id, nm) VALUES (1, 'a') ON CONFLICT (id) DO NOTHING RETURNING id;
+INSERT INTO t (id, nm) VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET nm = 'b' RETURNING id, nm;
+
+-- PostgreSQL match operators
+SELECT * FROM t WHERE nm ~  '^A';      -- regex
+SELECT * FROM t WHERE nm ~* '^a';      -- case-insensitive
+SELECT * FROM t WHERE nm !~~ 'A%';     -- NOT LIKE
+SELECT CURRENT_CATALOG AS db;
+```
+
+**Fixed**: `DATE '2026-01-01' + 1` concatenated into `'2026-01-01 00:00:001'` and `date - date`
+returned NULL — both are real arithmetic now, including on DATE-typed columns.
+`TRUNCATE TABLE t1, t2` reported success but only emptied the first table.
+`CREATE INDEX ... INCLUDE (...)` and `MAX(x) KEEP (DENSE_RANK ...)` failed with a raw
+JavaScript parse error instead of being supported. `CREATE TABLE ... WITH SYSTEM VERSIONING`
+and other trailing table options were silently discarded; they are accepted with a warning,
+and `FOR SYSTEM_TIME` now says plainly that it is unsupported.
+
+UI additions:
+
+| Feature | Problem it solves | How to use |
+|---------|-------------------|------------|
+| **Column profile** | Answering "what is actually in this column" meant writing SQL every time | The chart icon on a table row. Lists row count, nulls and their share, distinct values, min/max, average, length range and the three most common values. Click a column name to load a distribution query |
+| **ER diagram** | Foreign-key relationships were nowhere on screen | The `ER図` button at the top of the sidebar. Parents on top, children below, foreign keys drawn as arrows. Click a table for a `SELECT`, `Copy SVG` to copy the drawing |
+
+### Added in v1.21 — windows over groups, real COLLATE, statement warnings
+
+```sql
+-- Window functions over GROUP BY output (percent of total, group ranking, running totals)
+SELECT dept,
+       SUM(salary)                                            AS total,
+       ROUND(SUM(salary) * 100.0 / SUM(SUM(salary)) OVER (), 1) AS pct,
+       RANK() OVER (ORDER BY SUM(salary) DESC)                AS rk,
+       SUM(SUM(salary)) OVER (ORDER BY dept)                  AS running
+FROM emp GROUP BY dept;
+
+-- Column-level COLLATE now actually applies (comparison, IN, BETWEEN,
+-- ORDER BY, GROUP BY, DISTINCT, UNIQUE / PK)
+CREATE TABLE m (id INTEGER PRIMARY KEY, nm TEXT COLLATE NOCASE UNIQUE);
+SELECT * FROM m WHERE nm = 'APPLE';        -- matches 'Apple'
+SELECT DISTINCT nm FROM m ORDER BY nm;     -- folds case for both
+
+-- ORDER BY ALL / GROUPING_ID
+SELECT region, product FROM sales ORDER BY ALL DESC;
+SELECT region, product, SUM(amt), GROUPING_ID(region, product) AS gid
+FROM sales GROUP BY CUBE(region, product);
+
+-- Standard ALTER COLUMN spellings, a conversion expression, and constraint renaming
+ALTER TABLE t ALTER COLUMN amt SET DATA TYPE FLOAT;
+ALTER TABLE t ALTER COLUMN s TYPE INTEGER USING LENGTH(s);
+ALTER TABLE t RENAME CONSTRAINT uq_old TO uq_new;
+
+-- Choose what happens to a value written into an identity column
+INSERT INTO t (id, nm) OVERRIDING SYSTEM VALUE VALUES (99, 'a');  -- keep the given value
+INSERT INTO t (id, nm) OVERRIDING USER VALUE   VALUES (99, 'b');  -- discard it, auto-number
+
+-- JOIN LATERAL ... ON TRUE (LEFT / INNER / CROSS)
+SELECT u.name, x.c FROM users u
+JOIN LATERAL (SELECT COUNT(*) AS c FROM orders o WHERE o.user_id = u.id) x ON TRUE;
+
+-- Subscripts and slices, 1-based as SQL requires (arrays, strings, JSON)
+SELECT ARRAY[10, 20, 30, 40][2]    AS second;   -- 20
+SELECT ARRAY[10, 20, 30, 40][2:3]  AS slice;    -- [20, 30]
+SELECT ('hello')[2:4]              AS sub;      -- 'ell'
+
+-- Non-fatal problems are recorded as warnings; the statement still runs
+UPDATE emp SET salary = 0;      -- whole-table update with no WHERE
+SHOW WARNINGS;                  -- read what the previous statement reported
+SHOW COUNT(*) WARNINGS;
+```
+
+**Fixed**: a column-level `COLLATE` was parsed and stored but never applied, so
+`WHERE nm = 'APPLE'` silently missed `'Apple'` and a `NOCASE UNIQUE` column happily accepted
+both spellings. Collated columns now also bypass the hash-index fast path (indexes are built
+on raw values, so an index lookup would miss the folded match). Array subscripts leaked
+JavaScript's 0-based indexing; they are now 1-based, with slices. Window functions over
+`GROUP BY` output are evaluated after `HAVING`, so filtered-out groups no longer affect
+percentages or rankings.
+
+UI additions:
+
+| Feature | Problem it solves | How to use |
+|---------|-------------------|------------|
+| **Editor tabs** | Trying another query meant either discarding the draft or piling everything into one editor | Tabs above the editor. `+` (`Ctrl+Alt+T`) adds, `x` (`Ctrl+Alt+W`) closes, `Alt+1`-`9` switches. Names are derived from the SQL and can be renamed by double-clicking. Text and undo history are per tab and are saved in the browser, so they survive a reload |
+| **Warnings in the console** | A no-op `IF EXISTS` DDL or a `WHERE`-less full-table update only ever reported "Success" | They appear as `WRN` lines in the execution log console (``Ctrl+` ``); `SHOW WARNINGS` reads them from SQL |
+
+### Added in v1.20 — ordered aggregates, domains, set-returning functions
+
+```sql
+-- Ordered concat aggregates (the PostgreSQL / Oracle spelling)
+SELECT STRING_AGG(name, ',' ORDER BY salary DESC) AS names FROM emp;
+SELECT ARRAY_AGG(name ORDER BY id) AS arr FROM emp;
+
+-- Window functions are allowed in ORDER BY (and rejected in WHERE / GROUP BY with a reason)
+SELECT name FROM emp ORDER BY ROW_NUMBER() OVER (ORDER BY salary DESC);
+
+-- Bulk update from a literal list — the usual migration-script shape
+UPDATE emp SET salary = v.s FROM (VALUES (1, 111), (2, 222)) AS v(i, s) WHERE emp.id = v.i;
+DELETE FROM emp USING (VALUES (9)) AS d(i) WHERE emp.id = d.i;
+
+-- Set-returning functions in the SELECT list, and infix integer division
+SELECT UNNEST(ARRAY[1, 2, 3]) AS v;
+SELECT GENERATE_SERIES(1, 12) AS month;
+SELECT salary DIV 1000 AS band FROM emp;
+
+-- Domains and enums, enforced as column constraints
+CREATE DOMAIN pos_int AS INTEGER CHECK (VALUE > 0);
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE survey (id INTEGER, score pos_int, m mood);
+
+-- Users and roles (privileges are not enforced, but the scripts run)
+CREATE ROLE reporting;  GRANT SELECT ON emp TO reporting;  SHOW GRANTS;
+
+-- Empty the table but keep the numbering
+TRUNCATE TABLE audit CONTINUE IDENTITY;
+
+-- Recursive traversal order and cycle detection
+WITH RECURSIVE t(id, nm) AS (
+  SELECT id, nm FROM tree WHERE pid IS NULL
+  UNION ALL SELECT e.id, e.nm FROM tree e JOIN t s ON e.pid = s.id
+) SEARCH DEPTH FIRST BY id SET ord
+SELECT id, ord FROM t ORDER BY ord;
+
+WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT g.b FROM g JOIN t ON g.a = t.n)
+CYCLE n SET is_cycle USING path
+SELECT n, is_cycle, path FROM t;
+```
+
+**Performance**: `IN (value, ...)` now uses the hash index instead of a full scan;
+`EXPLAIN` reports it as `Index lookup of N value(s)`.
+
+**Fixed**: unaliased constant columns (`SELECT id, name, 0`) got integer-like keys and were
+reordered to the front of the result, so **the output column order did not match the SELECT
+list**; string constants leaked the internal `__STR_0__` token as a column name. Both now
+become `columnN`. Constructs real databases reject — nested aggregates, window functions in
+`WHERE` — now fail with an explanatory message instead of an internal one.
+
+UI additions:
+
+| Feature | Problem it solves | How to use |
+|---------|-------------------|------------|
+| **Row add / delete in the grid** | Cell editing worked, but adding or removing a row still meant writing SQL | Click a cell to select its row, then `− Row` to delete or `+ Row` to append a defaults-only row. Editable grids only; key values are parameter-bound |
+| **Query history panel** | `Ctrl+↑↓` cycling could not reach "that statement from a while back" | The `History` button lists past statements; search to narrow, click to load into the editor, `Run` to execute immediately |
+
+### Added in v1.19 — composite keys, sequences, MERGE and an editable grid
+
+```sql
+-- Composite foreign keys (the usual shape against a composite primary key)
+CREATE TABLE order_line (
+  order_id INTEGER, line_no INTEGER, sku TEXT,
+  FOREIGN KEY (order_id, line_no) REFERENCES shipment(order_id, line_no) ON DELETE CASCADE
+);
+ALTER TABLE order_line ADD CONSTRAINT fk_ship FOREIGN KEY (order_id, line_no) REFERENCES shipment(order_id, line_no);
+
+-- Sequence options and ALTER
+CREATE SEQUENCE ticket START WITH 100 INCREMENT BY 10 MINVALUE 1 MAXVALUE 999 CYCLE;
+ALTER SEQUENCE ticket RESTART WITH 500;
+
+-- DEFAULT accepts expressions, evaluated per inserted row
+CREATE TABLE audit (
+  id  INTEGER DEFAULT NEXTVAL('ticket'),
+  tag TEXT    DEFAULT UUID(),
+  n   INTEGER DEFAULT (1 + 2)
+);
+
+-- Conditional MERGE clauses and actions on rows the source does not cover
+MERGE INTO target t USING source s ON t.id = s.id
+  WHEN MATCHED AND t.qty <> s.qty THEN UPDATE SET qty = s.qty
+  WHEN MATCHED AND s.qty = 0      THEN DELETE
+  WHEN NOT MATCHED AND s.qty > 0  THEN INSERT (id, qty) VALUES (s.id, s.qty)
+  WHEN NOT MATCHED BY SOURCE      THEN DELETE;
+
+-- Upsert additions
+INSERT INTO counter (id, hits) VALUES (1, 5) ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits);
+INSERT INTO counter (id, hits) VALUES (1, 5)
+  ON CONFLICT (id) DO UPDATE SET hits = EXCLUDED.hits WHERE counter.hits < EXCLUDED.hits;
+
+-- View column lists (the view stays updatable)
+CREATE VIEW v_user (uid, uname) AS SELECT id, name FROM users;
+UPDATE v_user SET uname = 'Bobby' WHERE uid = 2;
+
+-- DDL and metadata
+ALTER INDEX ix_old RENAME TO ix_new;
+SHOW TABLE STATUS LIKE 'user%';
+CREATE TABLE snapshot_shape AS SELECT * FROM users WITH NO DATA;
+CREATE GLOBAL TEMPORARY TABLE scratch (a INTEGER);
+```
+
+Nested aggregates (`MAX(SUM(x))`) used to fail with a confusing "column not found"; they now
+report that aggregates cannot be nested and suggest computing the inner one in a subquery.
+
+UI additions:
+
+| Feature | Problem it solves | How to use |
+|---------|-------------------|------------|
+| **Editable result grid** | Fixing one value meant writing an `UPDATE` | **Double-click** a cell to edit; Enter commits, Esc cancels. Enabled only for a single-table SELECT whose result carries a key column (PK / UNIQUE) — the toolbar badge shows whether it is editable and why not. Values are always parameter-bound, so quotes and semicolons are stored as data |
+| **Copy as Markdown / INSERT** | Moving results into a ticket or another database was manual | `Copy MD` copies a Markdown table (escaping `\|` and newlines); `Copy INSERT` copies `INSERT` statements (doubling quotes) |
+| **Shortcut reference** | Nothing on screen listed the available keys | The `?` button in the toolbar, or press `?`. Esc closes any open modal |
+
+### Added in v1.18 — commercial-SQL parity and client-grade UI
+
+```sql
+-- Type conversion with precision (DECIMAL rounds to scale; VARCHAR/CHAR truncate to length)
+SELECT CAST(1.005 AS DECIMAL(10,2)) AS rounded;   -- 1.01, matching MySQL's rounding
+SELECT CAST(12345 AS VARCHAR(3)) AS truncated;    -- '123'
+SELECT CONVERT(DECIMAL(5,1), 3.14159) AS s;       -- SQL Server argument order also accepted
+
+-- Updatable views: a projection + selection over one table accepts INSERT / UPDATE / DELETE
+CREATE VIEW v_active AS SELECT id, name FROM users WHERE age >= 30 WITH CHECK OPTION;
+UPDATE v_active SET name = 'Bobby' WHERE id = 2;  -- rewritten against the base table
+INSERT INTO v_active (id, name) VALUES (99, 'x'); -- CHECK OPTION rejects rows outside the view
+
+-- Aggregate views become writable through an INSTEAD OF trigger
+CREATE TRIGGER tg_sum INSTEAD OF INSERT ON v_totals FOR EACH ROW
+  INSERT INTO orders (user_id, amount) VALUES (NEW.user_id, NEW.total);
+
+-- Column-level foreign keys (previously the constraint was silently dropped)
+CREATE TABLE child (id INTEGER, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE);
+CREATE TABLE child2 (id INTEGER, pid INTEGER REFERENCES parent);  -- resolves to the PK
+
+-- JSON access operators and partial updates
+SELECT payload ->> 'name' AS name, payload -> 'tags' AS tags FROM events;
+SELECT payload #>> '{addr,city}' AS city FROM events;
+SELECT COUNT(*) FROM events WHERE payload @> '{"kind":"click"}';
+SELECT JSON_INSERT(payload, '$.seen', TRUE) FROM events;    -- writes missing paths only
+SELECT JSON_REPLACE(payload, '$.seen', FALSE) FROM events;   -- writes existing paths only
+
+-- Boolean predicates (three-valued: NULL is neither TRUE nor FALSE)
+SELECT * FROM users WHERE (age > 30) IS NOT TRUE;
+
+-- Named constraints and table aliases in DML
+ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id);
+ALTER TABLE orders DROP CONSTRAINT fk_user;
+UPDATE orders o SET o.amount = o.amount + 1 WHERE o.order_id = 1001;
+DELETE FROM orders o WHERE o.amount = 0;
+
+-- Row-constructor IN with a subquery
+SELECT * FROM orders WHERE (user_id, product_id) IN (SELECT user_id, product_id FROM archive);
+
+-- Index key ordering, expression keys, and array-to-rows
+CREATE INDEX ix_price ON products (price DESC, name ASC NULLS LAST);
+CREATE INDEX ix_lname ON users (LOWER(name));
+SELECT SUM(v) FROM UNNEST(ARRAY[1, 2, 3]) AS t(v);
+SELECT v, n FROM UNNEST(ARRAY['a','b']) WITH ORDINALITY AS t(v, n);
+```
+
+New metadata views: `INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS`, `CHECK_CONSTRAINTS`,
+`STATISTICS`, `TRIGGERS`, `PARAMETERS`, plus `SHOW INDEX` / `SHOW KEYS` (MySQL spellings
+of `SHOW INDEXES`).
+
+UI additions, matching what DBeaver / pgAdmin / SSMS give you day to day:
+
+| Feature | Problem it solves | How to use |
+|---------|-------------------|------------|
+| **Result grid filter** | Finding one row in thousands meant editing the SQL's `WHERE` every time | Filter box above the grid (substring match across all columns; the footer shows filtered / total) |
+| **Cell detail view** | Long text and JSON were clipped inside the cell | Click a cell for its type, length and raw value — JSON pretty-prints and copies in one click |
+| **Expandable schema tree** | Checking columns and constraints required typing `DESCRIBE` | The ▶ next to a table expands it; each column shows its type and `PK` / `FK` / `UQ` / `NN` / `AI` / `GEN` badges, and clicking inserts the column name at the caret |
+| **More object sections** | Only views and triggers were listed | Indexes / Sequences / Procedures / Functions sections (views show their `CHECK OPTION`) |
+| **Transaction bar** | `BEGIN` / `COMMIT` / `ROLLBACK` were typed by hand and nothing showed uncommitted state | Begin / Commit / Rollback buttons with a live indicator and pending-change count (auto-save pauses inside a transaction) |
+| **Run the statement at the caret** | You could not try one statement from a scratchpad of many | `Ctrl+Enter` runs only the statement under the cursor (`Ctrl+Shift+Enter` still runs everything); semicolons inside string literals are not treated as separators |
+
 ### Added in v1.17
 
 | Feature | Problem it solves | API |
@@ -346,6 +642,11 @@ The 7,000+ self-contained tests can be run two ways. The main suites are:
 | `test-suite-v20.js` | 275 | v1.15 syntax and the browser-DB essentials, including security checks and time budgets for the new entry points (procedure locals, `JSON_TABLE` paths, `MATCH` terms, backup import, worker messages) |
 | `test-suite-v21.js` | 185 | v1.16 procedural SQL (cursors, handlers, `SIGNAL`, `CASE` statement), range/JSON/time-series predicates, incremental persistence and streaming reads — including security checks on cursor values and `SIGNAL` message text |
 | `test-suite-v22.js` | 180 | v1.17 arrays, regression aggregates, fuzzy matching, time-series generation, window extras, the compile cache, CSV import and leader election — including security checks on CSV fields/headers and array elements |
+| `test-suite-v23.js` | 203 | v1.18 precision `CAST`/`CONVERT`, updatable views and `WITH CHECK OPTION`, `INSTEAD OF` triggers, column-level `REFERENCES`, JSON access operators, `IS [NOT] TRUE/FALSE`, named constraints, DML aliases, row-constructor `IN (SELECT)`, index key ordering/expression keys, metadata views and `UNNEST` — plus the UI (result filter, cell detail, tree expansion, transaction bar, run-at-caret) |
+| `test-suite-v24.js` | 124 | v1.19 composite `FOREIGN KEY`, sequence options and `ALTER SEQUENCE`, `DEFAULT` expressions, conditional `MERGE` clauses and `NOT MATCHED BY SOURCE`, `VALUES(col)` / `ON CONFLICT ... WHERE`, view column lists, `ALTER INDEX RENAME` / `SHOW TABLE STATUS` / `WITH [NO] DATA`, nested-aggregate diagnostics — plus the UI (editable grid, copy formats, shortcuts), including a check that edited cell values are bound rather than concatenated into SQL |
+| `test-suite-v27.js` | 123 | v1.22 date arithmetic (date ± integer, date − date), Oracle hierarchical queries (`CONNECT BY`, `LEVEL`, `SYS_CONNECT_BY_PATH`, `CONNECT_BY_ROOT`, `NOCYCLE`) and `ROWNUM`, analytic functions (`RATIO_TO_REPORT`, `PERCENTILE_* OVER`, `NTH_VALUE ... FROM LAST`, `KEEP (DENSE_RANK ...)`), multi-table `TRUNCATE`, `CREATE INDEX ... INCLUDE`/`CONCURRENTLY`, generated columns via `ADD COLUMN`, `SET CONSTRAINTS`, `RETURNING` with upserts, PostgreSQL match operators — plus the UI (column profile, ER diagram) |
+| `test-suite-v26.js` | 115 | v1.21 window functions over `GROUP BY` output, column-level `COLLATE` made effective (comparison, `IN`, `BETWEEN`, `ORDER BY`, `GROUP BY`, `DISTINCT`, `UNIQUE`, index-path bypass), `ORDER BY ALL` / `GROUPING_ID`, `ALTER COLUMN ... SET DATA TYPE` / `TYPE ... USING`, `RENAME CONSTRAINT`, `INSERT ... OVERRIDING VALUE`, `JOIN LATERAL ... ON TRUE`, 1-based subscripts and slices, statement warnings and `SHOW WARNINGS` — plus the UI (editor tabs, warnings in the console) |
+| `test-suite-v25.js` | 110 | v1.20 ordered concat aggregates, window functions in `ORDER BY`, derived-table sources for `UPDATE`/`DELETE`, set-returning functions in the SELECT list, the `DIV` operator, `CREATE DOMAIN`/`TYPE AS ENUM`, users and roles, `TRUNCATE CONTINUE IDENTITY`, recursive `SEARCH`/`CYCLE`, index-backed `IN`, constant-column naming — plus the UI (row add/delete, query history), including a check that deleted-row key values are bound |
 
 The security suite takes 28 attacker-controlled payloads and pushes each through 10 entry points (`?` binding, named binding, `insert`, `update`, `select`, `remove`, `prepare`, SQL prepared statements, `WHERE`, `LIKE`), asserting every time that the payload **(a) is never evaluated as JS, (b) never changes the SQL structure, and (c) round-trips unchanged as data**.
 

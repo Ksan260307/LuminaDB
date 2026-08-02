@@ -3,7 +3,7 @@
     // 各機能メソッドは engine-*.js で prototype 拡張として定義される
     // ============================================================================
     // エンジンバージョン（VERSION() 関数 / SHOW STATUS / 外部APIが参照する）
-    var LUMINA_VERSION = '1.17.0';
+    var LUMINA_VERSION = '1.22.0';
 
     class DatabaseEngine {
       constructor() {
@@ -14,6 +14,15 @@
         this.procedures = Object.create(null);
         // トリガー定義: name -> { name, timing, event, table, statements }
         this.triggers = Object.create(null);
+        // ビューの付随情報: name -> { checkOption: 'LOCAL'|'CASCADED' }。
+        // 本体（SELECT文）は views 側に持つ。IDB保存対象
+        this.viewMeta = Object.create(null);
+        // ユーザー定義ドメイン / 列挙型: name -> { base, check, values }。
+        // 列の型として使うと基底型へ展開し、CHECK / 値集合を列制約として付ける。IDB保存対象
+        this.domains = Object.create(null);
+        // ロール・ユーザー（LuminaDB に認証機構は無い。移行スクリプトを通すための名簿）。
+        // IDB保存対象外（セッション限り）
+        this.roles = Object.create(null);
         // ユーザー変数 (SET @name = ...)。セッション限り（IDB保存対象外）
         this.userVars = Object.create(null);
         // プリペアドステートメント (PREPARE name FROM '...')。セッション限り・非トランザクション
@@ -56,8 +65,22 @@
         this.lastInsertId = 0;
         // 相関サブクエリの文単位レジストリ（executeQuery のトップレベルでリセット）
         this._corrSubs = [];
+        // 文単位の警告。SHOW WARNINGS がこれを読む（その文自身ではリセットしない）
+        this._warnings = [];
+        this._isShowWarnings = false;
         this._attachEngineRef();
         this._initDefaultData();
+      }
+
+      // 致命的でない問題を「警告」として記録する。エラーと違い実行は続行し、
+      // 直後の SHOW WARNINGS と結果オブジェクトの warnings で確認できる
+      // （黙って成功したように見える操作を可視化するのが狙い）
+      _warn(code, message) {
+          if (!this._warnings) this._warnings = [];
+          // 同一文中の重複は 1 件にまとめ、総数は上限で打ち切る（暴走防止）
+          if (this._warnings.length >= 64) return;
+          if (this._warnings.some(w => w.Code === code && w.Message === message)) return;
+          this._warnings.push({ Level: 'Warning', Code: code, Message: message });
       }
 
       // タイプミス提案用の簡易編集距離（挿入/削除/置換）。長さ差2超は早期棄却
@@ -172,6 +195,10 @@
             strMap = [];
             // 相関サブクエリのレジストリは文単位（コンパイル済み式が実行中に参照する）
             this._corrSubs = [];
+            // 警告も文単位。ただし SHOW WARNINGS / SHOW COUNT(*) WARNINGS は
+            // 「直前の文」の警告を読む文なので、この 2 つだけはリセットしない（MySQL と同じ）
+            this._isShowWarnings = /^\s*show\s+(?:count\s*\(\s*\*\s*\)\s+)?warnings\b/i.test(sql);
+            if (!this._isShowWarnings) this._warnings = [];
             sql = this._maskStrings(sql, strMap);
             // 文単位の実行時間上限。ネストした executeQuery は最上位の期限を引き継ぐ
             this._deadline = this.statementTimeoutMs > 0 ? (startTime + this.statementTimeoutMs) : 0;
@@ -243,11 +270,18 @@
           // 複数表 UPDATE/DELETE（... FROM src / ... USING src / ... JOIN src）は
           // サブクエリ展開の前に単一表＋相関サブクエリの形へ書き換える
           if (!isSubquery && /^(update|delete)\b/i.test(sql)) {
+              // 派生表のソース（FROM (VALUES ...) / FROM (SELECT ...)）を先に実体化してから
+              // 単一表＋相関サブクエリの形へ書き換える
+              sql = this._materializeDmlSources(sql, strMap);
               sql = this._rewriteMultiTableDml(sql);
           }
 
+          // SHOW 文の FROM はメタデータの対象指定（`SHOW COLUMNS FROM v` / `SHOW TRIGGERS FROM v`）
+          // であってクエリのデータ源ではない。ビュー展開に通すと名前が SELECT へ
+          // 書き換わって対象が特定できなくなるため除外する
           if (!isSubquery
               && !/^create\s+(or\s+replace\s+)?(view|procedure|trigger|function)\b/i.test(sql)
+              && !/^show\b/i.test(sql)
               && !/^merge\s+into\b/i.test(sql)) {
               sql = this.expandInfoSchema(sql);
               sql = this.expandViews(sql, strMap);
@@ -305,17 +339,24 @@
              affectedRows = res.affectedRows;
           }
           else if (/^(insert|replace)\b/i.test(sql)) {
-             const res = this._executeInsert(sql, strMap);
+             // 対象がビューなら基底表への書き換え経路（更新可能ビュー）へ回す
+             const res = this._viewDmlTarget('insert', sql)
+                 ? this._executeViewDml('insert', sql, strMap)
+                 : this._executeInsert(sql, strMap);
              resultSet = res.data;
              affectedRows = res.affectedRows;
           }
           else if (/^update/i.test(sql)) {
-             const res = this._executeUpdate(sql, strMap);
+             const res = this._viewDmlTarget('update', sql)
+                 ? this._executeViewDml('update', sql, strMap)
+                 : this._executeUpdate(sql, strMap);
              resultSet = res.data;
              affectedRows = res.affectedRows;
           }
           else if (/^delete/i.test(sql)) {
-             const res = this._executeDelete(sql, strMap);
+             const res = this._viewDmlTarget('delete', sql)
+                 ? this._executeViewDml('delete', sql, strMap)
+                 : this._executeDelete(sql, strMap);
              resultSet = res.data;
              affectedRows = res.affectedRows;
           }
@@ -439,6 +480,12 @@
              const res = this._executeDDL(sql, strMap);
              resultSet = res.data;
              affectedRows = res.affectedRows || 0;
+             // IF EXISTS / IF NOT EXISTS で何もしなかった DDL は「成功」を返すが、
+             // 移行スクリプトでは取りこぼしに気づけない。警告として残す
+             if (resultSet && resultSet.length === 1 && typeof resultSet[0].Message === 'string'
+                 && /\bSkipped\.$/.test(resultSet[0].Message)) {
+                 this._warn('DDL_NOOP', resultSet[0].Message);
+             }
           }
           else {
              throw new Error("Syntax Error or Unsupported Command.");
@@ -447,18 +494,23 @@
         } catch (e) {
           if (!isSubquery) this.cleanupTempTables();
           if (isTopLevel) { this._deadline = 0; this._recordProfile(rawSql, startTime, -1, e.message); }
-          return { error: e.message };
+          return this._warnings && this._warnings.length > 0
+              ? { error: e.message, warnings: this._warnings.slice() }
+              : { error: e.message };
         }
 
         if (!isSubquery) this.cleanupTempTables();
 
         const executionTime = performance.now() - startTime;
         if (isTopLevel) { this._deadline = 0; this._recordProfile(rawSql, startTime, resultSet ? resultSet.length : 0, null); }
-        return {
+        const out = {
           data: resultSet,
           executionTime: Math.max(0.01, executionTime).toFixed(2),
           scannedRows: affectedRows
         };
+        // SHOW WARNINGS 自身の結果には（読み取った）警告を重ねて付けない
+        if (!this._isShowWarnings && this._warnings && this._warnings.length > 0) out.warnings = this._warnings.slice();
+        return out;
       }
 
       // 実行時間の上限チェック。行ループの内側から一定間隔で呼ばれる。

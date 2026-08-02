@@ -29,6 +29,18 @@
         renderDisplay(true);
     });
 
+    // 絞り込み後の行配列を返す。どの列でも部分一致（大文字小文字を無視）すれば残す。
+    // 商用DBクライアントのグリッドフィルタと同じ「まず全部取ってから目で探す」用途
+    function filteredResultData() {
+        if (!currentResultData) return currentResultData;
+        const q = resultFilter.trim().toLowerCase();
+        if (q === '') return currentResultData;
+        return currentResultData.filter(row => Object.values(row).some(v => {
+            if (v === null || v === undefined) return 'null'.includes(q);
+            return String(v).toLowerCase().includes(q);
+        }));
+    }
+
     function renderDisplay(reset = true) {
        if (reset) {
            els.resArea.innerHTML = '';
@@ -41,15 +53,25 @@
           return;
        }
 
+       // 列見出しは元データ由来（絞り込みで 0 件になっても列は保つ）
+       const keys = Object.keys(currentResultData[0]);
+       const filtered = filteredResultData();
+       if (filtered.length === 0) {
+          if (reset) {
+              els.resArea.innerHTML = `<div class="m-auto text-gray-500 text-sm">`
+                  + `「${escapeHtml(resultFilter)}」に一致する行がありません（全 ${currentResultData.length.toLocaleString()} 件）。</div>`;
+          }
+          return;
+       }
+
        const limitVal = els.dispLimit.value;
-       const limit = limitVal === 'all' ? currentResultData.length : parseInt(limitVal, 10);
-       const targetData = currentResultData.slice(0, limit);
+       const limit = limitVal === 'all' ? filtered.length : parseInt(limitVal, 10);
+       const targetData = filtered.slice(0, limit);
 
        if (currentDisplayOffset >= targetData.length) return;
 
        const chunk = targetData.slice(currentDisplayOffset, currentDisplayOffset + CHUNK_SIZE);
-
-       const keys = Object.keys(currentResultData[0]);
+       const chunkStart = currentDisplayOffset;
        let ths = `<tr>${keys.map(k => {
            let sortIcon = '<span class="text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity ml-1">⇅</span>';
            if (currentSort.col === k) {
@@ -60,22 +82,26 @@
            return `<th class="px-4 py-2 font-semibold border-r border-gray-200 last:border-0 sticky top-0 bg-gray-100 shadow-sm z-20 cursor-pointer hover:bg-gray-200 select-none group" data-col="${escapeHtml(k)}">${escapeHtml(k)}${sortIcon}</th>`;
        }).join('')}</tr>`;
 
-       let trs = chunk.map(row => {
-          let tds = Object.values(row).map(v => {
+       let trs = chunk.map((row, ri) => {
+          // data-r / data-c は「クリックされたセルの元の値」を引くための座標。
+          // 属性なので td の子要素は増えない（セル値のエスケープ検証テストが要求する）
+          const rowIdx = chunkStart + ri;
+          let tds = Object.values(row).map((v, ci) => {
+             const pos = ` data-r="${rowIdx}" data-c="${ci}"`;
              // XSS対策: セル値は必ずエスケープしてから innerHTML へ挿入する
              const esc = escapeHtml(v);
              if(v==="Success"||v==="PASS"||(typeof v==='string' && (v.includes("inserted")||v.includes("updated")||v.includes("deleted")))){
-                 return `<td class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-green-600 font-medium">${esc}</td>`;
+                 return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-green-600 font-medium">${esc}</td>`;
              }
              if(v==="FAIL"||(typeof v==='string' && v.includes("Assertion") && !v.includes("not found"))){
-                 return `<td class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-red-600 font-medium">${esc}</td>`;
+                 return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-red-600 font-medium">${esc}</td>`;
              }
-             if(typeof v==='number') return `<td class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-blue-600">${v}</td>`;
-             if(typeof v==='boolean') return `<td class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-purple-600 font-semibold">${v}</td>`;
-             if(v===null) return `<td class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-gray-400 italic">null</td>`;
+             if(typeof v==='number') return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-blue-600">${v}</td>`;
+             if(typeof v==='boolean') return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-purple-600 font-semibold">${v}</td>`;
+             if(v===null) return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-gray-400 italic">null</td>`;
              // エラーメッセージの特別なハイライト
-             if(typeof v==='string' && (v.includes("not found") || v.includes("Type mismatch") || v.includes("Foreign key constraint failed"))) return `<td class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-red-600 font-bold bg-red-50">${esc}</td>`;
-             return `<td class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-gray-700">${esc}</td>`;
+             if(typeof v==='string' && (v.includes("not found") || v.includes("Type mismatch") || v.includes("Foreign key constraint failed"))) return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-red-600 font-bold bg-red-50">${esc}</td>`;
+             return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-gray-700">${esc}</td>`;
           }).join('');
           return `<tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0">${tds}</tr>`;
        }).join('');
@@ -100,7 +126,11 @@
        const noteEl = els.resArea.querySelector('#resultsNote');
        if (noteEl) {
            if (currentDisplayOffset >= targetData.length) {
-               noteEl.innerHTML = `Showing top ${targetData.length.toLocaleString()} rows out of ${currentResultData.length.toLocaleString()}.`;
+               const base = `Showing top ${targetData.length.toLocaleString()} rows out of ${filtered.length.toLocaleString()}`;
+               // 絞り込み中は「絞り込み後の件数 / 全件数」の両方を出す
+               noteEl.textContent = resultFilter.trim() === ''
+                   ? `${base}.`
+                   : `${base} (filtered from ${currentResultData.length.toLocaleString()}).`;
                noteEl.classList.remove('hidden');
            } else {
                noteEl.classList.add('hidden');
@@ -108,17 +138,237 @@
        }
     }
 
-    // データセルのクリックでその値をクリップボードへコピーする（ヘッダーのソートとは別経路）
+    // データセルのクリックで詳細モーダルを開く（長いテキストや JSON をそのまま読むため）。
+    // ヘッダーのソートは別のリスナーが担当する
+    // シングルクリックは詳細表示、ダブルクリックはセル編集。ダブルクリックの
+    // 1 打目でモーダルが開いてしまわないよう、詳細表示は少し遅らせて出す
+    let cellClickTimer = null;
     els.resArea.addEventListener('click', (e) => {
         const td = e.target.closest('td');
-        if (!td) return;
-        const text = td.textContent === 'null' ? '' : td.textContent;
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text).then(() => showToast('セルの値をコピーしました。')).catch(() => {});
+        if (!td || td.dataset.r === undefined) return;
+        if (activeEditor) return;   // 編集中は詳細を開かない
+        const show = () => {
+            const rows = filteredResultData();
+            const row = rows[Number(td.dataset.r)];
+            if (!row) return;
+            const keys = Object.keys(row);
+            const col = keys[Number(td.dataset.c)];
+            openCellModal(col, row[col]);
+        };
+        clearTimeout(cellClickTimer);
+        // 編集可のときだけ待つ（ダブルクリックの1打目で詳細が開かないように）。
+        // 読み取り専用ならダブルクリックの用途が無いので即座に開く
+        if (editContext.editable) cellClickTimer = setTimeout(show, 220);
+        else show();
+    });
+
+    // セル詳細モーダル: 型・長さ・生の値を出し、JSON ならワンクリックで整形できる
+    function openCellModal(col, value) {
+        const raw = value === null || value === undefined ? '' : String(value);
+        document.getElementById('cellModalCol').textContent = col === undefined ? '' : col;
+        document.getElementById('cellModalType').textContent = value === null ? 'null' : typeof value;
+        document.getElementById('cellModalLen').textContent = String(raw.length);
+        const pre = document.getElementById('cellModalValue');
+        pre.textContent = value === null ? 'NULL' : raw;
+        const prettyBtn = document.getElementById('cellModalPretty');
+        let parsed;
+        try { parsed = (raw.trim()[0] === '{' || raw.trim()[0] === '[') ? JSON.parse(raw) : undefined; } catch (err) { parsed = undefined; }
+        prettyBtn.classList.toggle('hidden', parsed === undefined);
+        prettyBtn.onclick = () => { pre.textContent = JSON.stringify(parsed, null, 2); };
+        document.getElementById('cellModalCopy').onclick = () => {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(pre.textContent).then(() => showToast('セルの値をコピーしました。')).catch(() => {});
+            }
+        };
+        openModal('cellModal');
+    }
+
+    // ============================================================================
+    // 結果グリッドの直接編集
+    // 単一表への単純な SELECT で、行を特定できる列（PK / UNIQUE）が結果に載っている
+    // ときだけ有効。セルをダブルクリックすると入力欄になり、Enter で基底表へ
+    // UPDATE を発行する。値は必ずプレースホルダでバインドする（SQL 組み立てを避ける）
+    // ============================================================================
+    function setEditContext(sql) {
+        editContext = sql ? db.analyzeEditableSelect(sql) : { editable: false, reason: 'run a SELECT first' };
+        renderEditBadge();
+        // 新しい結果セットでは行選択を解除する（行番号が別の行を指してしまうため）
+        selectedRowIdx = null;
+        setRowActionsEnabled();
+    }
+
+    function renderEditBadge() {
+        const badge = document.getElementById('editBadge');
+        const text = document.getElementById('editBadgeText');
+        if (!badge || !text) return;
+        if (editContext.editable) {
+            badge.className = 'inline-flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded border text-[11px] font-medium border-blue-200 bg-blue-50 text-blue-700';
+            text.textContent = `Editable: ${editContext.table}`;
+            badge.title = `結果セルをダブルクリックすると ${editContext.table} を直接更新します（キー: ${editContext.keyCols.join(', ')}）`;
+        } else {
+            badge.className = 'inline-flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded border text-[11px] font-medium border-gray-200 bg-gray-50 text-gray-400';
+            text.textContent = 'Read-only';
+            badge.title = `直接編集できません: ${editContext.reason}`;
         }
+    }
+
+    // 編集中のセルはひとつだけ。多重に開かないよう参照を持つ
+    let activeEditor = null;
+
+    function closeCellEditor(restore) {
+        if (!activeEditor) return;
+        const { td, original } = activeEditor;
+        activeEditor = null;
+        if (restore) { td.textContent = original.text; td.classList.remove('bg-blue-50'); }
+    }
+
+    function beginCellEdit(td) {
+        if (!editContext.editable || activeEditor) return;
+        const rows = filteredResultData();
+        const row = rows[Number(td.dataset.r)];
+        if (!row) return;
+        const keys = Object.keys(row);
+        const col = keys[Number(td.dataset.c)];
+        // キー列そのものの編集は行の同定を壊すので許さない（実クライアントも同様）
+        if (editContext.keyCols.includes(col)) { showToast('キー列は直接編集できません。', true); return; }
+        const baseCol = editContext.colMap[col];
+        if (!baseCol) { showToast(`列 '${col}' は基底表の列ではないため編集できません。`, true); return; }
+
+        const original = { text: td.textContent, value: row[col] };
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = row[col] === null || row[col] === undefined ? '' : String(row[col]);
+        input.className = 'w-full bg-white border border-blue-400 rounded px-1 py-0.5 font-mono text-xs outline-none';
+        td.textContent = '';
+        td.classList.add('bg-blue-50');
+        td.appendChild(input);
+        activeEditor = { td, original, row, col, baseCol };
+        input.focus();
+        input.select();
+
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); commitCellEdit(input.value); }
+            else if (e.key === 'Escape') { e.preventDefault(); closeCellEditor(true); }
+        });
+        input.addEventListener('blur', () => { if (activeEditor) closeCellEditor(true); });
+    }
+
+    // 入力文字列を列の型に合わせた値へ寄せる。空欄は NULL 扱い
+    function coerceCellInput(text, prev) {
+        if (text === '') return null;
+        if (typeof prev === 'number' && text.trim() !== '' && !isNaN(text)) return Number(text);
+        if (typeof prev === 'boolean') {
+            const t = text.trim().toLowerCase();
+            if (t === 'true' || t === '1') return true;
+            if (t === 'false' || t === '0') return false;
+        }
+        return text;
+    }
+
+    function commitCellEdit(text) {
+        if (!activeEditor) return;
+        const { td, original, row, col, baseCol } = activeEditor;
+        const newVal = coerceCellInput(text, original.value);
+        activeEditor = null;
+        td.classList.remove('bg-blue-50');
+        if (newVal === original.value) { td.textContent = original.text; return; }
+
+        // 値もキーもすべてプレースホルダでバインドする（文字列連結による SQL 組み立てを避ける）
+        const keyBase = editContext.keyBase;
+        const where = keyBase.map(c => `${c} = ?`).join(' AND ');
+        const params = [newVal, ...editContext.keyCols.map(k => row[k])];
+        const sql = `UPDATE ${editContext.table} SET ${baseCol} = ? WHERE ${where}`;
+        let res;
+        try { res = LuminaDB.query(sql, params); } catch (e) { res = { error: e.message }; }
+        if (res && res.error) {
+            td.textContent = original.text;
+            showToast(res.error, true);
+            logToConsole('error', sqlSummary(sql), res.error, sql);
+            return;
+        }
+        row[col] = newVal;
+        renderDisplay(true);
+        renderTree();
+        triggerAutoSave();
+        showToast(`${editContext.table}.${baseCol} を更新しました。`);
+        logToConsole('query', sqlSummary(sql), `1 行処理 · セル編集`, sql);
+    }
+
+    els.resArea.addEventListener('dblclick', (e) => {
+        const td = e.target.closest('td');
+        if (td && td.dataset.r !== undefined) beginCellEdit(td);
+    });
+
+    // ============================================================================
+    // 行の追加・削除（編集可能なグリッドのみ）
+    // 対象行はセルのクリックで選ばれた行。実DBクライアントと同じく、
+    // 削除はキー列で 1 行だけを狙い撃ちする
+    // ============================================================================
+    let selectedRowIdx = null;
+
+    function highlightSelectedRow() {
+        els.resArea.querySelectorAll('#resultsTbody tr').forEach(tr => tr.classList.remove('bg-blue-50/60'));
+        if (selectedRowIdx === null) return;
+        const td = els.resArea.querySelector(`#resultsTbody td[data-r="${selectedRowIdx}"]`);
+        if (td && td.parentElement) td.parentElement.classList.add('bg-blue-50/60');
+    }
+
+    function setRowActionsEnabled() {
+        const add = document.getElementById('addRowBtn');
+        const del = document.getElementById('delRowBtn');
+        if (!add || !del) return;
+        add.disabled = !editContext.editable;
+        del.disabled = !editContext.editable || selectedRowIdx === null;
+    }
+
+    els.resArea.addEventListener('click', (e) => {
+        const td = e.target.closest('td');
+        if (!td || td.dataset.r === undefined) return;
+        selectedRowIdx = Number(td.dataset.r);
+        highlightSelectedRow();
+        setRowActionsEnabled();
+    });
+
+    document.getElementById('addRowBtn').addEventListener('click', () => {
+        if (!editContext.editable) return;
+        // 空行を1つ足す。既定値・AUTO_INCREMENT はエンジン側が埋める
+        const res = LuminaDB.query(`INSERT INTO ${editContext.table} DEFAULT VALUES`);
+        if (res && res.error) { showToast(res.error, true); return; }
+        showToast(`${editContext.table} に行を追加しました。`);
+        logToConsole('query', `INSERT INTO ${editContext.table} DEFAULT VALUES`, '1 行処理 · 行追加', `INSERT INTO ${editContext.table} DEFAULT VALUES`);
+        renderTree();
+        triggerAutoSave();
+        runQuery();   // 追加行を含めて取り直す
+    });
+
+    document.getElementById('delRowBtn').addEventListener('click', () => {
+        if (!editContext.editable || selectedRowIdx === null) return;
+        const rows = filteredResultData();
+        const row = rows[selectedRowIdx];
+        if (!row) return;
+        const where = editContext.keyBase.map(c => `${c} = ?`).join(' AND ');
+        const params = editContext.keyCols.map(k => row[k]);
+        const sql = `DELETE FROM ${editContext.table} WHERE ${where}`;
+        let res;
+        try { res = LuminaDB.query(sql, params); } catch (err) { res = { error: err.message }; }
+        if (res && res.error) { showToast(res.error, true); logToConsole('error', sqlSummary(sql), res.error, sql); return; }
+        selectedRowIdx = null;
+        showToast(`${editContext.table} から 1 行削除しました。`);
+        logToConsole('query', sqlSummary(sql), '1 行処理 · 行削除', sql);
+        renderTree();
+        triggerAutoSave();
+        runQuery();
     });
 
     els.dispLimit.addEventListener('change', () => renderDisplay(true));
+
+    // 絞り込み入力: 入力のたびに再描画する（元データは保持したまま表示だけ絞る）
+    if (els.resFilter) {
+        els.resFilter.addEventListener('input', () => { resultFilter = els.resFilter.value; renderDisplay(true); });
+        document.getElementById('resultFilterClear').addEventListener('click', () => {
+            els.resFilter.value = ''; resultFilter = ''; renderDisplay(true); els.resFilter.focus();
+        });
+    }
 
     document.getElementById('resultsContainer').addEventListener('scroll', function(e) {
         const { scrollTop, scrollHeight, clientHeight } = e.target;

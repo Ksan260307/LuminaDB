@@ -232,6 +232,59 @@
         URL.revokeObjectURL(url);
     });
 
+    // ============================================================================
+    // 結果セットを他所へ貼るための書式化（クリップボードへコピー）
+    // Markdown 表は課題票やレビューへ、INSERT 文は別のDBへ移す用途
+    // ============================================================================
+    function resultToMarkdown(rows) {
+        const headers = Object.keys(rows[0]);
+        // '|' は表の区切りなのでエスケープし、改行はセル内改行の記法へ置き換える
+        const cell = (v) => (v === null || v === undefined ? '' : String(v))
+            .replace(/\|/g, '\\|').replace(/\r?\n/g, '<br>');
+        const lines = [
+            `| ${headers.map(cell).join(' | ')} |`,
+            `| ${headers.map(() => '---').join(' | ')} |`
+        ];
+        rows.forEach(r => lines.push(`| ${headers.map(h => cell(r[h])).join(' | ')} |`));
+        return lines.join('\n');
+    }
+
+    // 値を SQL リテラルへ。文字列は引用符を二重化して閉じる（インジェクション回避）
+    function sqlLiteral(v) {
+        if (v === null || v === undefined) return 'NULL';
+        if (typeof v === 'number') return isFinite(v) ? String(v) : 'NULL';
+        if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+        return `'${String(v).replace(/'/g, "''")}'`;
+    }
+
+    function resultToInserts(rows, table) {
+        const headers = Object.keys(rows[0]);
+        const cols = headers.map(h => String(h).replace(/[^a-zA-Z0-9_]/g, '_')).join(', ');
+        return rows.map(r => `INSERT INTO ${table} (${cols}) VALUES (${headers.map(h => sqlLiteral(r[h])).join(', ')});`).join('\n');
+    }
+
+    function copyToClipboard(text, label) {
+        if (!navigator.clipboard || !navigator.clipboard.writeText) {
+            showToast('このブラウザではクリップボードを利用できません。', true);
+            return;
+        }
+        navigator.clipboard.writeText(text)
+            .then(() => showToast(`${label} をコピーしました（${text.length.toLocaleString()} 文字）。`))
+            .catch(() => showToast('クリップボードへのコピーに失敗しました。', true));
+    }
+
+    document.getElementById('copyMdBtn').addEventListener('click', () => {
+        if (!currentResultData || currentResultData.length === 0) return;
+        copyToClipboard(resultToMarkdown(currentResultData), 'Markdown 表');
+    });
+
+    document.getElementById('copyInsertBtn').addEventListener('click', () => {
+        if (!currentResultData || currentResultData.length === 0) return;
+        // 基底表が判っていればその名前を、判らなければ汎用の名前を使う
+        const table = (typeof editContext !== 'undefined' && editContext.editable) ? editContext.table : 'target_table';
+        copyToClipboard(resultToInserts(currentResultData, table), `INSERT 文 ${currentResultData.length} 件`);
+    });
+
     // 結果セットを JSON ファイルとしてダウンロードする（行オブジェクトの配列 / 整形出力）
     document.getElementById('exportJsonBtn').addEventListener('click', () => {
         if (!currentResultData || currentResultData.length === 0) return;

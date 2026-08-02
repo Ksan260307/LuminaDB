@@ -97,7 +97,9 @@
             if (!line) return;
             const entry = entries[+line.getAttribute('data-cidx')];
             if (entry && entry.sql && typeof els !== 'undefined' && els.query) {
-                els.query.value = entry.sql;
+                // setQueryValue はエディタタブへの反映も行う（未定義環境では直接代入に落とす）
+                if (typeof setQueryValue === 'function') setQueryValue(entry.sql);
+                else els.query.value = entry.sql;
                 if (typeof updateHighlight === 'function') updateHighlight();
                 els.query.focus();
                 showToast('コンソールのクエリをエディタに読み込みました。');
@@ -121,7 +123,7 @@
         // 初期表示状態を復元（既定は非表示 = ランチャーのみ表示）
         let init = false;
         try { init = localStorage.getItem(STORE_KEY) === '1'; } catch (e) { init = false; }
-        window.logConsole('info', `LuminaDB console ready (v${typeof LUMINA_VERSION !== 'undefined' ? LUMINA_VERSION : '?'})`);
+        window.logConsole('info', 'LuminaDB console ready');
         setVisible(init);
         updateBadge();
     })();

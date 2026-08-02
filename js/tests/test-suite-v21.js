@@ -175,7 +175,14 @@
       push('V21Pi index used', "EXPLAIN SELECT * FROM v21_src WHERE v = 20", r => r.data[0].Operation === 'INDEX SCAN');
       push('V21Pi drop', "DROP INDEX v21_pi", r => !r.error);
       err('V21Pi bad predicate', "CREATE INDEX v21_pb ON v21_src (v) WHERE nope > 1", 'not found');
-      err('V21Fk multi column', "CREATE TABLE v21_mfk (a INT, b INT, FOREIGN KEY (a, b) REFERENCES v21_src(id, v))", 'multi-column foreign key');
+      // v1.19: 複合 FOREIGN KEY をサポート（旧: 明示エラー）。列数の不一致は引き続き拒否する
+      push('V21Fk multi column', "CREATE TABLE v21_mfk (a INT, b INT, FOREIGN KEY (a, b) REFERENCES v21_src(id, v))", r => !r.error);
+      err('V21Fk multi column arity', "CREATE TABLE v21_mfk2 (a INT, b INT, FOREIGN KEY (a, b) REFERENCES v21_src(id))", 'has 2 columns but references 1');
+      fn('V21Fk multi column enforced', () => {
+          const bad = db.executeQuery("INSERT INTO v21_mfk VALUES (99999, 88888)");
+          db.executeQuery("DROP TABLE v21_mfk");
+          return bad.error !== undefined && bad.error.includes('Foreign key');
+      });
       err('V21Fk malformed', "CREATE TABLE v21_mf2 (a INT, FOREIGN KEY a REFERENCES v21_src)", 'foreign key');
       push('V21Fk single ok', "CREATE TABLE v21_fk (a INT, FOREIGN KEY (a) REFERENCES v21_src(id))", r => !r.error);
       push('V21Fk no phantom column', "SELECT COUNT(*) AS c FROM information_schema.columns WHERE TABLE_NAME = 'v21_fk'", r => r.data[0].c === 1);

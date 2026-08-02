@@ -349,17 +349,33 @@
         }},
         { name: "XNeg: View Non-Select Body", sql: "CREATE VIEW nx_bad AS UPDATE users SET age = 1", isErrorExpected: true, check: r => r.error !== undefined },
         { name: "XNeg: View Self Reference", sql: "CREATE VIEW nx_selfv AS SELECT * FROM nx_selfv", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Insert Into View", fn: () => {
-            db.executeQuery("CREATE VIEW nx_v2 AS SELECT id FROM users");
+        // v1.18: 単一表ビューへの INSERT / UPDATE は基底表へ書き換えて実行される（旧: 明示エラー）。
+        // 共有テーブル (users) を書き換えないよう専用テーブルで検証する
+        { name: "XView: Insert Into View Now Works", fn: () => {
+            db.executeQuery("CREATE TABLE nx_t2 (id INTEGER, nm TEXT)");
+            db.executeQuery("CREATE VIEW nx_v2 AS SELECT id FROM nx_t2");
             const r = db.executeQuery("INSERT INTO nx_v2 (id) VALUES (99)");
+            const got = db.executeQuery("SELECT id, nm FROM nx_t2");
             db.executeQuery("DROP VIEW nx_v2");
-            return r.error !== undefined;
+            db.executeQuery("DROP TABLE nx_t2");
+            // ビューに含まれない列は既定値 (NULL) のまま
+            return !r.error && got.data.length === 1 && got.data[0].id === 99 && got.data[0].nm === null;
         }},
-        { name: "XNeg: Update View", fn: () => {
-            db.executeQuery("CREATE VIEW nx_v3 AS SELECT id FROM users");
+        { name: "XView: Update View Now Works", fn: () => {
+            db.executeQuery("CREATE TABLE nx_t3 (id INTEGER)");
+            db.executeQuery("INSERT INTO nx_t3 (id) VALUES (5)");
+            db.executeQuery("CREATE VIEW nx_v3 AS SELECT id FROM nx_t3");
             const r = db.executeQuery("UPDATE nx_v3 SET id = 1");
+            const got = db.executeQuery("SELECT id FROM nx_t3");
             db.executeQuery("DROP VIEW nx_v3");
-            return r.error !== undefined;
+            db.executeQuery("DROP TABLE nx_t3");
+            return !r.error && got.data[0].id === 1;
+        }},
+        { name: "XNeg: Update Aggregate View Rejected", fn: () => {
+            db.executeQuery("CREATE VIEW nx_v4 AS SELECT age, COUNT(*) AS n FROM users GROUP BY age");
+            const r = db.executeQuery("UPDATE nx_v4 SET n = 1");
+            db.executeQuery("DROP VIEW nx_v4");
+            return r.error !== undefined && r.error.includes('not updatable');
         }},
         { name: "XNeg: Call Syntax With Args", sql: "CALL some_proc(1)", isErrorExpected: true, check: r => r.error !== undefined },
         { name: "XNeg: Create Procedure Empty Body", sql: "CREATE PROCEDURE nx_p AS", isErrorExpected: true, check: r => r.error !== undefined },

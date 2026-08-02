@@ -99,7 +99,8 @@
       _logViewState(name) {
           name = name.toLowerCase();
           if (!this.inTransaction) return;
-          this.undoLog.push({ type: 'VIEW_STATE', name, prev: this.views[name] });
+          this.undoLog.push({ type: 'VIEW_STATE', name, prev: this.views[name],
+                             prevMeta: (this.viewMeta && this.viewMeta[name]) ? Object.assign({}, this.viewMeta[name]) : undefined });
       },
 
       // CREATE/DROP PROCEDURE の undo ログ（変更前の文リストを保存）
@@ -132,6 +133,14 @@
           if (!this.inTransaction) return;
           const cur = this.sequences[name];
           this.undoLog.push({ type: 'SEQ_STATE', name, prev: cur ? { ...cur } : undefined });
+      },
+
+      // CREATE/DROP DOMAIN・TYPE の undo ログ
+      _logDomainState(name) {
+          name = name.toLowerCase();
+          if (!this.inTransaction) return;
+          const cur = this.domains ? this.domains[name] : undefined;
+          this.undoLog.push({ type: 'DOMAIN_STATE', name, prev: cur ? JSON.parse(JSON.stringify(cur)) : undefined });
       },
 
       // Undo ログ 1 エントリを逆再生する（ROLLBACK / ROLLBACK TO SAVEPOINT 共用）
@@ -183,12 +192,19 @@
           } else if (log.type === 'VIEW_STATE') {
               if (log.prev === undefined) delete this.views[log.name];
               else this.views[log.name] = log.prev;
+              this.viewMeta = this.viewMeta || Object.create(null);
+              if (log.prevMeta === undefined) delete this.viewMeta[log.name];
+              else this.viewMeta[log.name] = Object.assign({}, log.prevMeta);
           } else if (log.type === 'PROC_STATE') {
               if (log.prev === undefined) delete this.procedures[log.name];
               else this.procedures[log.name] = [...log.prev];
           } else if (log.type === 'TRIGGER_STATE') {
               if (log.prev === undefined) delete this.triggers[log.name];
               else this.triggers[log.name] = JSON.parse(JSON.stringify(log.prev));
+          } else if (log.type === 'DOMAIN_STATE') {
+              this.domains = this.domains || Object.create(null);
+              if (log.prev === undefined) delete this.domains[log.name];
+              else this.domains[log.name] = JSON.parse(JSON.stringify(log.prev));
           } else if (log.type === 'SEQ_STATE') {
               if (log.prev === undefined) delete this.sequences[log.name];
               else this.sequences[log.name] = { ...log.prev };

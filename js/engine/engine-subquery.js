@@ -106,7 +106,10 @@
                   continue;
               }
 
-              let subResult = this.executeQuery(match.query, true, strMap);
+              // サブクエリ本文の表関数（SELECT 句の集合返し関数を含む）を先に展開する。
+              // executeQuery は isSubquery のとき expandTableFunctions を通さないため、
+              // ここで通さないと派生表の中の UNNEST(...) が解決できない
+              let subResult = this.executeQuery(this.expandTableFunctions(match.query, strMap), true, strMap);
               if(subResult.error) throw new Error(subResult.error);
 
               const beforeStr = expandedSql.slice(0, match.start);
@@ -121,14 +124,29 @@
                   // 量化比較の展開（OR/AND への分配）は compileCondition が担う。
                   // 文字列値はエスケープした上で strMap へ退避する
                   // （生のまま埋め込むとデータ中の引用符がJSソースを汚染し得るため）
-                  const vals = subResult.data.map(r => Object.values(r)[0]);
-                  const valsStr = vals.map(v => {
+                  const lit = (v) => {
                       if (typeof v === 'string') {
                           strMap.push(this._quoteLiteral(v));
                           return `__STR_${strMap.length - 1}__`;
                       }
                       return v;
-                  }).join(', ');
+                  };
+                  // 左辺が行コンストラクタ `(a, b) IN (SELECT a, b FROM ...)` の場合は
+                  // 全列を括弧付きの値グループへ畳む（compileCondition の
+                  // _rewriteRowConstructors が「括弧付きグループ」を要求するため）
+                  const arity = this._rowCtorArityBefore(beforeStr);
+                  let valsStr;
+                  if (arity > 1) {
+                      valsStr = subResult.data.map(r => {
+                          const cells = Object.values(r);
+                          if (cells.length !== arity) {
+                              throw new Error(`Row constructor IN requires equal arity (${arity} vs ${cells.length}).`);
+                          }
+                          return '(' + cells.map(lit).join(', ') + ')';
+                      }).join(', ');
+                  } else {
+                      valsStr = subResult.data.map(r => lit(Object.values(r)[0])).join(', ');
+                  }
                   expandedSql = expandedSql.slice(0, match.start) + `(${valsStr})` + expandedSql.slice(match.end + 1);
               } else if (/\bFROM\s*$/i.test(beforeStr.trim()) || /\bJOIN\s*$/i.test(beforeStr.trim())) {
                   const tmpName = '__tmp_' + Math.floor(Math.random()*1000000);
@@ -152,6 +170,23 @@
               }
           }
           return expandedSql;
+      },
+
+      // `IN` の直前が行コンストラクタ `(a, b)` かどうかを見て、その要素数を返す。
+      // 行コンストラクタでなければ 1（通常の単一列 IN）。関数呼び出し `f(x, y) IN (...)` は
+      // 直前が識別子なので行コンストラクタとは見なさない
+      _rowCtorArityBefore(beforeStr) {
+          const head = beforeStr.replace(/\s*(?:NOT\s+)?IN\s*$/i, '').replace(/\s+$/, '');
+          if (head[head.length - 1] !== ')') return 1;
+          let d = 0, j = head.length - 1;
+          for (; j >= 0; j--) {
+              if (head[j] === ')') d++;
+              else if (head[j] === '(') { d--; if (d === 0) break; }
+          }
+          if (j < 0) return 1;
+          if (j > 0 && /[a-zA-Z0-9_.\]]/.test(head[j - 1])) return 1;
+          const items = this.splitSelectClause(head.slice(j + 1, head.length - 1));
+          return items.length >= 2 ? items.length : 1;
       },
 
       // 行オブジェクト配列を一時テーブルとして実体化する（CTE / FROMサブクエリ / 再帰CTE 共用）。
@@ -327,7 +362,279 @@
           return sql;
       },
 
+      // SELECT 句に書かれた集合返し関数（PostgreSQL の `SELECT UNNEST(arr)`）を
+      // FROM 句の表関数へ書き換える。`SELECT UNNEST(ARRAY[1,2,3]) AS v` は
+      // `SELECT __srf_1.v AS v FROM UNNEST(ARRAY[1,2,3]) AS __srf_1(v)` と同義。
+      // FROM 句が既にある場合は行数が掛け合わさるため、FROM の無い形だけを受ける
+      // （実DBの LATERAL 相当までは踏み込まない — その旨をエラーで案内する）
+      _expandSelectListSRF(sql, strMap) {
+          if (!/^\s*select\b/i.test(sql)) return sql;
+          if (!/\b(unnest|string_split|generate_series)\s*\(/i.test(sql)) return sql;
+          const fromAt = this._topLevelKeyword(sql, 'from');
+          const selEnd = fromAt === -1 ? sql.length : fromAt;
+          const head = sql.slice(0, selEnd);
+          const srfRe = /\b(UNNEST|STRING_SPLIT|GENERATE_SERIES)\s*\(/i;
+          if (!srfRe.test(head)) return sql;
+          if (fromAt !== -1) {
+              throw new Error("Set-returning functions in the SELECT list are only supported without a FROM clause. Use `FROM UNNEST(...) AS t(v)` instead.");
+          }
+          const items = this.splitSelectClause(head.replace(/^\s*select\s+/i, ''));
+          if (items.length !== 1) {
+              throw new Error("A set-returning function in the SELECT list must be the only select item. Use `FROM UNNEST(...) AS t(v)` instead.");
+          }
+          const item = items[0].trim();
+          const m = item.match(/^(UNNEST|STRING_SPLIT|GENERATE_SERIES)\s*\(([\s\S]*)\)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?$/i);
+          if (!m) {
+              throw new Error("A set-returning function in the SELECT list must be the whole select item (optionally with an alias).");
+          }
+          const outName = (m[3] || 'value').toLowerCase();
+          return `SELECT ${outName} FROM ${m[1]}(${m[2]}) AS __srf(${outName})`;
+      },
+
+      // ============================================================================
+      // Oracle の階層問い合わせ (START WITH ... CONNECT BY PRIOR)
+      //   親から子へ辿った結果を一時テーブルへ実体化し、通常の SELECT へ差し替える。
+      //   擬似列 LEVEL / CONNECT_BY_ISLEAF / CONNECT_BY_ROOT col /
+      //   SYS_CONNECT_BY_PATH(col, sep) を列として付ける。
+      //   ORDER SIBLINGS BY は同じ親の子どもの並び順を決める。
+      // 対応する結合条件は「PRIOR <列> = <列>」（左右どちらでも可）を 1 本含む形。
+      // それ以外の AND 条件は候補行だけで評価できるフィルタとして扱う。
+      // ============================================================================
+      _expandConnectBy(sql, strMap) {
+          if (!/\bconnect\s+by\b/i.test(sql)) return sql;
+          const m = sql.match(/^\s*select\s+([\s\S]+?)\s+from\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:as\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?([\s\S]*)$/i);
+          if (!m) throw new Error("CONNECT BY requires a simple SELECT ... FROM <table> query.");
+          const selectClause = m[1];
+          const table = m[2].toLowerCase();
+          // START / CONNECT も句の始まりなので表の別名として拾わない
+          const isHead = (w) => this._isClauseKeyword(w) || /^(start|connect)$/i.test(w);
+          const rawAlias = m[3] && !isHead(m[3]) ? m[3].toLowerCase() : null;
+          let rest = (m[3] && isHead(m[3]) ? m[3] + ' ' : '') + (m[4] || '');
+          if (!this.tables[table]) throw this._tableNotFound(table);
+
+          // WHERE / START WITH / CONNECT BY / ORDER [SIBLINGS] BY を切り出す
+          const takeClause = (re) => {
+            const mm = rest.match(re);
+            if (!mm) return null;
+            rest = rest.slice(0, mm.index) + ' ' + rest.slice(mm.index + mm[0].length);
+            return mm[1].trim();
+          };
+          const TERM = '(?=\\s+(?:where|start\\s+with|connect\\s+by|group\\s+by|having|order\\s+(?:siblings\\s+)?by|limit|offset)\\b|\\s*$)';
+          const cbCond = takeClause(new RegExp('\\bconnect\\s+by\\s+(?:nocycle\\s+)?([\\s\\S]+?)' + TERM, 'i'));
+          const startCond = takeClause(new RegExp('\\bstart\\s+with\\s+([\\s\\S]+?)' + TERM, 'i'));
+          const siblingsBy = takeClause(new RegExp('\\border\\s+siblings\\s+by\\s+([\\s\\S]+?)' + TERM, 'i'));
+          const whereCond = takeClause(new RegExp('\\bwhere\\s+([\\s\\S]+?)' + TERM, 'i'));
+          const nocycle = /\bconnect\s+by\s+nocycle\b/i.test(sql);
+          if (!cbCond) throw new Error("Syntax Error in CONNECT BY.");
+
+          // 「PRIOR <列> = <列>」を 1 本取り出し、残りは候補行だけで判定できるフィルタにする
+          const parts = this._splitTopLevelAnd(cbCond).map(p => p.replace(/^\((.*)\)$/s, '$1'));
+          let priorCol = null, childCol = null;
+          const extra = [];
+          parts.forEach(p => {
+              const eq = p.match(/^\s*(?:prior\s+)?([a-zA-Z_][a-zA-Z0-9_.]*)\s*=\s*(?:prior\s+)?([a-zA-Z_][a-zA-Z0-9_.]*)\s*$/i);
+              const leftPrior = /^\s*prior\b/i.test(p);
+              const rightPrior = /=\s*prior\b/i.test(p);
+              if (eq && (leftPrior !== rightPrior) && !priorCol) {
+                  const strip = (c) => c.replace(/^[a-zA-Z0-9_]+\./, '').toLowerCase();
+                  priorCol = strip(leftPrior ? eq[1] : eq[2]);
+                  childCol = strip(leftPrior ? eq[2] : eq[1]);
+                  return;
+              }
+              if (/\bprior\b/i.test(p)) {
+                  throw new Error("CONNECT BY supports one 'PRIOR <col> = <col>' link; other PRIOR expressions are not supported.");
+              }
+              extra.push(p);
+          });
+          if (!priorCol) throw new Error("CONNECT BY requires a 'PRIOR <col> = <col>' link.");
+
+          const t = this.tables[table];
+          const cols = t.getColumnNames();
+          if (!t.cols[priorCol] || !t.cols[childCol]) {
+              throw new Error(`CONNECT BY references unknown column '${t.cols[priorCol] ? childCol : priorCol}'.`);
+          }
+          const baseRows = [];
+          for (let i = 0; i < t.rowCount; i++) {
+              const row = {};
+              cols.forEach(c => row[c] = t.getValue(c, i));
+              baseRows.push(row);
+          }
+          // 行だけで評価できる条件を 1 つの関数へまとめる（WHERE / START WITH / 追加の CONNECT BY 条件）
+          // 条件テキストからは表名・別名の修飾子を落としてから評価する
+          const unqualify = (text) => {
+              let x = String(text);
+              if (rawAlias) x = x.replace(new RegExp('\\b' + rawAlias + '\\.', 'gi'), '');
+              return x.replace(new RegExp('\\b' + table + '\\.', 'gi'), '');
+          };
+          const rowPred = (text) => {
+              if (!text) return null;
+              const fn = this.compileCondition(unqualify(text).replace(/\bprior\s+/gi, ''), strMap);
+              const dummyCols = {};
+              cols.forEach(c => dummyCols[c] = true);
+              return (row) => {
+                  try {
+                      return !!fn({ dummy: 0 }, { dummy: { cols: dummyCols, getValue: (c) => {
+                          const k = c.replace(/^[a-zA-Z0-9_]+\./, '').toLowerCase();
+                          return row[k] === undefined ? null : row[k];
+                      } } }, { dummy: 'dummy' });
+                  } catch (e) { return false; }
+              };
+          };
+          const startFn = rowPred(startCond);
+          const extraFn = extra.length > 0 ? rowPred(extra.join(' AND ')) : null;
+          const whereFn = rowPred(whereCond);
+
+          // 親の値 -> 子行の索引（O(n) の辿り）
+          const byChildKey = Object.create(null);
+          baseRows.forEach(r => {
+              const k = r[childCol];
+              if (k === null || k === undefined) return;
+              const key = String(k);
+              (byChildKey[key] = byChildKey[key] || []).push(r);
+          });
+
+          // 兄弟の並び順（ORDER SIBLINGS BY col [ASC|DESC], ...）
+          const sibKeys = siblingsBy ? this.splitSelectClause(siblingsBy).map(x => {
+              const d = x.trim().match(/^([a-zA-Z_][a-zA-Z0-9_.]*)(?:\s+(asc|desc))?$/i);
+              if (!d) throw new Error("ORDER SIBLINGS BY accepts plain column names only.");
+              return { col: d[1].replace(/^[a-zA-Z0-9_]+\./, '').toLowerCase(), desc: /^desc$/i.test(d[2] || '') };
+          }) : null;
+          const sortSibs = (arr) => {
+              if (!sibKeys) return arr;
+              return arr.slice().sort((a, b) => {
+                  for (const k of sibKeys) {
+                      const x = a[k.col], y = b[k.col];
+                      if (x === y) continue;
+                      if (x === null || x === undefined) return k.desc ? 1 : -1;
+                      if (y === null || y === undefined) return k.desc ? -1 : 1;
+                      return (x < y) === !k.desc ? -1 : 1;
+                  }
+                  return 0;
+              });
+          };
+
+          // SELECT 句が要求する擬似列を先に洗い出す
+          const rootCols = [];
+          selectClause.replace(/\bconnect_by_root\s+([a-zA-Z_][a-zA-Z0-9_.]*)/gi, (mm, c) => {
+              const k = c.replace(/^[a-zA-Z0-9_]+\./, '').toLowerCase();
+              if (!rootCols.includes(k)) rootCols.push(k);
+              return mm;
+          });
+          const pathSpecs = [];
+          selectClause.replace(/\bsys_connect_by_path\s*\(([^()]*)\)/gi, (mm, args) => {
+              const a = this.splitSelectClause(args).map(x => x.trim());
+              pathSpecs.push({ text: mm, col: (a[0] || '').replace(/^[a-zA-Z0-9_]+\./, '').toLowerCase(), sep: a[1] || "'/'" });
+              return mm;
+          });
+          const pathSep = (spec) => {
+              const lit = this._restoreStrings(spec.sep, strMap || []);
+              const q = lit.match(/^'([\s\S]*)'$/);
+              return q ? q[1].replace(/''/g, "'") : lit;
+          };
+
+          // 幅優先ではなく深さ優先（Oracle の既定の並び）で辿る
+          const out = [];
+          const GUARD = 200000;
+          const walk = (row, level, ancestors, rootRow, path) => {
+              if (out.length > GUARD) throw new Error("CONNECT BY produced too many rows (possible cycle). Use CONNECT BY NOCYCLE.");
+              const selfKey = row[priorCol] === null || row[priorCol] === undefined ? null : String(row[priorCol]);
+              let kids = selfKey === null ? [] : (byChildKey[selfKey] || []);
+              if (extraFn) kids = kids.filter(extraFn);
+              // 循環検出: 既に経路上にある行へ戻ったら打ち切る（NOCYCLE 無しはエラー）
+              const cyclic = kids.filter(k => ancestors.has(k));
+              if (cyclic.length > 0 && !nocycle) {
+                  throw new Error("CONNECT BY detected a loop in the data. Use CONNECT BY NOCYCLE.");
+              }
+              kids = sortSibs(kids.filter(k => !ancestors.has(k)));
+              const rec = { ...row, level, connect_by_isleaf: kids.length === 0 ? 1 : 0 };
+              rootCols.forEach(c => rec['__cbroot_' + c] = rootRow[c]);
+              pathSpecs.forEach((sp, i) => {
+                  rec['__cbpath_' + i] = path[i] + pathSep(sp) + (row[sp.col] === null || row[sp.col] === undefined ? '' : String(row[sp.col]));
+              });
+              out.push(rec);
+              const nextAnc = new Set(ancestors);
+              nextAnc.add(row);
+              kids.forEach(k => walk(k, level + 1, nextAnc, rootRow,
+                  pathSpecs.map((sp, i) => rec['__cbpath_' + i])));
+          };
+          let roots = startFn ? baseRows.filter(startFn) : baseRows.slice();
+          roots = sortSibs(roots);
+          roots.forEach(r => walk(r, 1, new Set(), r, pathSpecs.map(() => '')));
+
+          // WHERE は階層を辿った後に適用する（Oracle と同じ順序）
+          const finalRows = whereFn ? out.filter(whereFn) : out;
+          const outCols = cols.concat(['level', 'connect_by_isleaf'],
+              rootCols.map(c => '__cbroot_' + c), pathSpecs.map((sp, i) => '__cbpath_' + i));
+          const tmpName = '__tmp_hier_' + (this._tmpCounter = (this._tmpCounter || 0) + 1);
+          this._materializeRows(tmpName, finalRows.map(r => {
+              const o = {};
+              outCols.forEach(c => o[c] = r[c] === undefined ? null : r[c]);
+              return o;
+          }), outCols);
+
+          // SELECT 句の擬似列参照を実体化した列名へ差し替える
+          let sel = selectClause;
+          pathSpecs.forEach((sp, i) => { sel = sel.split(sp.text).join('__cbpath_' + i); });
+          sel = sel.replace(/\bconnect_by_root\s+([a-zA-Z_][a-zA-Z0-9_.]*)/gi,
+              (mm, c) => '__cbroot_' + c.replace(/^[a-zA-Z0-9_]+\./, '').toLowerCase());
+          if (rawAlias) sel = sel.replace(new RegExp('\\b' + rawAlias + '\\.', 'gi'), '');
+          sel = sel.replace(new RegExp('\\b' + table + '\\.', 'gi'), '');
+          return `SELECT ${sel} FROM ${tmpName}${rest.replace(/\s+/g, ' ').trimEnd()}`;
+      },
+
+      // AND で区切られたトップレベルの条件へ分割する（括弧の内側は保護する）
+      _splitTopLevelAnd(text) {
+          const out = [];
+          let depth = 0, start = 0;
+          const s = text;
+          for (let i = 0; i < s.length; i++) {
+              const c = s[i];
+              if (c === '(') depth++;
+              else if (c === ')') depth--;
+              else if (depth === 0 && /\s/.test(c) && /^\s+and\s+/i.test(s.slice(i))) {
+                  out.push(s.slice(start, i));
+                  const mm = s.slice(i).match(/^\s+and\s+/i);
+                  i += mm[0].length - 1;
+                  start = i + 1;
+              }
+          }
+          out.push(s.slice(start));
+          return out.map(x => x.trim()).filter(x => x !== '');
+      },
+
+      // Oracle の擬似列 ROWNUM。
+      //   WHERE ROWNUM <= n / < n  -> LIMIT（上位 n 件の定番イディオム）
+      //   SELECT 句の ROWNUM       -> ROW_NUMBER() OVER ()
+      // Oracle 同様 ORDER BY より前に採番されるので「並べ替えてから上位 n 件」は
+      // 副問い合わせにする必要がある（実 DB と同じ制約）
+      _expandRownum(sql) {
+          if (!/\browne?um\b/i.test(sql) && !/\browNUM\b/i.test(sql) && !/\brownum\b/i.test(sql)) return sql;
+          let out = sql;
+          // WHERE ... ROWNUM <= n （AND で並んだ項のひとつ）を LIMIT へ移す
+          let limitFromRownum = null;
+          out = out.replace(/\browNUM\s*(<=|<|=)\s*(\d+)/gi, (m, op, n) => {
+              const v = parseInt(n, 10);
+              const lim = op === '<' ? v - 1 : v;
+              limitFromRownum = limitFromRownum === null ? lim : Math.min(limitFromRownum, lim);
+              return '1 = 1';
+          });
+          if (limitFromRownum !== null && !/\blimit\s+\d+/i.test(out)) {
+              out += ` LIMIT ${Math.max(0, limitFromRownum)}`;
+          }
+          // 残った ROWNUM は出力行の連番として扱う
+          out = out.replace(/\browNUM\b/gi, 'ROW_NUMBER() OVER ()');
+          return out;
+      },
+
       expandTableFunctions(sql, strMap) {
+          // システムバージョン管理表（時制テーブル）は未実装。FROM 句の構文エラーとして
+          // 出るより「対応していない」と言われたほうが判るので明示的に弾く
+          if (/\bfor\s+system_time\b/i.test(sql)) {
+              throw new Error("FOR SYSTEM_TIME (system-versioned tables) is not supported. Keep history in a table of your own and query it directly.");
+          }
+          sql = this._expandRownum(sql);
+          sql = this._expandConnectBy(sql, strMap);
+          sql = this._expandSelectListSRF(sql, strMap);
           sql = this.expandValuesTables(sql, strMap);
           sql = this._expandJsonTable(sql, strMap);
           sql = this._expandTableSample(sql, strMap);
@@ -396,8 +703,8 @@
       //   UNNEST(a, b, c)           (PostgreSQL の配列展開に相当。要素をそのまま行にする)
       _expandSplitFunctions(sql, strMap) {
           if (!/\b(string_split|unnest)\s*\(/i.test(sql)) return sql;
-          const re = /\b(FROM|JOIN)\s+(STRING_SPLIT|UNNEST)\s*\(((?:[^()]|\([^()]*\))*)\)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))?)?/gi;
-          return sql.replace(re, (m, kw, fn, args, aliasName, colName) => {
+          const re = /\b(FROM|JOIN)\s+(STRING_SPLIT|UNNEST)\s*\(((?:[^()]|\([^()]*\))*)\)(?:\s+WITH\s+ORDINALITY)?(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*))?\s*\))?)?/gi;
+          return sql.replace(re, (m, kw, fn, args, aliasName, colName, ordName) => {
               const parts = this.splitSelectClause(args).map(a => this.compileCondition(a.trim(), strMap)({}, this.tables, {}));
               const col = colName ? colName.toLowerCase() : 'value';
               let rows;
@@ -411,10 +718,21 @@
                   }
               } else {
                   if (parts.length === 0) throw new Error("UNNEST requires at least one argument.");
-                  rows = parts.map(v => ({ [col]: v === undefined ? null : v }));
+                  // 引数が配列なら要素を行へ展開する（PostgreSQL の UNNEST(anyarray)）。
+                  // スカラーを並べた UNNEST(10, 20, 30) 形は各引数がそのまま 1 行になる。
+                  // 配列とスカラーが混ざっても素直に平坦化する
+                  rows = [];
+                  parts.forEach(v => {
+                      if (Array.isArray(v)) v.forEach(e => rows.push({ [col]: e === undefined ? null : e }));
+                      else rows.push({ [col]: v === undefined ? null : v });
+                  });
               }
+              // WITH ORDINALITY: 1 始まりの連番列を添える（SQL標準）
+              const withOrd = /\bWITH\s+ORDINALITY\b/i.test(m);
+              const ordCol = ordName ? ordName.toLowerCase() : 'ordinality';
+              if (withOrd) rows.forEach((r, i) => { r[ordCol] = i + 1; });
               const tmpName = '__tmp_split_' + (this._tmpCounter = (this._tmpCounter || 0) + 1);
-              this._materializeRows(tmpName, rows, [col]);
+              this._materializeRows(tmpName, rows, withOrd ? [col, ordCol] : [col]);
               return `${kw} ${tmpName}${aliasName ? ' ' + aliasName : ''}`;
           });
       },
@@ -626,12 +944,18 @@
           return sql.slice(0, srcStart) + `${tmpName}${aliasName ? ' ' + aliasName : ''}` + sql.slice(close + 1 + consumedAfter);
       },
 
-      // <left> CROSS|OUTER APPLY (subquery) [alias]  /  <left> [,|JOIN] LATERAL (subquery) [alias]
+      // <left> CROSS|OUTER APPLY (subquery) [alias]
+      // <left> [, | [INNER|LEFT|CROSS] JOIN] LATERAL (subquery) [alias] [ON <cond>]
       //   左の各行に対しサブクエリを評価して連結する（相関可）。結果は一時テーブルへ実体化する。
       _expandOneApply(sql, strMap) {
-          const km = sql.match(/\b(?:(CROSS|OUTER)\s+APPLY|LATERAL)\s+/i);
+          const km = sql.match(/\b(?:(CROSS|OUTER)\s+APPLY|(?:(left|right|full|inner|cross)\s+(?:outer\s+)?)?(?:join\s+)?LATERAL)\s+/i);
           if (!km) return sql;
-          const kind = km[1] ? km[1].toUpperCase() : 'CROSS'; // LATERAL は CROSS APPLY 相当
+          // JOIN LATERAL: LEFT JOIN LATERAL は OUTER APPLY 相当、それ以外は CROSS APPLY 相当
+          const joinKw = km[2] ? km[2].toLowerCase() : null;
+          if (joinKw === 'right' || joinKw === 'full') {
+              throw new Error(`${joinKw.toUpperCase()} JOIN LATERAL is not supported. Use INNER / LEFT / CROSS JOIN LATERAL.`);
+          }
+          const kind = km[1] ? km[1].toUpperCase() : (joinKw === 'left' ? 'OUTER' : 'CROSS');
           // 右辺は (サブクエリ) かテーブル名。括弧はバランス走査で切り出す
           let pos = km.index + km[0].length;
           let rightText, rightEnd;
@@ -648,9 +972,25 @@
           }
           const aliasM = sql.slice(rightEnd).match(/^\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)/i);
           const rightAlias = (aliasM && !this._isClauseKeyword(aliasM[1])) ? aliasM[1] : null;
-          const consumedEnd = rightEnd + (rightAlias ? aliasM[0].length : 0);
+          let consumedEnd = rightEnd + (rightAlias ? aliasM[0].length : 0);
 
-          // APPLY より前の部分から「左側クエリ」を組み立てて行を得る（LATERAL 前のカンマも消費する）
+          // JOIN LATERAL ... ON <cond>: ON TRUE / ON 1=1 は無条件なので捨てる。
+          // それ以外は実体化後の表への絞り込み（WHERE）へ移す
+          let lateralOn = null;
+          const onM = sql.slice(consumedEnd).match(/^\s*on\s+([\s\S]*?)(?=\s+(?:where|group\s+by|having|order\s+by|limit|offset|window|qualify|union|intersect|except|left|right|inner|full|cross|natural|join)\b|$)/i);
+          if (onM) {
+              const cond = onM[1].trim();
+              if (!/^(?:true|1\s*=\s*1)$/i.test(cond)) {
+                  if (kind === 'OUTER') {
+                      throw new Error("LEFT JOIN LATERAL supports only ON TRUE. Move the condition into the subquery's WHERE clause.");
+                  }
+                  lateralOn = cond;
+              }
+              consumedEnd += onM[0].length;
+          }
+
+          // APPLY より前の部分から「左側クエリ」を組み立てて行を得る
+          // （LATERAL 前のカンマ / JOIN キーワードも消費する）
           const before = sql.slice(0, km.index).trim().replace(/,\s*$/, '');
           if (!/^select\b/i.test(before)) throw new Error("APPLY / LATERAL must follow a SELECT ... FROM clause.");
           const leftSql = before.replace(/^select\s+(?:distinct\s+)?[\s\S]*?\s+from\s+/i, 'SELECT * FROM ');
@@ -711,7 +1051,13 @@
               return s;
           };
           const selList = stripQual(selHead ? selHead[2] : '*');
-          const rest = stripQual(sql.slice(consumedEnd));
+          let rest = stripQual(sql.slice(consumedEnd));
+          // JOIN LATERAL の ON 条件は実体化した表への WHERE として合成する
+          if (lateralOn) {
+              const cond = stripQual(lateralOn);
+              const wM = rest.match(/^(\s*)where\s+/i);
+              rest = wM ? `${wM[1]}WHERE (${cond}) AND ${rest.slice(wM[0].length)}` : ` WHERE (${cond})${rest}`;
+          }
           return `SELECT ${distinctTxt}${selList} FROM ${tmpName}${rest}`;
       },
 
@@ -719,7 +1065,9 @@
       // 「前イテレーションの行だけが見える作業テーブル」に対して繰り返し実行する。
       // UNION（重複除去）は累積集合と重複した行を捨てることで循環データでも収束する。
       // UNION ALL は無限再帰し得るため反復回数と行数に上限を設ける。
-      _materializeRecursiveCTE(cteName, body, tmpName, strMap, colNames) {
+      // searchSpec: { mode: 'depth'|'breadth', cols: [...], seqCol } — 走査順の連番列を足す
+      // cycleSpec : { cols, flagCol, markValue, defaultValue, pathCol } — 循環を検出して打ち切る
+      _materializeRecursiveCTE(cteName, body, tmpName, strMap, colNames, searchSpec, cycleSpec) {
           const segs = this._splitUnion(body);
           const refRe = new RegExp(`\\b(?:from|join)\\s+${cteName}\\b`, 'i');
           const anchor = [], recursive = [];
@@ -770,18 +1118,79 @@
               });
           };
 
+          // CYCLE 句: 循環キーの通過履歴を行ごとに持ち、既に通った値へ戻ったら
+          // その行に印を付けて以降は辿らない（無限再帰を上限エラーではなく仕様として止める）
+          const cyclePaths = cycleSpec ? new WeakMap() : null;
+          const cycleKeyOf = (row) => JSON.stringify(cycleSpec.cols.map(c => {
+              const k = Object.keys(row).find(x => x.toLowerCase() === c);
+              return k === undefined ? null : row[k];
+          }));
+
           anchor.forEach(seg => addRows(runSeg(seg.sql), working));
+          if (cycleSpec) {
+              working.forEach(r => {
+                  cyclePaths.set(r, [cycleKeyOf(r)]);
+                  r[cycleSpec.flagCol] = cycleSpec.defaultValue;
+                  if (cycleSpec.pathCol) r[cycleSpec.pathCol] = JSON.stringify([JSON.parse(cycleKeyOf(r))]);
+              });
+          }
           let iter = 0;
           while (working.length > 0 && recursive.length > 0) {
               if (++iter > 500) throw new Error(`Recursive CTE '${cteName}' exceeded 500 iterations. Add a termination condition (or use UNION instead of UNION ALL).`);
               if (acc.length > 100000) throw new Error(`Recursive CTE '${cteName}' exceeded 100,000 rows.`);
-              this._materializeRows(workName, working);
+              // CYCLE 有効時は「まだ循環していない行」だけを次の入力にする
+              const feed = cycleSpec ? working.filter(r => r[cycleSpec.flagCol] !== cycleSpec.markValue) : working;
+              if (feed.length === 0) break;
+              this._materializeRows(workName, feed.map(r => {
+                  if (!cycleSpec) return r;
+                  // 作業テーブルには CYCLE の付随列を出さない（自己参照 SELECT の列数を保つ）
+                  const c = Object.assign(Object.create(null), r);
+                  delete c[cycleSpec.flagCol];
+                  if (cycleSpec.pathCol) delete c[cycleSpec.pathCol];
+                  return c;
+              }));
               const next = [];
               recursive.forEach(seg => addRows(runSeg(replaceSelfRef(seg.sql)), next));
+              if (cycleSpec) {
+                  // 親の経路は「同じ循環キーを持つ直近の作業行」から引き継ぐ
+                  const parentPath = new Map();
+                  feed.forEach(r => parentPath.set(cycleKeyOf(r), cyclePaths.get(r) || []));
+                  next.forEach(r => {
+                      const key = cycleKeyOf(r);
+                      // 直前の世代のどれかの経路に自分のキーがあれば循環
+                      let base = null, cycled = false;
+                      for (const [, p] of parentPath) {
+                          if (p.indexOf(key) !== -1) { base = p; cycled = true; break; }
+                          if (base === null) base = p;
+                      }
+                      const path = (base || []).concat([key]);
+                      cyclePaths.set(r, path);
+                      r[cycleSpec.flagCol] = cycled ? cycleSpec.markValue : cycleSpec.defaultValue;
+                      if (cycleSpec.pathCol) r[cycleSpec.pathCol] = JSON.stringify(path.map(x => JSON.parse(x)));
+                  });
+              }
               working = next;
           }
           delete this.tables[workName];
-          this._materializeRows(tmpName, acc, colNames);
+
+          // SEARCH 句: 走査順の連番列を足す。深さ優先は「親の直後に子」を並べ直し、
+          // 幅優先は生成順（＝世代順）がそのまま該当する
+          let out = acc;
+          if (searchSpec) {
+              const keyOf = (row) => JSON.stringify(searchSpec.cols.map(c => {
+                  const k = Object.keys(row).find(x => x.toLowerCase() === c);
+                  return k === undefined ? null : row[k];
+              }));
+              if (searchSpec.mode === 'depth') {
+                  // 生成順は幅優先なので、同じ探索キーの塊ごとに安定ソートして深さ優先へ寄せる
+                  out = [...acc].sort((a, b) => {
+                      const ka = keyOf(a), kb = keyOf(b);
+                      return ka < kb ? -1 : (ka > kb ? 1 : 0);
+                  });
+              }
+              out = out.map((row, i) => Object.assign(Object.create(null), row, { [searchSpec.seqCol]: i + 1 }));
+          }
+          this._materializeRows(tmpName, out, colNames && !searchSpec && !cycleSpec ? colNames : null);
       },
 
       // WITH [RECURSIVE] name AS (SELECT ...), ... <本体>: CTE を一時テーブルへ実体化し、
@@ -824,9 +1233,37 @@
               // 先行して定義された CTE の参照を解決してから実行する
               let body = replaceRefs(rest.slice(start + 1, end).trim());
               const tmpName = '__tmp_cte_' + name;
+              // 定義の直後に来る SEARCH / CYCLE 句（SQL:2003）を取り込む。
+              //   SEARCH {DEPTH|BREADTH} FIRST BY col[, ...] SET seqCol
+              //   CYCLE col[, ...] SET flagCol [TO 'y' DEFAULT 'n'] [USING pathCol]
+              // 階層データの並び順と循環検出は再帰CTEの実運用でほぼ必ず要る
+              let searchSpec = null, cycleSpec = null;
+              let tail = rest.slice(end + 1);
+              const sm = tail.match(/^\s*search\s+(depth|breadth)\s+first\s+by\s+([a-zA-Z0-9_,\s]+?)\s+set\s+([a-zA-Z0-9_]+)/i);
+              if (sm) {
+                  searchSpec = { mode: sm[1].toLowerCase(), cols: sm[2].split(',').map(c => c.trim().toLowerCase()), seqCol: sm[3].toLowerCase() };
+                  tail = tail.slice(sm[0].length);
+              }
+              const cm = tail.match(/^\s*cycle\s+([a-zA-Z0-9_,\s]+?)\s+set\s+([a-zA-Z0-9_]+)(?:\s+to\s+(__STR_\d+__|\S+)\s+default\s+(__STR_\d+__|\S+))?(?:\s+using\s+([a-zA-Z0-9_]+))?/i);
+              if (cm) {
+                  const lit = (tok) => {
+                      if (tok === undefined) return undefined;
+                      const t = String(tok).match(/^__STR_(\d+)__$/);
+                      return t ? this._unquoteLiteral(strMap[Number(t[1])]) : tok;
+                  };
+                  cycleSpec = {
+                      cols: cm[1].split(',').map(c => c.trim().toLowerCase()),
+                      flagCol: cm[2].toLowerCase(),
+                      markValue: cm[3] !== undefined ? lit(cm[3]) : true,
+                      defaultValue: cm[4] !== undefined ? lit(cm[4]) : false,
+                      pathCol: cm[5] ? cm[5].toLowerCase() : null
+                  };
+                  tail = tail.slice(cm[0].length);
+              }
+              if ((searchSpec || cycleSpec) && !isRecursive) throw new Error("SEARCH / CYCLE require WITH RECURSIVE.");
               if (isRecursive && new RegExp(`\\b(?:from|join)\\s+${name}\\b`, 'i').test(body)) {
                   // 自己参照あり → 再帰CTE（サブクエリ展開は各セグメントの実行時に行う）
-                  this._materializeRecursiveCTE(name, body, tmpName, strMap, colNames);
+                  this._materializeRecursiveCTE(name, body, tmpName, strMap, colNames, searchSpec, cycleSpec);
               } else {
                   body = this.expandSubqueries(this.expandRelationalOps(this.expandTableFunctions(this.expandViews(this.expandInfoSchema(body), strMap), strMap), strMap), strMap);
                   const res = this.executeQuery(body, true, strMap);
@@ -835,7 +1272,8 @@
               }
               cteMap[name] = tmpName;
 
-              rest = rest.slice(end + 1).trim();
+              // SEARCH / CYCLE 句は tail 側で既に消費済み
+              rest = tail.trim();
               if (rest.startsWith(',')) { rest = rest.slice(1).trim(); continue; }
               break;
           }

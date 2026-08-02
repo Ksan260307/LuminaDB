@@ -23,6 +23,10 @@
             this.checks = [];
             // 複合 UNIQUE / PRIMARY KEY: [{ cols: [...], isPK }]
             this.compositeKeys = [];
+            // 名前付き制約の索引: name -> { kind: 'pk'|'unique'|'fk'|'check', cols: [...] }。
+            // ALTER TABLE ... ADD CONSTRAINT <name> ... で登録し
+            // DROP CONSTRAINT <name> の逆引きに使う（実体は uniqueCols/foreignKeys 側）
+            this.constraintNames = Object.create(null);
             // 生成列 (GENERATED ALWAYS AS): col -> 式テキスト（STORED相当。INSERT/UPDATE時に評価）
             this.generatedCols = Object.create(null);
             // ON UPDATE CURRENT_TIMESTAMP を持つ列名（UPDATE 時に自動更新）
@@ -32,6 +36,12 @@
             this.version = 0;
             // CREATE TEMPORARY TABLE で作られたテーブル（IDB保存・SQLエクスポート対象外）
             this.isTemp = false;
+            // AUTO_INCREMENT の採番下限。TRUNCATE ... CONTINUE IDENTITY が設定する
+            // （通常は既存行の最大値+1 で決まるので 1 のまま）
+            this.identityFloor = 1;
+            // 列の照合順序: col -> 'NOCASE' | 'NOACCENT' | 'NUMERIC' 等。
+            // 指定された列は比較・並べ替え・一意性判定で正規化した値を使う
+            this.collations = Object.create(null);
         }
 
         addColumn(col, type = 'ANY') {
@@ -81,12 +91,22 @@
                 delete this.defaults[oldCol];
             }
             if (this.autoIncrementCol === oldCol) this.autoIncrementCol = newCol;
+            if (this.collations && oldCol in this.collations) {
+                this.collations[newCol] = this.collations[oldCol];
+                delete this.collations[oldCol];
+            }
             if (this.generatedCols && oldCol in this.generatedCols) {
                 this.generatedCols[newCol] = this.generatedCols[oldCol];
                 delete this.generatedCols[oldCol];
             }
             (this.compositeKeys || []).forEach(ck => {
                 ck.cols = ck.cols.map(c => c === oldCol ? newCol : c);
+            });
+            // 外部キーの参照元列名も追随させる（従来は取り残されて制約が効かなくなっていた）。
+            // 単一列は { col }、複合列は { cols: [...] } の両形を持つ
+            (this.foreignKeys || []).forEach(fk => {
+                if (fk.cols) fk.cols = fk.cols.map(c => c === oldCol ? newCol : c);
+                else if (fk.col === oldCol) fk.col = newCol;
             });
         }
 
@@ -103,16 +123,21 @@
             this.notNullCols = (this.notNullCols || []).filter(c => c !== col);
             if (this.defaults) delete this.defaults[col];
             if (this.autoIncrementCol === col) this.autoIncrementCol = null;
+            if (this.collations) delete this.collations[col];
             if (this.generatedCols) delete this.generatedCols[col];
             // 列を含む複合キー制約は列ごと削除する（部分キーとして残すと意味が変わるため）
             this.compositeKeys = (this.compositeKeys || []).filter(ck => !ck.cols.includes(col));
+            // 同じ理由で、その列を含む外部キーも落とす（残すと存在しない列を参照し続ける）
+            this.foreignKeys = (this.foreignKeys || []).filter(fk => !(fk.cols || [fk.col]).includes(col));
         }
 
-        changeColumnType(col, newType) {
+        // transform: 行ごとの新しい値の配列（ALTER COLUMN ... USING <expr> 用）。
+        // 指定時は既存値のキャストではなくこの値を格納する
+        changeColumnType(col, newType, transform) {
             this.version++;
             col = col.toLowerCase();
             const c = this.cols[col];
-            if (!c || this.colTypes[col] === newType) return;
+            if (!c || (this.colTypes[col] === newType && !transform)) return;
 
             const oldType = this.colTypes[col] || 'ANY';
 
@@ -141,7 +166,7 @@
                             val = backupStrPools[meta & 0xFFFFFF];
                         }
                     }
-                    this.setValue(col, i, val);
+                    this.setValue(col, i, transform ? transform[i] : val);
                 }
 
                 if (this.indices[col]) {
@@ -385,8 +410,11 @@
             t.onUpdateNowCols = [...(this.onUpdateNowCols || [])];
             t.version = this.version;
             t.compositeKeys = JSON.parse(JSON.stringify(this.compositeKeys || []));
+            t.constraintNames = Object.assign(Object.create(null), JSON.parse(JSON.stringify(this.constraintNames || {})));
             t.generatedCols = Object.assign(Object.create(null), this.generatedCols || {});
             t.isTemp = !!this.isTemp;
+            t.identityFloor = this.identityFloor || 1;
+            t.collations = Object.assign(Object.create(null), this.collations || {});
             Object.keys(this.indices).forEach(c => t.createIndex(c));
             return t;
         }

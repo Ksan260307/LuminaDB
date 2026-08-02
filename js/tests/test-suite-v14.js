@@ -222,7 +222,19 @@
             const r = db.executeQuery("SELECT id FROM idn_t");
             return r.data.length === 1 && r.data[0].id === 1;
         }},
-        { name: "V14Id: Truncate Continue Identity Rejected", sql: "TRUNCATE TABLE idn_t CONTINUE IDENTITY", isErrorExpected: true, check: r => r.error && r.error.includes('CONTINUE IDENTITY') },
+        // v1.20: CONTINUE IDENTITY は採番下限を覚えて継続するようになった（旧: 明示エラー）
+        { name: "V14Id: Truncate Continue Identity Keeps Numbering", fn: () => {
+            db.executeQuery("CREATE TABLE v14_ci (id INTEGER AUTO_INCREMENT, v TEXT)");
+            db.executeQuery("INSERT INTO v14_ci (v) VALUES ('a'), ('b'), ('c')");
+            const t = db.executeQuery("TRUNCATE TABLE v14_ci CONTINUE IDENTITY");
+            db.executeQuery("INSERT INTO v14_ci (v) VALUES ('z')");
+            const kept = db.executeQuery("SELECT id FROM v14_ci").data[0].id;
+            db.executeQuery("TRUNCATE TABLE v14_ci RESTART IDENTITY");
+            db.executeQuery("INSERT INTO v14_ci (v) VALUES ('y')");
+            const reset = db.executeQuery("SELECT id FROM v14_ci").data[0].id;
+            db.executeQuery("DROP TABLE v14_ci");
+            return !t.error && t.data[0].Message.includes('identity continues at 4') && kept === 4 && reset === 1;
+        }},
 
         { name: "V14Se: Set Isolation Level", sql: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED", check: r => r.data[0].Result === 'Success' },
         { name: "V14Se: Show Settings", sql: "SHOW SETTINGS", check: r => r.data.some(x => x.Setting === 'isolation_level' && x.Value === 'READ COMMITTED') && r.data.some(x => x.Setting === 'effective_isolation') },

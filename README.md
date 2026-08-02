@@ -4,7 +4,7 @@
 
 ブラウザだけで完結する、ビルド不要の in-memory SQL データベースエンジンです。単一の HTML ファイルを開くだけで、本格的な SQL（DQL / DML / DDL）・トランザクション・ウィンドウ関数・トリガー・ビュー・`MERGE` / `TOP` / `ON CONFLICT` などの商用 DB コマンド・270 以上の組み込み関数を、サーバーなしで実行できます。
 
-> バージョン: **v1.17.0** / 自己完結テスト **7,091 件**（全パス。うちセキュリティ 780 件超 / パフォーマンス 490 件超）
+> バージョン: **v1.22.0** / 自己完結テスト **7,772 件**（全パス。うちセキュリティ 780 件超 / パフォーマンス 490 件超）
 
 ---
 
@@ -216,6 +216,244 @@ WITH c AS MATERIALIZED (SELECT id FROM users) SELECT COUNT(*) FROM c;
 EXPLAIN QUERY PLAN SELECT * FROM users WHERE id = 1;
 ```
 
+### v1.22 で追加した構文（抜粋）
+
+```sql
+-- 日付演算（従来は文字列連結や NULL になっていた）
+SELECT DATE '2026-01-01' + 30                AS due;      -- 2026-01-31
+SELECT CURRENT_DATE - 7                      AS week_ago;
+SELECT DATE '2026-03-01' - DATE '2026-01-01' AS days;     -- 59
+SELECT nm, hire + 90 AS probation_end FROM emp;           -- 日付型の列にも効く
+
+-- Oracle の階層問い合わせ
+SELECT nm, LEVEL, SYS_CONNECT_BY_PATH(nm, '/') AS path, CONNECT_BY_ISLEAF AS leaf
+FROM emp
+START WITH mgr IS NULL
+CONNECT BY PRIOR id = mgr
+ORDER SIBLINGS BY nm;
+
+SELECT name FROM users WHERE ROWNUM <= 3;                 -- 上位 n 件の定番
+SELECT nm FROM (SELECT nm FROM emp ORDER BY sal DESC) WHERE ROWNUM <= 3;
+
+-- 分析関数
+SELECT nm, RATIO_TO_REPORT(sal) OVER (PARTITION BY dept)          AS share FROM emp;
+SELECT DISTINCT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sal) OVER () AS median FROM emp;
+SELECT NTH_VALUE(nm, 2) FROM LAST OVER (ORDER BY id)              AS second_last FROM emp;
+SELECT MAX(sal) KEEP (DENSE_RANK FIRST ORDER BY hire)             AS earliest_hire_sal FROM emp;
+
+-- DDL の取りこぼし修正・追加
+TRUNCATE TABLE t1, t2;                                    -- 以前は先頭 1 表しか空にしていなかった
+ALTER TABLE t ADD COLUMN len INTEGER GENERATED ALWAYS AS (LENGTH(nm)) STORED;
+CREATE INDEX ix ON t (nm) INCLUDE (v);
+CREATE INDEX CONCURRENTLY ix2 ON t (v);
+SET CONSTRAINTS ALL IMMEDIATE;
+SHOW SCHEMAS;
+SHOW TRANSACTION ISOLATION LEVEL;
+
+-- upsert でも RETURNING が使える（実際に書き込んだ行だけ返る）
+INSERT INTO t (id, nm) VALUES (1, 'a') ON CONFLICT (id) DO NOTHING RETURNING id;
+INSERT INTO t (id, nm) VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET nm = 'b' RETURNING id, nm;
+
+-- PostgreSQL の照合演算子
+SELECT * FROM t WHERE nm ~  '^A';      -- 正規表現
+SELECT * FROM t WHERE nm ~* '^a';      -- 大小無視
+SELECT * FROM t WHERE nm !~~ 'A%';     -- NOT LIKE
+SELECT CURRENT_CATALOG AS db;
+```
+
+### v1.21 で追加した構文（抜粋）
+
+```sql
+-- GROUP BY の結果に対するウィンドウ関数（構成比・グループ内順位・累計）
+SELECT dept,
+       SUM(salary)                                            AS total,
+       ROUND(SUM(salary) * 100.0 / SUM(SUM(salary)) OVER (), 1) AS pct,
+       RANK() OVER (ORDER BY SUM(salary) DESC)                AS rk,
+       SUM(SUM(salary)) OVER (ORDER BY dept)                  AS running
+FROM emp GROUP BY dept;
+
+-- 列レベルの COLLATE が実際に効く（比較・IN・BETWEEN・ORDER BY・GROUP BY・DISTINCT・UNIQUE）
+CREATE TABLE m (id INTEGER PRIMARY KEY, nm TEXT COLLATE NOCASE UNIQUE);
+SELECT * FROM m WHERE nm = 'APPLE';        -- 'Apple' も一致する
+SELECT DISTINCT nm FROM m ORDER BY nm;     -- 大文字小文字を畳んで比較・整列する
+
+-- ORDER BY ALL / GROUPING_ID
+SELECT region, product FROM sales ORDER BY ALL DESC;
+SELECT region, product, SUM(amt), GROUPING_ID(region, product) AS gid
+FROM sales GROUP BY CUBE(region, product);
+
+-- ALTER COLUMN の標準綴りと変換式、制約の改名
+ALTER TABLE t ALTER COLUMN amt SET DATA TYPE FLOAT;
+ALTER TABLE t ALTER COLUMN s TYPE INTEGER USING LENGTH(s);
+ALTER TABLE t RENAME CONSTRAINT uq_old TO uq_new;
+
+-- 識別列への明示代入の扱いを選ぶ（SQL標準）
+INSERT INTO t (id, nm) OVERRIDING SYSTEM VALUE VALUES (99, 'a');  -- 与えた値を使う
+INSERT INTO t (id, nm) OVERRIDING USER VALUE   VALUES (99, 'b');  -- 捨てて自動採番
+
+-- JOIN LATERAL ... ON TRUE（LEFT / INNER / CROSS）
+SELECT u.name, x.c FROM users u
+JOIN LATERAL (SELECT COUNT(*) AS c FROM orders o WHERE o.user_id = u.id) x ON TRUE;
+
+-- 添字とスライス（SQL 準拠の 1 始まり。配列・文字列・JSON 共通）
+SELECT ARRAY[10, 20, 30, 40][2]    AS second;   -- 20
+SELECT ARRAY[10, 20, 30, 40][2:3]  AS slice;    -- [20, 30]
+SELECT ('hello')[2:4]              AS sub;      -- 'ell'
+
+-- 致命的でない問題は「警告」として残る（実行は続行）
+UPDATE emp SET salary = 0;      -- WHERE なしの全行更新
+SHOW WARNINGS;                  -- 直前の文が出した警告を読む
+SHOW COUNT(*) WARNINGS;
+```
+
+### v1.20 で追加した構文（抜粋）
+
+```sql
+-- 連結系集計の引数内 ORDER BY（PostgreSQL / Oracle の書き方）
+SELECT STRING_AGG(name, ',' ORDER BY salary DESC) AS names FROM emp;
+SELECT ARRAY_AGG(name ORDER BY id) AS arr FROM emp;
+
+-- ORDER BY にウィンドウ関数を直書きできる（WHERE / GROUP BY は理由付きで拒否）
+SELECT name FROM emp ORDER BY ROW_NUMBER() OVER (ORDER BY salary DESC);
+
+-- 値の並びからの一括更新（移行スクリプトの定番）
+UPDATE emp SET salary = v.s FROM (VALUES (1, 111), (2, 222)) AS v(i, s) WHERE emp.id = v.i;
+DELETE FROM emp USING (VALUES (9)) AS d(i) WHERE emp.id = d.i;
+
+-- SELECT 句に書く集合返し関数と中置整数除算
+SELECT UNNEST(ARRAY[1, 2, 3]) AS v;
+SELECT GENERATE_SERIES(1, 12) AS month;
+SELECT salary DIV 1000 AS band FROM emp;
+
+-- ドメインと列挙型（列制約として強制される）
+CREATE DOMAIN pos_int AS INTEGER CHECK (VALUE > 0);
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE survey (id INTEGER, score pos_int, m mood);
+
+-- ユーザー・ロール（権限は強制しないがスクリプトは通る）
+CREATE ROLE reporting;  GRANT SELECT ON emp TO reporting;  SHOW GRANTS;
+
+-- 採番を維持したまま全消し
+TRUNCATE TABLE audit CONTINUE IDENTITY;
+
+-- 再帰CTE の走査順と循環検出（循環グラフが上限エラーで落ちなくなる）
+WITH RECURSIVE t(id, nm) AS (
+  SELECT id, nm FROM tree WHERE pid IS NULL
+  UNION ALL SELECT e.id, e.nm FROM tree e JOIN t s ON e.pid = s.id
+) SEARCH DEPTH FIRST BY id SET ord
+SELECT id, ord FROM t ORDER BY ord;
+
+WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT g.b FROM g JOIN t ON g.a = t.n)
+CYCLE n SET is_cycle USING path
+SELECT n, is_cycle, path FROM t;
+```
+
+**性能**: `IN (値, ...)` がインデックスを使うようになりました（従来は全表走査）。
+`EXPLAIN` にも `Index lookup of N value(s)` として出ます。
+
+**修正**: 別名の無い定数列（`SELECT id, name, 0`）が JS の整数風キー順序で先頭へ回り、
+**出力列の順序が SELECT の並びと食い違っていた**のを修正しました。文字列定数で内部トークン
+`__STR_0__` が列名として露出していたのも併せて直しています（いずれも `columnN` になります）。
+集計の入れ子や WHERE でのウィンドウ関数など、実DBが拒否するものは理由の判る文言で拒否します。
+
+### v1.19 で追加した構文（抜粋）
+
+```sql
+-- 複合列の外部キー（複合主キーを参照する定番形。従来は明示エラーだった）
+CREATE TABLE order_line (
+  order_id INTEGER, line_no INTEGER, sku TEXT,
+  FOREIGN KEY (order_id, line_no) REFERENCES shipment(order_id, line_no) ON DELETE CASCADE
+);
+ALTER TABLE order_line ADD CONSTRAINT fk_ship FOREIGN KEY (order_id, line_no) REFERENCES shipment(order_id, line_no);
+
+-- シーケンスのオプションと ALTER
+CREATE SEQUENCE ticket START WITH 100 INCREMENT BY 10 MINVALUE 1 MAXVALUE 999 CYCLE;
+ALTER SEQUENCE ticket RESTART WITH 500;
+
+-- DEFAULT に式を書ける（行ごとに評価される）
+CREATE TABLE audit (
+  id  INTEGER DEFAULT NEXTVAL('ticket'),
+  tag TEXT    DEFAULT UUID(),
+  n   INTEGER DEFAULT (1 + 2)
+);
+
+-- MERGE の条件付き WHEN と、ソースに無い行への操作
+MERGE INTO target t USING source s ON t.id = s.id
+  WHEN MATCHED AND t.qty <> s.qty THEN UPDATE SET qty = s.qty
+  WHEN MATCHED AND s.qty = 0      THEN DELETE
+  WHEN NOT MATCHED AND s.qty > 0  THEN INSERT (id, qty) VALUES (s.id, s.qty)
+  WHEN NOT MATCHED BY SOURCE      THEN DELETE;
+
+-- upsert の追加構文
+INSERT INTO counter (id, hits) VALUES (1, 5) ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits);
+INSERT INTO counter (id, hits) VALUES (1, 5)
+  ON CONFLICT (id) DO UPDATE SET hits = EXCLUDED.hits WHERE counter.hits < EXCLUDED.hits;
+
+-- ビューの列リスト（更新可能ビューのまま使える）
+CREATE VIEW v_user (uid, uname) AS SELECT id, name FROM users;
+UPDATE v_user SET uname = 'Bobby' WHERE uid = 2;
+
+-- DDL とメタデータ
+ALTER INDEX ix_old RENAME TO ix_new;
+SHOW TABLE STATUS LIKE 'user%';
+CREATE TABLE snapshot_shape AS SELECT * FROM users WITH NO DATA;
+CREATE GLOBAL TEMPORARY TABLE scratch (a INTEGER);
+```
+
+集計の入れ子（`MAX(SUM(x))`）は、内側が列名として解決されて判りにくいエラーになっていたのを、
+「入れ子にはできない・サブクエリで先に集計せよ」と伝えるメッセージに変えました。
+
+### v1.18 で追加した構文（抜粋）
+
+```sql
+-- 桁指定付きの型変換（DECIMAL は位取りへ丸め、VARCHAR/CHAR は長さで切り捨て）
+SELECT CAST(1.005 AS DECIMAL(10,2)) AS rounded;   -- 1.01（MySQL と同じ丸め）
+SELECT CAST(12345 AS VARCHAR(3)) AS truncated;    -- '123'
+SELECT CONVERT(DECIMAL(5,1), 3.14159) AS s;       -- SQL Server 形の引数順も可
+
+-- 更新可能ビュー: 単一表への射影＋選択なら INSERT / UPDATE / DELETE が通る
+CREATE VIEW v_active AS SELECT id, name FROM users WHERE age >= 30 WITH CHECK OPTION;
+UPDATE v_active SET name = 'Bobby' WHERE id = 2;  -- 基底表へ書き換えて実行
+INSERT INTO v_active (id, name) VALUES (99, 'x'); -- CHECK OPTION でビュー外の行は拒否
+
+-- 集約ビューへも INSTEAD OF トリガーで書ける
+CREATE TRIGGER tg_sum INSTEAD OF INSERT ON v_totals FOR EACH ROW
+  INSERT INTO orders (user_id, amount) VALUES (NEW.user_id, NEW.total);
+
+-- 列レベルの外部キー宣言（従来は黙って制約が落ちていた）
+CREATE TABLE child (id INTEGER, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE);
+CREATE TABLE child2 (id INTEGER, pid INTEGER REFERENCES parent);  -- 参照列は PK へ解決
+
+-- JSON アクセス演算子と部分更新
+SELECT payload ->> 'name' AS name, payload -> 'tags' AS tags FROM events;
+SELECT payload #>> '{addr,city}' AS city FROM events;
+SELECT COUNT(*) FROM events WHERE payload @> '{"kind":"click"}';
+SELECT JSON_INSERT(payload, '$.seen', TRUE) FROM events;   -- 無いパスだけ書く
+SELECT JSON_REPLACE(payload, '$.seen', FALSE) FROM events;  -- 有るパスだけ書く
+
+-- 真偽述語（3値論理: NULL は TRUE でも FALSE でもない）
+SELECT * FROM users WHERE (age > 30) IS NOT TRUE;
+
+-- 名前付き制約とテーブル別名つき DML
+ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id);
+ALTER TABLE orders DROP CONSTRAINT fk_user;
+UPDATE orders o SET o.amount = o.amount + 1 WHERE o.order_id = 1001;
+DELETE FROM orders o WHERE o.amount = 0;
+
+-- 行コンストラクタ IN のサブクエリ形
+SELECT * FROM orders WHERE (user_id, product_id) IN (SELECT user_id, product_id FROM archive);
+
+-- 索引の並び順・式キーと配列の行展開
+CREATE INDEX ix_price ON products (price DESC, name ASC NULLS LAST);
+CREATE INDEX ix_lname ON users (LOWER(name));
+SELECT SUM(v) FROM UNNEST(ARRAY[1, 2, 3]) AS t(v);
+SELECT v, n FROM UNNEST(ARRAY['a','b']) WITH ORDINALITY AS t(v, n);
+```
+
+追加したメタデータビュー: `INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS` /
+`CHECK_CONSTRAINTS` / `STATISTICS` / `TRIGGERS` / `PARAMETERS`、および
+`SHOW INDEX` / `SHOW KEYS`（`SHOW INDEXES` の MySQL 綴り）。
+
 ### v1.17 で追加した構文（抜粋）
 
 ```sql
@@ -371,6 +609,48 @@ LuminaDB.restoreBackup(await file.text());
 書き直しません。60,000 行の DB で実測すると、初回の全保存 25ms に対し、小さな表を 1 つ
 更新しただけの保存は **2ms**（変更なしの保存は 1ms・書き込み 0 テーブル）です。
 
+### v1.22 で追加した画面機能
+
+| 機能 | 解決する問題 | 操作 |
+|------|--------------|------|
+| **列プロファイル** | 「この列に何が入っているか」を見るのに毎回 SQL を書いていた | テーブル行のグラフアイコン。行数・NULL 数と割合・相異なり数・最小/最大・平均・文字数の幅・出現上位 3 件を一覧する。列名クリックでその列の分布クエリをエディタへ |
+| **ER 図** | 外部キーの関係が画面のどこにも出ていなかった | サイドバー右上の `ER図`。親を上・子を下に並べ、外部キーを矢印で結ぶ。表クリックで `SELECT`、`Copy SVG` で図をコピー |
+
+### v1.21 で追加した画面機能
+
+| 機能 | 解決する問題 | 操作 |
+|------|--------------|------|
+| **エディタタブ** | 別のクエリを試すたびに書きかけを消すか、1 枚のエディタに積み上げるしかなかった | エディタ上部のタブ。`＋`（`Ctrl+Alt+T`）で追加、`×`（`Ctrl+Alt+W`）で閉じる、`Alt+1〜9` で切替。タブ名は SQL から自動で付き、ダブルクリックで手動命名できる。内容と undo 履歴はタブごとに保持され、ブラウザに保存されるのでリロードしても残る |
+| **警告のコンソール出力** | `IF EXISTS` で何もしなかった DDL や `WHERE` なしの全行更新が「成功」としか出なかった | 実行ログコンソール（``Ctrl+` ``）に `WRN` 行として出る。SQL からは `SHOW WARNINGS` で読める |
+
+### v1.20 で追加した画面機能
+
+| 機能 | 解決する問題 | 操作 |
+|------|--------------|------|
+| **結果グリッドの行追加・行削除** | セル編集はできても行の増減は SQL を書く必要があった | セルをクリックして行を選択 → `− Row` で削除、`+ Row` で既定値の行を追加。編集可能なグリッドでのみ有効で、キー値はプレースホルダで束縛される |
+| **クエリ履歴パネル** | `Ctrl+↑↓` の巡回だけでは「少し前のあの1文」に戻れなかった | `History` ボタンで一覧。検索で絞り込み、クリックでエディタへ読み込み、`Run` で即実行 |
+
+### v1.19 で追加した画面機能
+
+| 機能 | 解決する問題 | 操作 |
+|------|--------------|------|
+| **結果グリッドの直接編集** | 1 セル直すだけでも `UPDATE` を書く必要があった | セルを**ダブルクリック**して編集、Enter で確定・Esc で取消。単一表の SELECT でキー列（PK / UNIQUE）が結果に含まれるときだけ有効で、可否と理由はツールバーのバッジに出る。入力値は必ずプレースホルダでバインドするため、引用符やセミコロンを含む値も安全に保存される |
+| **Markdown / INSERT でコピー** | 結果を課題票へ貼ったり別DBへ移すのに手作業が要った | `Copy MD` は Markdown 表（`\|` と改行をエスケープ）、`Copy INSERT` は `INSERT` 文（引用符を二重化）としてクリップボードへ |
+| **ショートカット一覧** | 使える操作が画面から判らなかった | ツールバーの `?` ボタン、またはキーボードの `?`。Esc で全モーダルを閉じる |
+
+### v1.18 で追加した画面機能
+
+商用DBクライアント（DBeaver / pgAdmin / SSMS）で日常的に使う操作を揃えました。
+
+| 機能 | 解決する問題 | 操作 |
+|------|--------------|------|
+| **結果グリッドの絞り込み** | 数千行の結果から目的の行を探すのに、毎回 SQL へ `WHERE` を足していた | 結果上部の絞り込み欄（全列を対象に部分一致。件数は「絞り込み後 / 全件」で表示） |
+| **セル詳細ビュー** | 長いテキストや JSON がセル内で切れて読めなかった | セルをクリック → 型・長さ・生の値を表示（JSON はワンクリックで整形・コピー可） |
+| **スキーマツリーの展開** | 列名と制約を確認するのに `DESCRIBE` を打つ必要があった | テーブル名の左の ▶ で展開。列ごとに型と `PK` / `FK` / `UQ` / `NN` / `AI` / `GEN` のバッジを表示し、クリックでカーソル位置へ列名を挿入 |
+| **オブジェクト一覧の拡充** | ビューとトリガーしか一覧できなかった | Indexes / Sequences / Procedures / Functions のセクションを追加（ビューの `CHECK OPTION` も表示） |
+| **トランザクション操作バー** | `BEGIN` / `COMMIT` / `ROLLBACK` を毎回手で打ち、未確定かどうかが画面から分からなかった | Begin / Commit / Rollback ボタンと状態表示（未確定の変更数つき。トランザクション中は自動保存を止める） |
+| **カーソル位置の文だけ実行** | 複数文を書き溜めたエディタから 1 文だけ試せなかった | `Ctrl+Enter` でカーソル位置の文のみ実行（`Ctrl+Shift+Enter` は従来どおり全文）。文字列リテラル内の `;` は区切りとして扱わない |
+
 ### v1.17 で追加したブラウザDB機能
 
 | 機能 | 解決する問題 | API |
@@ -481,6 +761,11 @@ js/
 | `test-suite-v20.js` | 275 | v1.15 の構文とブラウザDB必須機能。新しい入口（プロシージャのローカル変数・`JSON_TABLE` のパス・`MATCH` の検索語・バックアップの取り込み・ワーカーのメッセージ）に対するセキュリティ検査と性能予算を含む |
 | `test-suite-v21.js` | 185 | v1.16 の手続き型（カーソル・ハンドラ・`SIGNAL`・`CASE` 文）、期間/JSON/時系列の述語、差分永続化・ストリーミング読み出し。カーソルが返す値と `SIGNAL` の本文に対するセキュリティ検査を含む |
 | `test-suite-v22.js` | 180 | v1.17 の配列・回帰集計・あいまい照合・時系列生成・ウィンドウ拡張、式キャッシュ・CSV 取り込み・リーダー選出。CSV のフィールド/ヘッダーと配列要素に対するセキュリティ検査を含む |
+| `test-suite-v23.js` | 203 | v1.18 の桁指定付き `CAST`/`CONVERT`、更新可能ビューと `WITH CHECK OPTION`、`INSTEAD OF` トリガー、列レベル `REFERENCES`、JSON アクセス演算子、`IS [NOT] TRUE/FALSE`、名前付き制約、DML の別名、行コンストラクタ `IN (SELECT)`、索引の並び順/式キー、メタデータビュー、`UNNEST`。UI（結果絞り込み・セル詳細・ツリー展開・トランザクションバー・カーソル位置の文の実行）も含む |
+| `test-suite-v24.js` | 124 | v1.19 の複合列 `FOREIGN KEY`、シーケンスのオプションと `ALTER SEQUENCE`、`DEFAULT` 式、`MERGE` の条件付き `WHEN` と `NOT MATCHED BY SOURCE`、`VALUES(col)` / `ON CONFLICT ... WHERE`、ビューの列リスト、`ALTER INDEX RENAME` / `SHOW TABLE STATUS` / `WITH [NO] DATA`、集計入れ子の診断。UI（結果グリッドの直接編集・コピー書式・ショートカット）も含み、セル編集の値がバインドされること（SQL 組み立てでないこと）を検査する |
+| `test-suite-v27.js` | 123 | v1.22 の日付演算（日付 ± 数値 / 日付 − 日付）、Oracle の階層問い合わせ（`CONNECT BY` / `LEVEL` / `SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT` / `NOCYCLE`）と `ROWNUM`、分析関数（`RATIO_TO_REPORT` / `PERCENTILE_* OVER` / `NTH_VALUE ... FROM LAST` / `KEEP (DENSE_RANK ...)`）、`TRUNCATE` の複数表指定、`CREATE INDEX` の `INCLUDE`/`CONCURRENTLY`、`ADD COLUMN` の生成列、`SET CONSTRAINTS`、upsert の `RETURNING`、PostgreSQL の照合演算子。UI（列プロファイル・ER 図）も含む |
+| `test-suite-v26.js` | 115 | v1.21 の GROUP BY 結果へのウィンドウ関数、列レベル `COLLATE` の実効化（比較・`IN`・`BETWEEN`・`ORDER BY`・`GROUP BY`・`DISTINCT`・`UNIQUE`・索引経路の回避）、`ORDER BY ALL` / `GROUPING_ID`、`ALTER COLUMN ... SET DATA TYPE` / `TYPE ... USING`、`RENAME CONSTRAINT`、`INSERT ... OVERRIDING VALUE`、`JOIN LATERAL ... ON TRUE`、1 始まりの添字とスライス、文単位の警告と `SHOW WARNINGS`。UI（エディタタブ、警告のコンソール出力）も含む |
+| `test-suite-v25.js` | 110 | v1.20 の連結系集計の引数内 `ORDER BY`、`ORDER BY` のウィンドウ関数、`UPDATE`/`DELETE` の派生表ソース、SELECT 句の集合返し関数、`DIV` 演算子、`CREATE DOMAIN`/`TYPE AS ENUM`、ユーザー・ロール、`TRUNCATE CONTINUE IDENTITY`、再帰CTE の `SEARCH`/`CYCLE`、`IN` のインデックス活用、定数列の命名。UI（行追加・削除、クエリ履歴パネル）も含み、行削除のキー値がバインドされることを検査する |
 
 セキュリティテストは「攻撃者が制御できる文字列」を 28 種類用意し、10 通りの入口（`?` バインド / 名前付きバインド / `insert` / `update` / `select` / `remove` / `prepare` / SQL プリペアド / `WHERE` / `LIKE`）へ総当たりで流し込み、**(a) JS として実行されない・(b) SQL の構造が変わらない・(c) 値としてそのまま往復する** の 3 点を毎回検査します。
 

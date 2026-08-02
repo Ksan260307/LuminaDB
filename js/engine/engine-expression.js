@@ -9,6 +9,27 @@
     // 注意: ヘルパーは全て状態を持たない（相関サブクエリは ptrs/dbTables/aliases を
     // 引数で受け取り、シーケンス等は dbTables.__engine__ 経由でエンジンへ到達する）
     // ------------------------------------------------------------------------
+
+    // CAST / CONVERT / '::' が受け付ける型名 -> __cast の正準名。
+    // 商用DBの型名は方言ごとに別名が多い（INT4/INT8/NUMBER/VARCHAR2/NVARCHAR ...）ため
+    // ここへ寄せる。ここに無い型名は「変換せず素通し」になる
+    const CAST_TYPE_ALIASES = {
+        'INT': 'INTEGER', 'INTEGER': 'INTEGER', 'INT2': 'INTEGER', 'INT4': 'INTEGER', 'INT8': 'INTEGER',
+        'SMALLINT': 'INTEGER', 'TINYINT': 'INTEGER', 'MEDIUMINT': 'INTEGER', 'BIGINT': 'INTEGER',
+        'SERIAL': 'INTEGER', 'BIGSERIAL': 'INTEGER', 'SIGNED': 'INTEGER', 'UNSIGNED': 'INTEGER',
+        'DECIMAL': 'DECIMAL', 'DEC': 'DECIMAL', 'NUMERIC': 'DECIMAL', 'NUMBER': 'DECIMAL',
+        'MONEY': 'DECIMAL', 'SMALLMONEY': 'DECIMAL',
+        'FLOAT': 'FLOAT', 'REAL': 'FLOAT', 'DOUBLE': 'FLOAT', 'DOUBLE PRECISION': 'FLOAT',
+        'BINARY_FLOAT': 'FLOAT', 'BINARY_DOUBLE': 'FLOAT',
+        'TEXT': 'TEXT', 'CHAR': 'TEXT', 'CHARACTER': 'TEXT', 'CHARACTER VARYING': 'TEXT',
+        'VARCHAR': 'TEXT', 'VARCHAR2': 'TEXT', 'NVARCHAR': 'TEXT', 'NVARCHAR2': 'TEXT', 'NCHAR': 'TEXT',
+        'STRING': 'TEXT', 'CLOB': 'TEXT', 'NCLOB': 'TEXT',
+        'LONGTEXT': 'TEXT', 'MEDIUMTEXT': 'TEXT', 'TINYTEXT': 'TEXT',
+        'BOOL': 'BOOLEAN', 'BOOLEAN': 'BOOLEAN',
+        'DATE': 'DATE', 'DATETIME': 'DATE', 'DATETIME2': 'DATE', 'SMALLDATETIME': 'DATE', 'TIMESTAMP': 'DATE',
+        'TIME': 'TIME'
+    };
+
     const __EXPR_LIB = (function () {
 
               // 列名タイプミスの提案（エラー経路のみで実行される）
@@ -79,6 +100,19 @@
               };
               // ILIKE (PostgreSQL): LIKE の大文字小文字非依存版。__like は元々 'i' フラグで
               // 照合するため実装を共用できるが、将来 LIKE を照合順依存にしても壊れないよう分離する
+              // PostgreSQL の照合演算子。NULL が絡む比較は NULL のまま返す（3値論理）
+              const __op_like  = (a, b) => (a == null || b == null) ? null : __like(a, b);
+              const __op_nlike = (a, b) => { const r = __op_like(a, b); return r === null ? null : !r; };
+              const __op_ilike = (a, b) => (a == null || b == null) ? null : __ilike(a, b);
+              const __op_nilike = (a, b) => { const r = __op_ilike(a, b); return r === null ? null : !r; };
+              const __op_regex = (a, b) => (a == null || b == null) ? null : __regexp_like(a, b);
+              const __op_iregex = (a, b) => {
+                  if (a == null || b == null) return null;
+                  __regexp_guard(b);
+                  try { return new RegExp(String(b), 'i').test(String(a)) ? 1 : 0; } catch (e) { return 0; }
+              };
+              const __op_nregex = (a, b) => { const r = __op_regex(a, b); return r === null ? null : !r; };
+              const __op_niregex = (a, b) => { const r = __op_iregex(a, b); return r === null ? null : !r; };
               const __ilike = (val, pattern, esc) => {
                  if (val === null || val === undefined || pattern == null) return false;
                  const p = String(pattern);
@@ -228,6 +262,9 @@
                   return isNaN(r.getTime()) ? null : r.toISOString().replace('T', ' ').slice(0, 19);
               };
               const __date_add = (v, n) => __add_interval(v, n, 1);
+              // 日付型の列への参照に付く目印。値はそのまま返し、'+'/'-' の
+              // 書き換え（_rewriteDateArith）がコンパイル時に日付だと判るようにするだけ
+              const __datecol = (v) => v;
               const __date_sub = (v, n) => __add_interval(v, n, -1);
               // (s1, e1) OVERLAPS (s2, e2): 期間の重なり判定（SQL標準。端点は半開区間で扱う）
               const __overlaps = (a1, a2, b1, b2) => {
@@ -307,6 +344,32 @@
                   return i === -1 ? null : i + 1;   // SQL の配列は 1 始まり
               };
               const __array_contains = (a, v) => { const x = __toArray(a); return x === null ? null : x.some(e => e === v); };
+              // a[n]: 配列・JSON 配列は 1 始まりの要素、文字列は 1 始まりの 1 文字、
+              // オブジェクト（JSON）は添字をキーとして引く。範囲外は NULL
+              const __subscript = (a, i) => {
+                  if (a === null || a === undefined || i === null || i === undefined) return null;
+                  if (typeof a === 'object' && !Array.isArray(a)) return a[i] === undefined ? null : a[i];
+                  if (typeof a === 'string') {
+                      const t = a.trim();
+                      if (t[0] === '{' ) { try { const p = JSON.parse(t); if (p && typeof p === 'object' && !Array.isArray(p)) return p[i] === undefined ? null : p[i]; } catch (e) { /* 通常の文字列 */ } }
+                      if (t[0] !== '[') { const n = Number(i); return (n >= 1 && n <= a.length) ? a[n - 1] : null; }
+                  }
+                  const x = __toArray(a);
+                  const n = Number(i);
+                  if (x === null || !Number.isFinite(n)) return null;
+                  return (n >= 1 && n <= x.length) ? x[n - 1] : null;
+              };
+              // a[lo:hi]: 1 始まり・両端を含む。境界の省略は先頭 / 末尾を意味する
+              const __array_slice = (a, lo, hi) => {
+                  if (a === null || a === undefined) return null;
+                  const isStr = typeof a === 'string' && a.trim()[0] !== '[';
+                  const x = isStr ? a : __toArray(a);
+                  if (x === null) return null;
+                  const from = (lo === null || lo === undefined) ? 1 : Number(lo);
+                  const to = (hi === null || hi === undefined) ? x.length : Number(hi);
+                  if (!Number.isFinite(from) || !Number.isFinite(to)) return null;
+                  return x.slice(Math.max(0, from - 1), Math.max(0, to));
+              };
               const __array_append = (a, v) => { const x = __toArray(a); return x === null ? [v] : x.concat([v]); };
               const __array_prepend = (v, a) => { const x = __toArray(a); return x === null ? [v] : [v].concat(x); };
               const __array_remove = (a, v) => { const x = __toArray(a); return x === null ? null : x.filter(e => e !== v); };
@@ -523,11 +586,50 @@
               const __log10 = (v) => (v != null && Number(v) > 0) ? Math.log10(Number(v)) : null;
               const __pi = () => Math.PI;
 
-              const __cast = (v, t) => {
+              // 指定位取りへゼロから遠い方向で丸める。10^sc の乗算は 1.005*100 が
+              // 100.49999... になる（1.005 が二進で表せない）ため、指数表記の文字列を
+              // 経由して小数点を移す — こうすると "1.005e2" が正確に 100.5 へパースされ、
+              // MySQL の DECIMAL 丸めと一致する。指数表記の値だけ乗算へ退避する
+              const __round_scale = (n, sc) => {
+                  const str = String(n);
+                  if (str.indexOf('e') !== -1 || str.indexOf('E') !== -1) {
+                      const f = Math.pow(10, sc);
+                      return Math.sign(n) * Math.round(Math.abs(n) * f) / f;
+                  }
+                  const shifted = Number(str + 'e' + sc);
+                  if (!isFinite(shifted)) return n;
+                  const rounded = Math.sign(shifted) * Math.round(Math.abs(shifted));
+                  const back = Number(rounded + 'e' + (-sc));
+                  return isFinite(back) ? back : n;
+              };
+
+              // 型名は正規化済みの正準名（INTEGER/FLOAT/DECIMAL/TEXT/BOOLEAN/DATE/TIME）で渡され、
+              // p/s は DECIMAL(p,s) や VARCHAR(n) の桁指定（未指定なら null）。
+              // 正規化と別名解決はコンパイル時（_normalizeCastType）に済んでいるため、
+              // 行評価ごとの型名パースは発生しない
+              const __cast = (v, t, p, s) => {
                   if (v === null || v === undefined) return null;
                   if (t === 'INTEGER') { const n = Math.trunc(Number(v)); return isNaN(n) ? null : n; }
                   if (t === 'FLOAT') { const n = Number(v); return isNaN(n) ? null : n; }
-                  if (t === 'TEXT') return String(v);
+                  if (t === 'DECIMAL') {
+                      const n = Number(v);
+                      if (isNaN(n)) return null;
+                      // 位取り指定があればそこへ丸める（MySQL 同様ゼロから遠い方向）。
+                      // 桁数のみなら位取り 0、どちらも無ければ値をそのまま通す
+                      if (p == null) return n;
+                      const sc = s == null ? 0 : s;
+                      const r = __round_scale(n, sc);
+                      // 整数部が精度に収まらない場合は NULL（式評価中の throw は行単位の
+                      // catch に飲まれて結局 NULL になるため、最初から NULL で一貫させる。
+                      // 変換不能を NULL で表すのは他の __cast 分岐と同じ規約）
+                      if (Math.abs(r) >= Math.pow(10, p - sc)) return null;
+                      return r;
+                  }
+                  if (t === 'TEXT') {
+                      const sv = String(v);
+                      // CHAR(n)/VARCHAR(n) は長さ超過分を切り捨てる（MySQL の CAST と同じ挙動）
+                      return (p == null || sv.length <= p) ? sv : sv.slice(0, p);
+                  }
                   if (t === 'BOOLEAN') {
                       if (typeof v === 'boolean') return v;
                       if (v === 1 || v === 0) return v === 1;
@@ -541,6 +643,14 @@
                       // 解釈するため、直後の toISOString でタイムゾーン分ずれる）
                       const d = v instanceof Date ? v : __date_parse(v);
                       return (!d || isNaN(d.getTime())) ? null : d.toISOString().replace('T', ' ').slice(0, 19);
+                  }
+                  if (t === 'TIME') {
+                      const d = v instanceof Date ? v : __date_parse(v);
+                      if (d && !isNaN(d.getTime())) return d.toISOString().slice(11, 19);
+                      // 'HH:MM[:SS]' 単体の文字列も受ける
+                      const tm = String(v).match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+                      if (!tm) return null;
+                      return `${tm[1].padStart(2, '0')}:${tm[2]}:${tm[3] || '00'}`;
                   }
                   return v;
               };
@@ -870,6 +980,133 @@
                   if (Array.isArray(cur) && typeof leaf === 'number') cur.splice(leaf, 1);
                   else if (cur !== null && typeof cur === 'object') delete cur[leaf];
                   return JSON.stringify(obj);
+              };
+
+              // --- v1.18 追加: JSON の部分更新（MySQL 互換）と演算子形アクセス ---
+              // JSON_INSERT は「存在しないパスだけ」書く。JSON_REPLACE は「存在するパスだけ」書く。
+              // JSON_SET は両方。3者は書き込み条件だけが違うので判定を共有する
+              const __json_write = (v, path, val, mode) => {
+                  const obj = __json_parse(v);
+                  const parts = __json_path(path);
+                  if (obj === undefined || parts === null || parts.length === 0) return null;
+                  parts.forEach(__json_safe_key);
+                  let cur = obj;
+                  for (let i = 0; i < parts.length - 1; i++) {
+                      const k = parts[i];
+                      if (cur === null || typeof cur !== 'object') return JSON.stringify(obj);
+                      if (cur[k] === undefined || cur[k] === null || typeof cur[k] !== 'object') {
+                          // 中間ノードが無い場合、REPLACE は何もしない（対象パスが存在しないため）
+                          if (mode === 'replace') return JSON.stringify(obj);
+                          cur[k] = typeof parts[i + 1] === 'number' ? [] : {};
+                      }
+                      cur = cur[k];
+                  }
+                  if (cur === null || typeof cur !== 'object') return JSON.stringify(obj);
+                  const leaf = parts[parts.length - 1];
+                  const exists = Array.isArray(cur) ? (typeof leaf === 'number' && leaf < cur.length) : (leaf in cur);
+                  if (mode === 'insert' && exists) return JSON.stringify(obj);
+                  if (mode === 'replace' && !exists) return JSON.stringify(obj);
+                  if (Array.isArray(cur) && typeof leaf === 'number' && leaf >= cur.length) cur.push(val === undefined ? null : val);
+                  else cur[leaf] = val === undefined ? null : val;
+                  return JSON.stringify(obj);
+              };
+              const __json_insert = (v, path, val) => __json_write(v, path, val, 'insert');
+              const __json_replace = (v, path, val) => __json_write(v, path, val, 'replace');
+              // JSON_ARRAY_INSERT('[1,2]', '$[0]', 9) -> '[9,1,2]'（指定位置へ挿入。末尾超過は追記）
+              const __json_array_insert = (v, path, val) => {
+                  const obj = __json_parse(v);
+                  const parts = __json_path(path);
+                  if (obj === undefined || parts === null || parts.length === 0) return null;
+                  if (typeof parts[parts.length - 1] !== 'number') return null;
+                  parts.forEach(__json_safe_key);
+                  let cur = obj;
+                  for (let i = 0; i < parts.length - 1; i++) {
+                      if (cur === null || typeof cur !== 'object') return JSON.stringify(obj);
+                      cur = cur[parts[i]];
+                      if (cur === undefined) return JSON.stringify(obj);
+                  }
+                  if (!Array.isArray(cur)) return JSON.stringify(obj);
+                  const idx = parts[parts.length - 1];
+                  cur.splice(Math.min(idx, cur.length), 0, val === undefined ? null : val);
+                  return JSON.stringify(obj);
+              };
+              // '->' / '->>' のキー引数は '$.a' 形のパスでも 'a' / 配列添字の数値でも来る。
+              // PostgreSQL/MySQL 双方の書き方を受けられるようここで正規化する
+              const __json_key_path = (k) => {
+                  if (k === null || k === undefined) return null;
+                  if (typeof k === 'number') return '$[' + Math.trunc(k) + ']';
+                  const sk = String(k);
+                  if (sk[0] === '$') return sk;
+                  if (/^-?\d+$/.test(sk)) return '$[' + sk + ']';
+                  return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(sk) ? '$.' + sk : '$."' + sk.replace(/"/g, '') + '"';
+              };
+              // '->' は JSON を JSON のまま返す（オブジェクト/配列は文字列化、スカラーは JSON 表記）
+              const __json_arrow = (v, k) => {
+                  const p = __json_key_path(k);
+                  if (p === null) return null;
+                  const r = __json_get(v, p);
+                  if (r === undefined) return null;
+                  return JSON.stringify(r);
+              };
+              // '->>' は取り出した値をテキストとして返す（文字列は引用符なし）
+              const __json_arrow_text = (v, k) => {
+                  const p = __json_key_path(k);
+                  if (p === null) return null;
+                  const r = __json_get(v, p);
+                  if (r === undefined || r === null) return null;
+                  return typeof r === 'object' ? JSON.stringify(r) : String(r);
+              };
+              // '#>' / '#>>' のパスは '{a,b}' 形（PostgreSQL）または JSON 配列 '["a","b"]'
+              const __json_path_list = (spec) => {
+                  if (spec == null) return null;
+                  const t = String(spec).trim();
+                  let keys;
+                  if (t[0] === '{' && t[t.length - 1] === '}') {
+                      const body = t.slice(1, -1).trim();
+                      keys = body === '' ? [] : body.split(',').map(x => x.trim());
+                  } else {
+                      const parsed = __json_parse(t);
+                      if (!Array.isArray(parsed)) return null;
+                      keys = parsed.map(x => String(x));
+                  }
+                  return '$' + keys.map(k => /^-?\d+$/.test(k) ? '[' + k + ']' : (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(k) ? '.' + k : '."' + k.replace(/"/g, '') + '"')).join('');
+              };
+              const __json_hash_arrow = (v, spec) => {
+                  const p = __json_path_list(spec);
+                  return p === null ? null : __json_arrow(v, p);
+              };
+              const __json_hash_arrow_text = (v, spec) => {
+                  const p = __json_path_list(spec);
+                  return p === null ? null : __json_arrow_text(v, p);
+              };
+              // トップレベルにそのキー（配列なら要素）が存在するか
+              const __json_has_key = (v, k) => {
+                  const t = __json_parse(v);
+                  if (t === undefined || t === null || k == null) return null;
+                  if (Array.isArray(t)) return t.some(x => String(x) === String(k));
+                  if (typeof t !== 'object') return false;
+                  return Object.keys(t).indexOf(String(k)) !== -1;
+              };
+              // JSON_CONTAINS_PATH(json, 'one'|'all', path, ...) — MySQL 互換
+              const __json_contains_path = (v, oneOrAll, ...paths) => {
+                  if (v == null || oneOrAll == null || paths.length === 0) return null;
+                  const all = String(oneOrAll).toLowerCase() === 'all';
+                  const hits = paths.map(p => __json_get(v, p) !== undefined);
+                  return (all ? hits.every(Boolean) : hits.some(Boolean)) ? 1 : 0;
+              };
+              // SQL 標準の真偽述語 IS [NOT] TRUE|FALSE。NULL(UNKNOWN) は TRUE でも FALSE でもない
+              const __is_bool = (v, want, negate) => {
+                  let b;
+                  if (v === null || v === undefined) b = false;
+                  else if (typeof v === 'boolean') b = (v === want);
+                  else if (typeof v === 'number') b = ((v !== 0) === want);
+                  else {
+                      const sv = String(v).toLowerCase();
+                      if (sv === 'true' || sv === '1') b = (want === true);
+                      else if (sv === 'false' || sv === '0' || sv === '') b = (want === false);
+                      else b = (want === true);
+                  }
+                  return negate ? !b : b;
               };
 
               // --- v1.2 追加関数群: 正規表現 / 文字列 / ビット / 時刻 ---
@@ -1751,9 +1988,15 @@
                   return __to_char_number(v, f);
               };
 
-        return { __ilike, __similar, __concat_op, __setseed, __collate, __ft_tokens, __match_against,
+        return { __op_like, __op_nlike, __op_ilike, __op_nilike,
+                 __op_regex, __op_iregex, __op_nregex, __op_niregex,
+                 __ilike, __similar, __concat_op, __setseed, __collate, __ft_tokens, __match_against,
                  __overlaps, __date_bin, __age, __is_json, __json_exists, __json_query,
+                 __json_insert, __json_replace, __json_array_insert, __json_arrow, __json_arrow_text,
+                 __json_hash_arrow, __json_hash_arrow_text, __json_has_key, __json_contains_path, __is_bool,
+                 __datecol,
                  __array, __toArray, __array_length, __array_position, __array_contains, __array_append,
+                 __subscript, __array_slice,
                  __array_prepend, __array_remove, __array_to_string, __string_to_array, __array_agg_sort,
                  __levenshtein, __similarity, __difference, __regexp_matches, __regexp_split_to_array,
                  __div, __safe_divide, __at_time_zone,
@@ -1866,7 +2109,260 @@
           return { start: k + 1, end: i };
       },
 
+      // JSON アクセス演算子を関数呼び出しへ畳む（PostgreSQL / MySQL 共通の書き方）。
+      //   j -> 'a'    要素を JSON のまま      j ->> 'a'   要素をテキストで
+      //   j #> '{a,b}' パス配列で JSON       j #>> '{a,b}' パス配列でテキスト
+      //   a @> b      a が b を含む          a <@ b      a が b に含まれる
+      // 左辺は _operandStartBefore で後方走査、右辺は前方の1プライマリだけを取る。
+      // これにより比較演算子より強く結合し（`j->>'a' = 'x'` が正しく割れる）、
+      // `j->'a'->>'b'` の連鎖も左から順に畳める
+      _JSON_OPS: [
+          ['#>>', '__json_hash_arrow_text'],
+          ['#>', '__json_hash_arrow'],
+          ['->>', '__json_arrow_text'],
+          ['->', '__json_arrow'],
+          ['@>', '__json_contains_op'],
+          ['<@', '__json_contained_op']
+      ],
+
+      // PostgreSQL の照合演算子。~ 系は正規表現、~~ 系は LIKE の別綴り。
+      // 長い綴りを先に並べる（'!~~*' が '!~' で切れないように）
+      _MATCH_OPS: [
+          ['!~~*', '__op_nilike'],
+          ['!~~', '__op_nlike'],
+          ['~~*', '__op_ilike'],
+          ['~~', '__op_like'],
+          ['!~*', '__op_niregex'],
+          ['!~', '__op_nregex'],
+          ['~*', '__op_iregex'],
+          ['~', '__op_regex']
+      ],
+
+      // <left> <op> <right> を関数呼び出しへ畳む（左は後方走査、右は 1 プライマリ）
+      _rewriteMatchOps(s) {
+          if (s.indexOf('~') === -1) return s;
+          for (let guard = 0; guard < 128; guard++) {
+              let best = -1, op = null, fn = null;
+              for (const [sym, f] of this._MATCH_OPS) {
+                  const at = s.indexOf(sym);
+                  if (at === -1) continue;
+                  if (best === -1 || at < best || (at === best && sym.length > op.length)) { best = at; op = sym; fn = f; }
+              }
+              if (best === -1) return s;
+              const { start, end } = this._operandStartBefore(s, best, op);
+              const right = this._primaryAfter(s, best + op.length, op);
+              s = s.slice(0, start) + `${fn}(${s.slice(start, end + 1)}, ${s.slice(right.start, right.end + 1)})` + s.slice(right.end + 1);
+          }
+          return s;
+      },
+
+      _rewriteJsonOps(s) {
+          if (!/->|#>|@>|<@/.test(s)) return s;
+          for (let guard = 0; guard < 128; guard++) {
+              // 最も左に現れる演算子を選ぶ（同位置なら長い綴りを優先）
+              let best = -1, op = null, fn = null;
+              for (const [sym, f] of this._JSON_OPS) {
+                  const at = s.indexOf(sym);
+                  if (at === -1) continue;
+                  if (best === -1 || at < best || (at === best && sym.length > op.length)) { best = at; op = sym; fn = f; }
+              }
+              if (best === -1) return s;
+              const { start, end } = this._operandStartBefore(s, best, op);
+              const right = this._primaryAfter(s, best + op.length, op);
+              const args = `${s.slice(start, end + 1)}, ${s.slice(right.start, right.end + 1)}`;
+              // @> / <@ は __json_contains の引数順（対象, 候補）に合わせる
+              let rep;
+              if (fn === '__json_contains_op') rep = `(__json_contains(${args}) === 1)`;
+              else if (fn === '__json_contained_op') rep = `(__json_contains(${s.slice(right.start, right.end + 1)}, ${s.slice(start, end + 1)}) === 1)`;
+              else rep = `${fn}(${args})`;
+              s = s.slice(0, start) + rep + s.slice(right.end + 1);
+          }
+          return s;
+      },
+
+      // 位置 at 以降の「1プライマリ」（括弧グループ / 関数呼び出し / 識別子 / トークン / 数値）
+      // の範囲を返す。_operandStartBefore の前方版
+      _primaryAfter(s, at, what) {
+          let i = at;
+          while (i < s.length && /\s/.test(s[i])) i++;
+          if (i >= s.length) throw new Error(`Syntax Error near '${what}': missing right operand.`);
+          const start = i;
+          if (s[i] === '-' || s[i] === '+') i++;
+          if (s[i] === '(') {
+              let d = 0;
+              for (; i < s.length; i++) {
+                  if (s[i] === '(') d++;
+                  else if (s[i] === ')') { d--; if (d === 0) return { start, end: i }; }
+              }
+              throw new Error(`Syntax Error near '${what}': unbalanced parentheses.`);
+          }
+          let j = i;
+          while (j < s.length && /[a-zA-Z0-9_.$]/.test(s[j])) j++;
+          if (j === i) throw new Error(`Syntax Error near '${what}': missing right operand.`);
+          // 関数呼び出しなら引数の括弧まで取り込む
+          let k = j;
+          while (k < s.length && /\s/.test(s[k])) k++;
+          if (s[k] === '(') {
+              let d = 0;
+              for (let m = k; m < s.length; m++) {
+                  if (s[m] === '(') d++;
+                  else if (s[m] === ')') { d--; if (d === 0) return { start, end: m }; }
+              }
+              throw new Error(`Syntax Error near '${what}': unbalanced parentheses.`);
+          }
+          return { start, end: j - 1 };
+      },
+
+      // MySQL の中置整数除算 `a DIV b` を __div(a, b) へ畳む。
+      // 左辺は後方走査、右辺は前方の1プライマリ（`7 DIV 2 DIV 2` の連鎖も左から畳める）
+      _rewriteDivOp(s) {
+          if (!/\bDIV\b/i.test(s)) return s;
+          let from = 0;
+          for (let guard = 0; guard < 64; guard++) {
+              const rel = s.slice(from).match(/\bDIV\b/i);
+              if (!rel) return s;
+              const at = from + rel.index;
+              // 直前が識別子文字なら関数名の一部（既に __div( へ畳まれた形）なので飛ばす
+              if (at > 0 && /[a-zA-Z0-9_]/.test(s[at - 1])) { from = at + 3; continue; }
+              if (/^\s*\(/.test(s.slice(at + 3))) { from = at + 3; continue; }
+              const { start, end } = this._operandStartBefore(s, at, 'DIV');
+              const right = this._primaryAfter(s, at + 3, 'DIV');
+              const rep = `__div(${s.slice(start, end + 1)}, ${s.slice(right.start, right.end + 1)})`;
+              s = s.slice(0, start) + rep + s.slice(right.end + 1);
+              from = start + rep.length;
+          }
+          return s;
+      },
+
+      // <expr> IS [NOT] TRUE|FALSE を __is_bool(expr, want, negate) へ書き換える。
+      // 左辺は `(sal > 150)` のような括弧式が主なので、正規表現で切るのではなく
+      // _operandStartBefore で対応括弧まで後方走査する（入れ子の深さに依存しない）
+      _rewriteIsBool(s) {
+          if (!/\bIS\s+(?:NOT\s+)?(?:TRUE|FALSE)\b/i.test(s)) return s;
+          let from = 0;
+          for (let guard = 0; guard < 128; guard++) {
+              const rel = s.slice(from).match(/\bIS\s+(NOT\s+)?(TRUE|FALSE)\b/i);
+              if (!rel) return s;
+              const at = from + rel.index;
+              const { start, end } = this._operandStartBefore(s, at, 'IS TRUE/FALSE');
+              const want = rel[2].toUpperCase() === 'TRUE' ? 'true' : 'false';
+              const neg = rel[1] ? 'true' : 'false';
+              const rep = `__is_bool(${s.slice(start, end + 1)}, ${want}, ${neg})`;
+              s = s.slice(0, start) + rep + s.slice(at + rel[0].length);
+              from = start + rep.length;
+          }
+          return s;
+      },
+
       _COLLATIONS: new Set(['NOCASE', 'CI', 'BINARY', 'CS', 'NOACCENT', 'AI', 'NUMERIC', 'NATURAL']),
+
+      // 照合順序を適用した比較用の値を返す（コンパイル済み式の外——並べ替え・
+      // グループ化・DISTINCT・一意性検査——から使う。中身は __collate と同じ規則）
+      _collateValue(v, name) {
+          if (v === null || v === undefined) return v;
+          const c = String(name || '').toUpperCase();
+          const s = String(v);
+          if (!c || c === 'BINARY' || c === 'CS') return s;
+          if (c === 'NOACCENT' || c === 'AI') return s.normalize('NFD').replace(/[̀-゙ͯ-゜]/g, '');
+          if (c === 'NUMERIC' || c === 'NATURAL') return s.replace(/\d+/g, (d) => d.padStart(20, '0'));
+          if (c === 'NOCASE' || c === 'CI') return s.toLowerCase();
+          throw new Error(`Unknown collation '${name}'. Use NOCASE / BINARY / NOACCENT / NUMERIC.`);
+      },
+
+      // 式テキストが「照合順序付きの実列そのもの」を指していれば照合名を返す。
+      // 関数呼び出しや演算を含む式は対象外（値が列そのものではないため）
+      _collationOfExpr(text, aliases) {
+          if (!text) return null;
+          const m = String(text).trim().match(/^(?:([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\s*)?([a-zA-Z_][a-zA-Z0-9_]*)$/);
+          if (!m) return null;
+          const qual = m[1] ? m[1].toLowerCase() : null;
+          const col = m[2].toLowerCase();
+          let found = null;
+          for (const a in aliases) {
+              if (qual && a.toLowerCase() !== qual) continue;
+              const t = this.tables[aliases[a]];
+              if (!t || !t.collations || !t.collations[col]) continue;
+              if (found && found !== t.collations[col]) return null; // 曖昧
+              found = t.collations[col];
+          }
+          return found;
+      },
+
+      // 列に照合順序が指定されている場合、その列への参照へ暗黙の COLLATE を挿す。
+      // 既存の `_rewriteCollate` が比較の右辺にも同じ照合を伝播させるので、
+      // `WHERE nm = 'APPLE'` が NOCASE 列で正しく一致するようになる。
+      // aliases: { 別名 -> 実表名 }。SELECT 句ではなく条件・並べ替え・グループ化に使う
+      _applyColumnCollations(text, aliases) {
+          if (!text) return text;
+          // 対象になる列名 -> 照合名（複数表で衝突する列名は曖昧なので対象外にする）
+          const map = Object.create(null);
+          const ambiguous = new Set();
+          for (const a in aliases) {
+              const t = this.tables[aliases[a]];
+              if (!t || !t.collations) continue;
+              for (const c in t.collations) {
+                  if (map[c] !== undefined && map[c] !== t.collations[c]) ambiguous.add(c);
+                  map[c] = t.collations[c];
+              }
+          }
+          if (Object.keys(map).length === 0) return text;
+          const sm = [];
+          let s = this._maskStrings(text, sm);
+          // 既に COLLATE が書かれている参照は触らない（明示指定を優先する）
+          s = s.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*\s*\.\s*)?([a-zA-Z_][a-zA-Z0-9_]*)\b(\s*\()?(\s+collate\b)?/gi,
+              (m, qual, name, call, already) => {
+                  if (call || already) return m;
+                  const lc = name.toLowerCase();
+                  if (!map[lc] || ambiguous.has(lc)) return m;
+                  return `${m} COLLATE ${map[lc]}`;
+              });
+          return this._restoreStrings(s, sm);
+      },
+
+      // 配列・JSON 配列・文字列の添字とスライス（PostgreSQL 互換の 1 始まり）。
+      //   a[2]     2 番目の要素        a[2:3]  2〜3 番目（両端を含む）
+      //   a[:2]    先頭から 2 番目まで  a[2:]   2 番目から末尾まで
+      // 生の JS 添字（0 始まり）が漏れないよう、必ず関数呼び出しへ畳む
+      _rewriteSubscripts(s) {
+          if (s.indexOf('[') === -1) return s;
+          for (let guard = 0; guard < 128; guard++) {
+              const at = s.indexOf('[');
+              if (at === -1) break;
+              // 直前が被演算子でない '[' は書き換えようがないので構文エラーにする
+              const prev = s.slice(0, at).replace(/\s+$/, '').slice(-1);
+              if (!/[a-zA-Z0-9_.)\]]/.test(prev)) {
+                  throw new Error("Syntax Error near '[': a subscript must follow an array, JSON or string value.");
+              }
+              let depth = 0, close = -1;
+              for (let i = at; i < s.length; i++) {
+                  if (s[i] === '[') depth++;
+                  else if (s[i] === ']') { depth--; if (depth === 0) { close = i; break; } }
+              }
+              if (close === -1) throw new Error("Syntax Error in subscript: missing ']'.");
+              const inner = s.slice(at + 1, close);
+              const { start, end } = this._operandStartBefore(s, at, '[');
+              const operand = s.slice(start, end + 1);
+              // ':' で分けるとスライス。括弧の外側にあるものだけを区切りとみなす
+              let cut = -1, d = 0;
+              for (let i = 0; i < inner.length; i++) {
+                  const ch = inner[i];
+                  if (ch === '(' || ch === '[') d++;
+                  else if (ch === ')' || ch === ']') d--;
+                  else if (ch === ':' && d === 0) { cut = i; break; }
+              }
+              let call;
+              if (cut === -1) {
+                  if (inner.trim() === '') throw new Error("Syntax Error: empty subscript '[]'.");
+                  call = `__subscript(${operand}, ${inner})`;
+              } else {
+                  const lo = inner.slice(0, cut).trim() || 'null';
+                  const hi = inner.slice(cut + 1).trim() || 'null';
+                  call = `__array_slice(${operand}, ${lo}, ${hi})`;
+              }
+              s = s.slice(0, start) + call + s.slice(close + 1);
+          }
+          return s;
+      },
 
       // <expr> COLLATE <name> を __collate(expr, 'NAME') へ（比較・ORDER BY 用の正規化）。
       // 比較演算子が続く場合は右辺にも同じ照合を適用する（SQL の COLLATE は比較全体に効くため。
@@ -1893,6 +2389,17 @@
                   const om = rest.match(/^(\([^()]*\)|[a-zA-Z_][a-zA-Z0-9_.]*\s*\((?:[^()]|\([^()]*\))*\)|__STR_\d+__|-?[a-zA-Z0-9_.]+)/);
                   if (om && !/^\s*COLLATE\b/i.test(rest.slice(om[0].length))) {
                       tail = opM[0] + `__collate(${om[1]}, '${coll}')` + rest.slice(om[0].length);
+                  }
+              } else {
+                  // IN (...) / BETWEEN a AND b も比較なので、右辺の各項にも同じ照合を掛ける
+                  const inM = tail.match(/^(\s*(?:not\s+)?in\s*)\(([^()]*)\)/i);
+                  const btM = inM ? null : tail.match(/^(\s*(?:not\s+)?between\s+)(__STR_\d+__|-?[a-zA-Z0-9_.]+)(\s+and\s+)(__STR_\d+__|-?[a-zA-Z0-9_.]+)/i);
+                  if (inM) {
+                      const items = this.splitSelectClause(inM[2]).map(x => `__collate(${x.trim()}, '${coll}')`);
+                      tail = inM[1] + '(' + items.join(', ') + ')' + tail.slice(inM[0].length);
+                  } else if (btM) {
+                      tail = btM[1] + `__collate(${btM[2]}, '${coll}')` + btM[3]
+                           + `__collate(${btM[4]}, '${coll}')` + tail.slice(btM[0].length);
                   }
               }
               s = s.slice(0, start) + left + tail;
@@ -1941,6 +2448,104 @@
               from = close + 1;
           }
           return s;
+      },
+
+      // 「結果が日付になる」ことがコンパイル時に判る呼び出し。この直後・直前の
+      // '+' / '-' は文字列連結ではなく日付演算として畳む（_rewriteDateArith が使う）
+      _DATE_PRODUCERS: ['__datecol', '__curdate', '__now', '__sysdate', '__to_date', '__to_timestamp',
+          '__date_add', '__date_sub', '__date_trunc', '__date_bin', '__make_date', '__make_timestamp',
+          '__last_day', '__eomonth', '__add_months', '__next_day', '__dateadd', '__from_unixtime', '__from_days'],
+
+      // 日付が絡む '+' / '-' を日付演算へ畳む。
+      //   date + n / n + date -> __date_add(date, n)     n 日後
+      //   date - n           -> __date_sub(date, n)      n 日前
+      //   date - date        -> __datediff(date, date)   日数差（SQL標準 / PostgreSQL）
+      // これが無いと JS の '+' に落ちて `DATE '2026-01-01' + 1` が
+      // '2026-01-01 00:00:001' という文字列連結になり、日付差は NULL になっていた。
+      // INTERVAL 版（_rewriteIntervalMath）の後に走らせること
+      _rewriteDateArith(s) {
+          // CAST(x AS DATE) 由来のものも日付として扱う
+          const isDateAt = (txt, i) => {
+              for (const p of this._DATE_PRODUCERS) {
+                  if (txt.startsWith(p + '(', i)) return p.length;
+              }
+              if (txt.startsWith('__cast(', i)) {
+                  const close = this._scanBalanced(txt, i + 6);
+                  // __cast(x, 'DATE') と __cast(x, 'DATE', null, null) の両形
+                  if (close !== -1 && /,\s*'(?:DATE|DATETIME|TIMESTAMP)'\s*(?:,[^()]*)?\)$/i.test(txt.slice(i, close + 1))) return 6;
+              }
+              return 0;
+          };
+          const producerEnd = (txt, i) => {
+              const nameLen = isDateAt(txt, i);
+              if (!nameLen) return -1;
+              const close = this._scanBalanced(txt, i + nameLen);
+              return close;
+          };
+          for (let guard = 0; guard < 128; guard++) {
+              let done = true;
+              for (let i = 0; i < s.length; i++) {
+                  if (s[i] !== '_') continue;
+                  // 識別子の途中（__date_add の中の文字など）を拾わない
+                  if (i > 0 && /[a-zA-Z0-9_.$]/.test(s[i - 1])) continue;
+                  const end = producerEnd(s, i);
+                  if (end === -1) continue;
+                  let p = end + 1;
+                  while (p < s.length && /\s/.test(s[p])) p++;
+                  if (s[p] === '+' || s[p] === '-') {
+                      // '+=' のような複合や '->' は対象外（この段階では既に畳まれているが念のため）
+                      if (s[p + 1] === '=' || s[p + 1] === '>' || s[p + 1] === s[p]) continue;
+                      const sign = s[p];
+                      const right = this._primaryAfter(s, p + 1, sign);
+                      const rhs = s.slice(right.start, right.end + 1);
+                      const lhs = s.slice(i, end + 1);
+                      const rhsIsDate = producerEnd(rhs, 0) === rhs.length - 1;
+                      const call = (sign === '-' && rhsIsDate)
+                          ? `__datediff(${lhs}, ${rhs})`
+                          : `${sign === '+' ? '__date_add' : '__date_sub'}(${lhs}, ${rhs})`;
+                      s = s.slice(0, i) + call + s.slice(right.end + 1);
+                      done = false;
+                      break;
+                  }
+                  // n + date（加算のみ意味を持つ。減算は「数値 - 日付」で無意味）
+                  let q = i - 1;
+                  while (q >= 0 && /\s/.test(s[q])) q--;
+                  if (q >= 0 && s[q] === '+' && s[q - 1] !== '+') {
+                      const { start } = this._operandStartBefore(s, q, '+');
+                      const left = s.slice(start, q).trim();
+                      // 左が日付ならそちら側の走査で畳まれるのでここでは触らない
+                      if (left !== '' && producerEnd(left, 0) !== left.length - 1) {
+                          s = s.slice(0, start) + `__date_add(${s.slice(i, end + 1)}, ${left})` + s.slice(end + 1);
+                          done = false;
+                          break;
+                      }
+                  }
+              }
+              if (done) break;
+          }
+          return s;
+      },
+
+      // 日付型の列への参照を __datecol(...) で包み、'+' / '-' を日付演算として
+      // 畳めるようにする（__datecol 自体は値をそのまま返す目印）。
+      // aliases が判る呼び出し元（_executeSelectPlan）から句ごとに適用する
+      _applyDateColumns(text, aliases) {
+          if (!text) return text;
+          if (text.indexOf('+') === -1 && text.indexOf('-') === -1) return text;
+          const dateCols = new Set();
+          for (const a in aliases) {
+              const t = this.tables[aliases[a]];
+              if (!t || !t.colTypes) continue;
+              for (const c in t.colTypes) if (t.colTypes[c] === 'DATE') dateCols.add(c);
+          }
+          if (dateCols.size === 0) return text;
+          const sm = [];
+          let s = this._maskStrings(text, sm);
+          s = s.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*\s*\.\s*)?([a-zA-Z_][a-zA-Z0-9_]*)\b(\s*\()?/g,
+              (m, qual, name, call) => (call || !dateCols.has(name.toLowerCase())) ? m : `__datecol(${m})`);
+          // MAX/MIN は引数の型をそのまま返すので、日付列に対する結果も日付として扱う
+          s = s.replace(/\b(?:MAX|MIN)\s*\(\s*__datecol\(\s*[a-zA-Z0-9_.]+\s*\)\s*\)/gi, (m) => `__datecol(${m})`);
+          return this._restoreStrings(s, sm);
       },
 
       // 行コンストラクタの直前に現れ得る語（この語のあとの '(' は関数呼び出しではない）
@@ -2008,6 +2613,28 @@
           return s;
       },
 
+      // CAST/CONVERT/'::' が受け取る型名を正準名＋桁指定へ正規化する。
+      // 商用DBの型名は方言差が大きく別名も多いので、ここで一箇所に寄せてから
+      // __cast へ渡す（行評価ごとの型名パースを避けるためコンパイル時に解く）。
+      // 未知の型名は正準名を null にして「変換せず素通し」にする（従来挙動）
+      _normalizeCastType(raw) {
+          const m = String(raw).match(/^\s*([a-zA-Z][a-zA-Z0-9_]*(?:\s+[a-zA-Z][a-zA-Z0-9_]*)?)\s*(?:\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?\s*$/);
+          if (!m) return { name: null, p: null, s: null };
+          const key = m[1].replace(/\s+/g, ' ').toUpperCase();
+          const p = m[2] === undefined ? null : parseInt(m[2], 10);
+          const s = m[3] === undefined ? null : parseInt(m[3], 10);
+          const name = CAST_TYPE_ALIASES[key] || null;
+          return { name, p, s, raw: key };
+      },
+
+      // 正規化した型を __cast の引数リストへ落とす（未知型は元の綴りをそのまま渡し、
+      // __cast の既定分岐＝素通しに任せる）
+      _castArgs(raw) {
+          const t = this._normalizeCastType(raw);
+          if (!t.name) return `'${(t.raw || String(raw).replace(/\s+/g, ' ').toUpperCase()).replace(/'/g, '')}'`;
+          return `'${t.name}', ${t.p === null ? 'null' : t.p}, ${t.s === null ? 'null' : t.s}`;
+      },
+
       // PostgreSQL の '::' キャスト演算子を __cast(expr, 'TYPE') へ書き換える。
       // 被演算子は '::' の左を後方走査して決める（`(a+b)::INT` / `f(x)::TEXT` /
       // `x::INT::TEXT` の連鎖も 1 単位ずつ正しく取れる）
@@ -2016,7 +2643,7 @@
           for (let guard = 0; guard < 256; guard++) {
               const at = s.indexOf('::');
               if (at === -1) return s;
-              const tm = s.slice(at + 2).match(/^\s*([a-zA-Z][a-zA-Z0-9_]*)(\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?/);
+              const tm = s.slice(at + 2).match(/^\s*([a-zA-Z][a-zA-Z0-9_]*(?:\s+(?:PRECISION|VARYING))?)(\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?/);
               if (!tm) throw new Error("Syntax Error near '::'. Use <expr>::<type>.");
               let i = at - 1;
               while (i >= 0 && /\s/.test(s[i])) i--;
@@ -2041,7 +2668,7 @@
                   start = k + 1;
               }
               const operand = s.slice(start, i + 1);
-              s = s.slice(0, start) + `__cast(${operand}, '${tm[1].toUpperCase()}')` + s.slice(at + 2 + tm[0].length);
+              s = s.slice(0, start) + `__cast(${operand}, ${this._castArgs(tm[1] + (tm[2] || ''))})` + s.slice(at + 2 + tm[0].length);
           }
           return s;
       },
@@ -2283,6 +2910,13 @@
               return `__STR_${strMap.length - 1}__`;
           });
 
+          // JSON アクセス演算子（-> ->> #> #>> @> <@）。
+          // ユーザー変数の畳み込みより後に置くこと（`a < @lim` が '<@' に見えてしまうため）。
+          // 比較演算子より強く結合するので、比較・論理の書き換えより前に畳む
+          s = this._rewriteJsonOps(s);
+          // PostgreSQL の ~ / ~* / !~ / !~* / ~~ / ~~* / !~~ / !~~*
+          s = this._rewriteMatchOps(s);
+
           // LHS が数値リテラル / 文字列トークンの場合は列解決せずそのまま比較し、
           // 関数呼び出し（括弧を含む: UPPER(name) LIKE ... 等）はそのまま式として残す
           // （後続の関数マッピングと識別子解決が中身を処理する）
@@ -2328,6 +2962,10 @@
                   s = s.slice(0, am.index) + (quant ? items : `__array(${items})`) + s.slice(close + 1);
               }
           }
+
+          // 添字・スライス a[n] / a[lo:hi]（SQL は 1 始まり）。ARRAY[...] を畳んだ後なので、
+          // ここに残る '[' は必ず「直前の 1 単位」に対する後置演算子である
+          s = this._rewriteSubscripts(s);
 
           // (s1, e1) OVERLAPS (s2, e2): 期間の重なり。行コンストラクタの書き換えより前に消す
           s = s.replace(/\(((?:[^()]|\([^()]*\))*)\)\s*OVERLAPS\s*\(((?:[^()]|\([^()]*\))*)\)/gi, (m, a, b) => {
@@ -2418,6 +3056,12 @@
                   return `${not ? '!' : ''}__is_json(${operand}, '${(kind || 'VALUE').toUpperCase()}')`;
               });
 
+          // <expr> IS [NOT] TRUE|FALSE (SQL標準の真偽述語)。
+          // NULL に対しては IS TRUE / IS FALSE がどちらも偽、IS NOT TRUE / IS NOT FALSE が
+          // どちらも真になる（3値論理）ため、単純な `=== true` 比較では表せず専用ヘルパーを使う。
+          // IS NULL / IS UNKNOWN の変換より前に置くこと（`IS NOT TRUE` の NOT を取り違えないため）
+          s = this._rewriteIsBool(s);
+
           // IS [NOT] UNKNOWN (SQL標準): 3値論理の UNKNOWN 判定。ブール式に対する IS NULL と同義
           s = s.replace(/\bIS\s+NOT\s+UNKNOWN\b/gi, '!== null').replace(/\bIS\s+UNKNOWN\b/gi, '=== null');
           s = s.replace(/\bIS\s+NOT\s+NULL\b/gi, '!== null').replace(/\bIS\s+NULL\b/gi, '=== null');
@@ -2471,37 +3115,47 @@
           s = s.replace(/__CORREX_(\d+)__/g, (m, k) => `__corr_exists(${k}, ptrs, dbTables, aliases)`);
           s = s.replace(/__CORRSC_(\d+)__/g, (m, k) => `__corr_scalar(${k}, ptrs, dbTables, aliases)`);
 
-          // CAST(expr AS TYPE) -> __cast(expr, 'TYPE')（1段の括弧ネストまで対応）
-          let castRegex = /\bCAST\s*\(((?:[^()]|\([^()]*\))*?)\s+AS\s+([a-zA-Z]+)\s*\)/i;
+          // CAST(expr AS TYPE) -> __cast(expr, 'TYPE', p, s)（1段の括弧ネストまで対応）。
+          // 型名は 'DECIMAL(10,2)' / 'DOUBLE PRECISION' / 'VARCHAR(20)' の各形を受ける
+          const CAST_TYPE_PAT = '([a-zA-Z][a-zA-Z0-9_]*(?:\\s+[a-zA-Z][a-zA-Z0-9_]*)?\\s*(?:\\(\\s*\\d+\\s*(?:,\\s*\\d+\\s*)?\\))?)';
+          let castRegex = new RegExp('\\bCAST\\s*\\(((?:[^()]|\\([^()]*\\))*?)\\s+AS\\s+' + CAST_TYPE_PAT + '\\s*\\)', 'i');
           let castM;
           while ((castM = s.match(castRegex))) {
               const inner = castM[1];
-              const castType = castM[2].toUpperCase();
-              s = s.replace(castM[0], () => `__cast(${inner}, '${castType}')`);
+              const castArgs = this._castArgs(castM[2]);
+              s = s.replace(castM[0], () => `__cast(${inner}, ${castArgs})`);
           }
-          // CONVERT(expr, TYPE) は CAST の別形（MySQL互換）
-          let convRegex = /\bCONVERT\s*\(((?:[^()]|\([^()]*\))*?),\s*([a-zA-Z]+)\s*\)/i;
+          // CONVERT(expr, TYPE) は CAST の別形（MySQL互換）。
+          // SQL Server 形 CONVERT(TYPE, expr) は引数順が逆なので型名が先頭に来る形も受ける
+          let convRegex = new RegExp('\\bCONVERT\\s*\\(((?:[^()]|\\([^()]*\\))*?),\\s*' + CAST_TYPE_PAT + '\\s*\\)', 'i');
           let convM;
           while ((convM = s.match(convRegex))) {
               const inner2 = convM[1];
-              const convType = convM[2].toUpperCase();
-              s = s.replace(convM[0], () => `__cast(${inner2}, '${convType}')`);
+              const convArgs = this._castArgs(convM[2]);
+              s = s.replace(convM[0], () => `__cast(${inner2}, ${convArgs})`);
+          }
+          let convRegex2 = new RegExp('\\bCONVERT\\s*\\(\\s*' + CAST_TYPE_PAT + '\\s*,((?:[^()]|\\([^()]*\\))*?)\\)', 'i');
+          let convM2;
+          while ((convM2 = s.match(convRegex2))) {
+              const convArgs2 = this._castArgs(convM2[1]);
+              const inner3 = convM2[2];
+              s = s.replace(convM2[0], () => `__cast(${inner3}, ${convArgs2})`);
           }
           // TRY_CAST(expr AS TYPE) / TRY_CONVERT(TYPE, expr): SQL Server の安全変換。
           // __cast は変換不可時に null を返す（例外を投げない）ため実装を共用する。
-          let tryCastRegex = /\bTRY_CAST\s*\(((?:[^()]|\([^()]*\))*?)\s+AS\s+([a-zA-Z]+)\s*\)/i;
+          let tryCastRegex = new RegExp('\\bTRY_CAST\\s*\\(((?:[^()]|\\([^()]*\\))*?)\\s+AS\\s+' + CAST_TYPE_PAT + '\\s*\\)', 'i');
           let tcM;
           while ((tcM = s.match(tryCastRegex))) {
               const innerT = tcM[1];
-              const typeT = tcM[2].toUpperCase();
-              s = s.replace(tcM[0], () => `__cast(${innerT}, '${typeT}')`);
+              const argsT = this._castArgs(tcM[2]);
+              s = s.replace(tcM[0], () => `__cast(${innerT}, ${argsT})`);
           }
-          let tryConvRegex = /\bTRY_CONVERT\s*\(\s*([a-zA-Z]+)\s*,((?:[^()]|\([^()]*\))*?)\)/i;
+          let tryConvRegex = new RegExp('\\bTRY_CONVERT\\s*\\(\\s*' + CAST_TYPE_PAT + '\\s*,((?:[^()]|\\([^()]*\\))*?)\\)', 'i');
           let tvM;
           while ((tvM = s.match(tryConvRegex))) {
-              const typeV = tvM[1].toUpperCase();
+              const argsV = this._castArgs(tvM[1]);
               const innerV = tvM[2];
-              s = s.replace(tvM[0], () => `__cast(${innerV}, '${typeV}')`);
+              s = s.replace(tvM[0], () => `__cast(${innerV}, ${argsV})`);
           }
 
           // String/Math/Date/Logic Functions mapping
@@ -2619,6 +3273,9 @@
           s = s.replace(/\bUUID\(\)/gi, '__uuid()');
           s = s.replace(/\bVERSION\(\)/gi, '__version()');
           s = s.replace(/\bDATABASE\(\)/gi, '__database()');
+          // CURRENT_CATALOG / CURRENT_DATABASE（SQL標準 / PostgreSQL）は DATABASE() と同義
+          s = s.replace(/\bCURRENT_CATALOG\b(?:\s*\(\s*\))?/gi, '__database()');
+          s = s.replace(/\bCURRENT_DATABASE\s*\(\s*\)/gi, '__database()');
           // v1.2 追加関数: 正規表現 / 文字列 / ビット / 時刻
           s = s.replace(/\bREGEXP_REPLACE\(/gi, '__regexp_replace(');
           s = s.replace(/\bREGEXP_SUBSTR\(/gi, '__regexp_substr(');
@@ -2664,8 +3321,13 @@
           s = s.replace(/\bJSON_QUOTE\(/gi, '__json_quote(');
           s = s.replace(/\bJSON_UNQUOTE\(/gi, '__json_unquote(');
           s = s.replace(/\bJSON_ARRAY_APPEND\(/gi, '__json_array_append(');
+          s = s.replace(/\bJSON_ARRAY_INSERT\(/gi, '__json_array_insert(');
           s = s.replace(/\bJSON_MERGE_PATCH\(/gi, '__json_merge_patch(');
           s = s.replace(/\bJSON_DEPTH\(/gi, '__json_depth(');
+          // 部分更新（MySQL）: INSERT は無いパスだけ / REPLACE は有るパスだけ書く
+          s = s.replace(/\bJSON_INSERT\(/gi, '__json_insert(');
+          s = s.replace(/\bJSON_REPLACE\(/gi, '__json_replace(');
+          s = s.replace(/\bJSON_CONTAINS_PATH\(/gi, '__json_contains_path(');
           // v1.6 追加関数: ハッシュ / バイト長 / 日付切り捨て / 型 / 別名 / シーケンス
           s = s.replace(/\bSHA1\(/gi, '__sha1(');
           s = s.replace(/\bSHA\(/gi, '__sha1(');
@@ -2778,6 +3440,13 @@
           s = s.replace(/\bREGEXP_SPLIT_TO_ARRAY\s*\(/gi, '__regexp_split_to_array(');
           s = s.replace(/\bSAFE_DIVIDE\s*\(/gi, '__safe_divide(');
           s = s.replace(/\bDIV\s*\(/gi, '__div(');
+          // MySQL の中置整数除算 `a DIV b`。関数形 DIV(a, b) を先に潰してから、
+          // 残った中置形を関数呼び出しへ畳む（被演算子は前後の1プライマリ）
+          s = this._rewriteDivOp(s);
+          // 日付 ± 数値 / 日付 - 日付。CAST(... AS DATE) や CURRENT_DATE が
+          // 関数呼び出しへ畳まれた後でないと「日付である」と判らないのでここで行う
+          s = this._rewriteDateArith(s);
+
           s = s.replace(/\bTRUE\b/gi, 'true');
           s = s.replace(/\bFALSE\b/gi, 'false');
           // 単独の NULL リテラル（大文字含む）を JS の null へ正規化する。
@@ -2793,7 +3462,7 @@
                .replace(/=/g, '===')
                .replace(/__LTE__/g, '<=').replace(/__GTE__/g, '>=').replace(/__NEQ__/g, '!==').replace(/__LT__/g, '<').replace(/__GT__/g, '>');
 
-          const protectedKeywords = ['&&', '||', '!', 'true', 'false', 'null', 'undefined', '__cast', '__like', '__regexp', '__upper', '__lower', '__length', '__round', '__coalesce', '__substring', '__substring_index', '__concat', '__concat_ws', '__locate', '__truncate', '__replace', '__trim', '__abs', '__ceil', '__floor', '__now', '__lpad', '__rpad', '__power', '__sqrt', '__year', '__month', '__day', '__mod', '__sign', '__rand', '__date', '__datediff', '__ifnull', '__nullif', '__is_distinct', '__if', '__left', '__right', '__instr', '__reverse', '__repeat', '__greatest', '__least', '__exp', '__log', '__log10', '__pi', '__hour', '__minute', '__second', '__ltrim', '__rtrim', '__ascii', '__char', '__sin', '__cos', '__tan', '__sinh', '__asin', '__acos', '__atan', '__atan2', '__degrees', '__radians', '__ln', '__cbrt', '__date_add', '__date_sub', '__dayofweek', '__dayofyear', '__quarter', '__last_day', '__curdate', '__log2', '__cot', '__format', '__hex', '__bin', '__oct', '__conv', '__space', '__strcmp', '__elt', '__field', '__initcap', '__monthname', '__dayname', '__week', '__weekday', '__weekofyear', '__unix_timestamp', '__from_unixtime', '__date_format', '__extract', '__timestampdiff', '__interval', '__json_extract', '__json_array', '__json_object', '__json_length', '__json_keys', '__json_valid', '__json_type', '__json_contains', '__json_set', '__json_remove', '__uuid', '__version', '__database', '__regexp_replace', '__regexp_substr', '__regexp_like', '__split_part', '__quote', '__bit_count', '__sec_to_time', '__time_to_sec', '__makedate', '__str_to_date', '__trim_dir', '__corr_exists', '__corr_scalar', '__corr_in', '__time', '__md5', '__crc32', '__to_base64', '__from_base64', '__inet_aton', '__inet_ntoa', '__soundex', '__translate', '__str_insert', '__cosh', '__tanh', '__to_days', '__from_days', '__maketime', '__curtime', '__format_bytes', '__timestampadd', '__json_pretty', '__json_quote', '__json_unquote', '__json_array_append', '__json_merge_patch', '__json_depth', '__sha1', '__octet_length', '__bit_length', '__unhex', '__date_trunc', '__typeof', '__regexp_count', '__nextval', '__currval', '__setval', '__decode', '__nvl2', '__zeroifnull', '__nullifzero', '__choose', '__starts_with', '__ends_with', '__charindex', '__len', '__stuff', '__regexp_instr', '__square', '__gcd', '__lcm', '__factorial', '__width_bucket', '__add_months', '__months_between', '__date_part', '__quotename', '__patindex', '__bitand', '__bitor', '__bitxor', '__bitnot', '__isnumeric', '__eomonth', '__make_date', '__make_timestamp', '__to_number', '__to_date', '__to_timestamp', '__dateadd', '__datepart', '__datename', '__next_day', '__nanvl', '__remainder', '__shiftleft', '__shiftright', '__to_hex', '__parsename', '__quote_ident', '__quote_literal', '__overlay', '__sys_user', '__current_schema', '__newid', '__sys_guid', '__to_char', '__ilike', '__similar', '__concat_op', '__setseed', '__collate', '__match_against', '__ft_tokens', '__overlaps', '__date_bin', '__age', '__is_json', '__json_exists', '__json_query', '__array', '__toArray', '__array_length', '__array_position', '__array_contains', '__array_append', '__array_prepend', '__array_remove', '__array_to_string', '__string_to_array', '__array_agg_sort', '__levenshtein', '__similarity', '__difference', '__regexp_matches', '__regexp_split_to_array', '__div', '__safe_divide', '__at_time_zone', '__resolve', 'ptrs', 'dbTables', 'aliases', 'includes', 'Math', 'Date'];
+          const protectedKeywords = ['&&', '||', '!', 'true', 'false', 'null', 'undefined', '__cast', '__like', '__regexp', '__upper', '__lower', '__length', '__round', '__coalesce', '__substring', '__substring_index', '__concat', '__concat_ws', '__locate', '__truncate', '__replace', '__trim', '__abs', '__ceil', '__floor', '__now', '__lpad', '__rpad', '__power', '__sqrt', '__year', '__month', '__day', '__mod', '__sign', '__rand', '__date', '__datediff', '__ifnull', '__nullif', '__is_distinct', '__if', '__left', '__right', '__instr', '__reverse', '__repeat', '__greatest', '__least', '__exp', '__log', '__log10', '__pi', '__hour', '__minute', '__second', '__ltrim', '__rtrim', '__ascii', '__char', '__sin', '__cos', '__tan', '__sinh', '__asin', '__acos', '__atan', '__atan2', '__degrees', '__radians', '__ln', '__cbrt', '__datecol', '__date_add', '__date_sub', '__dayofweek', '__dayofyear', '__quarter', '__last_day', '__curdate', '__log2', '__cot', '__format', '__hex', '__bin', '__oct', '__conv', '__space', '__strcmp', '__elt', '__field', '__initcap', '__monthname', '__dayname', '__week', '__weekday', '__weekofyear', '__unix_timestamp', '__from_unixtime', '__date_format', '__extract', '__timestampdiff', '__interval', '__json_extract', '__json_array', '__json_object', '__json_length', '__json_keys', '__json_valid', '__json_type', '__json_contains', '__json_set', '__json_remove', '__uuid', '__version', '__database', '__regexp_replace', '__regexp_substr', '__regexp_like', '__split_part', '__quote', '__bit_count', '__sec_to_time', '__time_to_sec', '__makedate', '__str_to_date', '__trim_dir', '__corr_exists', '__corr_scalar', '__corr_in', '__time', '__md5', '__crc32', '__to_base64', '__from_base64', '__inet_aton', '__inet_ntoa', '__soundex', '__translate', '__str_insert', '__cosh', '__tanh', '__to_days', '__from_days', '__maketime', '__curtime', '__format_bytes', '__timestampadd', '__json_pretty', '__json_quote', '__json_unquote', '__json_array_append', '__json_merge_patch', '__json_depth', '__sha1', '__octet_length', '__bit_length', '__unhex', '__date_trunc', '__typeof', '__regexp_count', '__nextval', '__currval', '__setval', '__decode', '__nvl2', '__zeroifnull', '__nullifzero', '__choose', '__starts_with', '__ends_with', '__charindex', '__len', '__stuff', '__regexp_instr', '__square', '__gcd', '__lcm', '__factorial', '__width_bucket', '__add_months', '__months_between', '__date_part', '__quotename', '__patindex', '__bitand', '__bitor', '__bitxor', '__bitnot', '__isnumeric', '__eomonth', '__make_date', '__make_timestamp', '__to_number', '__to_date', '__to_timestamp', '__dateadd', '__datepart', '__datename', '__next_day', '__nanvl', '__remainder', '__shiftleft', '__shiftright', '__to_hex', '__parsename', '__quote_ident', '__quote_literal', '__overlay', '__sys_user', '__current_schema', '__newid', '__sys_guid', '__to_char', '__op_like', '__op_nlike', '__op_ilike', '__op_nilike', '__op_regex', '__op_iregex', '__op_nregex', '__op_niregex', '__ilike', '__similar', '__concat_op', '__setseed', '__collate', '__match_against', '__ft_tokens', '__overlaps', '__date_bin', '__age', '__is_json', '__json_exists', '__json_query', '__array', '__subscript', '__array_slice', '__toArray', '__array_length', '__array_position', '__array_contains', '__array_append', '__array_prepend', '__array_remove', '__array_to_string', '__string_to_array', '__array_agg_sort', '__levenshtein', '__similarity', '__difference', '__regexp_matches', '__regexp_split_to_array', '__div', '__safe_divide', '__at_time_zone', '__json_insert', '__json_replace', '__json_array_insert', '__json_arrow', '__json_arrow_text', '__json_hash_arrow', '__json_hash_arrow_text', '__json_has_key', '__json_contains_path', '__is_bool', '__resolve', 'ptrs', 'dbTables', 'aliases', 'includes', 'Math', 'Date'];
           s = s.replace(/('([^'\\]|\\.)*'|"([^"\\]|\\.)*")|\b([a-zA-Z_][a-zA-Z0-9_.]*)\b/g, (m, stringLit, _1, _2, word) => {
               if (stringLit) return m;
               if (!word) return m;
@@ -2825,12 +3494,15 @@
               '\n};')(__EXPR_LIB);
       },
 
+      // 句をトップレベルのカンマで分割する。括弧に加えて角括弧も数える
+      // （`ARRAY[1, 2]` の内側のカンマで割れてしまわないように。文字列リテラルは
+      //   呼び出し前に __STR_n__ へ退避済みなので引用符は考慮しなくてよい）
       splitSelectClause(clause) {
           let parts = [], current = "", depth = 0;
           for (let i = 0; i < clause.length; i++) {
               let c = clause[i];
-              if (c === '(') depth++;
-              if (c === ')') depth--;
+              if (c === '(' || c === '[') depth++;
+              if (c === ')' || c === ']') depth--;
               if (c === ',' && depth === 0) { parts.push(current.trim()); current = ""; }
               else { current += c; }
           }

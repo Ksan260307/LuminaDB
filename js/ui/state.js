@@ -6,6 +6,12 @@
     let currentSort = { col: null, asc: true };
     let isTesting = false;
 
+    // 結果グリッドの絞り込み文字列（全列を対象にした部分一致。空なら絞り込みなし）
+    let resultFilter = '';
+    // 結果グリッドの直接編集の可否。db.analyzeEditableSelect() の結果を保持する
+    // （{ editable, table, keyCols, colMap } / { editable: false, reason }）
+    let editContext = { editable: false, reason: 'run a SELECT first' };
+
     const els = {
        query: document.getElementById('queryInput'),
        hl: document.getElementById('highlightLayer'),
@@ -14,6 +20,7 @@
        mTime: document.getElementById('metricTime'),
        mRows: document.getElementById('metricRows'),
        dispLimit: document.getElementById('displayLimit'),
+       resFilter: document.getElementById('resultFilter'),
        toastMsg: document.getElementById('toastMsg')
     };
 

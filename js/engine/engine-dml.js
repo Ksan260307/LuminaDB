@@ -3,6 +3,399 @@
     // ============================================================================
     Object.assign(DatabaseEngine.prototype, {
 
+      // ============ 更新可能ビュー (INSERT / UPDATE / DELETE ON VIEW) ============
+      // 商用DBはいずれも「単一表に対する射影＋選択だけのビュー」を更新可能として扱う。
+      // ここも同じ方針で、ビューへの DML を基底表への DML へ書き換えて実行する。
+      // 集約・結合・DISTINCT 等を含むビューは更新不可として理由付きで拒否し、
+      // INSTEAD OF トリガーが定義されている場合はそちらへ委譲する。
+
+      // DML の対象がビューかどうかを判定する（ディスパッチ前の安価な判定）。
+      // ビュー名なら true。テーブル名や未知の名前なら false（従来のエラー経路へ）
+      _viewDmlTarget(kind, sql) {
+          if (!this.views || Object.keys(this.views).length === 0) return false;
+          const m = kind === 'insert'
+              ? sql.match(/^(?:insert|replace)\s+(?:ignore\s+)?into\s+([a-zA-Z0-9_]+)/i)
+              : (kind === 'update' ? sql.match(/^update\s+([a-zA-Z0-9_]+)/i) : sql.match(/^delete\s+from\s+([a-zA-Z0-9_]+)/i));
+          if (!m) return false;
+          const n = m[1].toLowerCase();
+          // 同名のテーブルがあればテーブルを優先（マテリアライズドビューは実表なので通常経路）
+          return !this.tables[n] && !!this.views[n];
+      },
+
+      // 「単一表への射影＋選択だけの SELECT」を解析して基底表・列対応・選択条件を返す。
+      // 更新可能ビューの判定と、結果グリッドの直接編集の判定で共有する。
+      // opts.allowLimit を立てると LIMIT/OFFSET を許す（並び替えや件数制限は
+      // 行と基底行の対応を壊さないため、グリッド編集では問題にならない）
+      _analyzeSimpleSelect(body, opts) {
+          const o = opts || {};
+          const sm = [];
+          let s = this._maskStrings(String(body).trim().replace(/;$/, ''), sm).trim();
+          // ORDER BY は結果の並びだけを決めるので更新可能性に影響しない（実DBと同じ）
+          const obAt = this._topLevelKeyword(s, 'ORDER BY');
+          if (obAt !== -1) s = s.slice(0, obAt).trim();
+          if (o.allowLimit) {
+              s = s.replace(/\s+limit\s+\d+(?:\s*,\s*\d+)?(?:\s+offset\s+\d+)?\s*$/i, '')
+                   .replace(/\s+offset\s+\d+(?:\s+rows?)?(?:\s+fetch\s+(?:first|next)\s+\d+\s+rows?\s+only)?\s*$/i, '')
+                   .replace(/\s+fetch\s+(?:first|next)\s+\d+\s+rows?\s+(?:only|with\s+ties)\s*$/i, '')
+                   .trim();
+          }
+          const blockers = [
+              [/\bunion\b|\bintersect\b|\bexcept\b|\bminus\b/i, 'set operators'],
+              [/^select\s+distinct\b/i, 'DISTINCT'],
+              [/\bgroup\s+by\b/i, 'GROUP BY'],
+              [/\bhaving\b/i, 'HAVING'],
+              [/\bqualify\b/i, 'QUALIFY'],
+              [/\bwindow\b/i, 'WINDOW'],
+              [/\bjoin\b/i, 'JOIN'],
+              [/\bover\s*\(/i, 'window functions']
+          ];
+          if (!o.allowLimit) blockers.push([/\blimit\b|\boffset\b|\bfetch\s+first\b/i, 'LIMIT/OFFSET']);
+          for (const [re, what] of blockers) {
+              if (re.test(s)) return { ok: false, reason: `it uses ${what}` };
+          }
+          const m = s.match(/^select\s+([\s\S]+?)\s+from\s+([a-zA-Z0-9_]+)\s*(?:(?:as\s+)?([a-zA-Z0-9_]+))?\s*(?:where\s+([\s\S]+))?$/i);
+          if (!m) return { ok: false, reason: 'it is not a simple SELECT ... FROM <table> [WHERE ...]' };
+          const selectClause = m[1].trim();
+          const table = m[2].toLowerCase();
+          const alias = m[3] && !/^where$/i.test(m[3]) ? m[3].toLowerCase() : null;
+          const whereMasked = m[4] ? m[4].trim() : null;
+          if (this.views[table] && !o.allowView) return { ok: false, reason: `nested views are not updatable ('${table}' is a view)` };
+          const t = this.tables[table];
+          if (!t && !(o.allowView && this.views[table])) return { ok: false, reason: `base table '${table}' not found` };
+          // カンマ区切りの FROM（暗黙の結合）は単一表ではない
+          if (/,/.test(m[2] + (m[3] || ''))) return { ok: false, reason: 'it reads multiple base tables' };
+          // ビュー宛の編集はビュー側の列で判定する（実体は更新可能ビュー経路が処理する）
+          const cols = t ? t.cols : null;
+
+          // 列対応: 出力名 -> 基底表の列名。式・集約・定数は編集不可
+          const colMap = Object.create(null);
+          const items = this.splitSelectClause(selectClause).map(x => x.trim()).filter(x => x !== '');
+          for (const item of items) {
+              if (item === '*' || /^[a-zA-Z0-9_]+\s*\.\s*\*$/.test(item)) {
+                  if (!cols) return { ok: false, reason: 'SELECT * over a view cannot be mapped' };
+                  Object.keys(cols).forEach(c => { colMap[c] = c; });
+                  continue;
+              }
+              const am = item.match(/^([\s\S]+?)(?:\s+as\s+([a-zA-Z0-9_]+)|\s+([a-zA-Z0-9_]+))?$/i);
+              let expr = am[1].trim();
+              const outName = (am[2] || am[3] || '').toLowerCase();
+              // `t.col` / `alias.col` の修飾は剥がす
+              const qm = expr.match(/^([a-zA-Z0-9_]+)\s*\.\s*([a-zA-Z0-9_]+)$/);
+              if (qm) {
+                  if (qm[1].toLowerCase() !== table && qm[1].toLowerCase() !== alias) {
+                      return { ok: false, reason: `unknown table qualifier '${qm[1]}'` };
+                  }
+                  expr = qm[2];
+              }
+              if (!/^[a-zA-Z0-9_]+$/.test(expr) || (cols && !cols[expr.toLowerCase()])) {
+                  return { ok: false, reason: `column '${item}' is not a plain base-table column` };
+              }
+              colMap[outName || expr.toLowerCase()] = expr.toLowerCase();
+          }
+          if (Object.keys(colMap).length === 0) return { ok: false, reason: 'there are no plain columns' };
+
+          // WHERE 句の別名修飾は基底表名へ揃える（書き換え後の文で解決できるように）
+          let where = whereMasked;
+          if (where && alias) where = where.replace(new RegExp(`\\b${alias}\\s*\\.`, 'gi'), `${table}.`);
+          if (where) where = this._restoreStrings(where, sm);
+          return { ok: true, table, alias, colMap, where };
+      },
+
+      // ビュー定義を解析して基底表・列対応・選択条件を得る。
+      // 更新できない形なら { updatable: false, reason } を返す（呼び出し側がエラー文にする）
+      _analyzeUpdatableView(name) {
+          const body = this.views[name];
+          if (body === undefined) return { updatable: false, reason: `View '${name}' not found.` };
+          const r = this._analyzeSimpleSelect(body);
+          if (!r.ok) return { updatable: false, reason: r.reason.replace(/^it /, 'the view ') };
+          const meta = (this.viewMeta && this.viewMeta[name]) || null;
+          return { updatable: true, view: name, table: r.table, colMap: r.colMap, where: r.where,
+                   checkOption: meta ? meta.checkOption : null };
+      },
+
+      // 結果グリッドの直接編集が可能かを判定する（UI から呼ぶ）。
+      // 可能なら { editable: true, table, keyCols, colMap }、不可なら理由を返す。
+      // 行を一意に特定できる列（主キー、単一列 UNIQUE、複合主キー）が結果に
+      // 含まれていることを要求する — これが無いと UPDATE の対象行を決められない
+      analyzeEditableSelect(sql) {
+          const s = String(sql || '').trim().replace(/;$/, '');
+          if (!/^select\b/i.test(s)) return { editable: false, reason: 'the result is not from a SELECT' };
+          const r = this._analyzeSimpleSelect(s, { allowLimit: true, allowView: true });
+          if (!r.ok) return { editable: false, reason: r.reason };
+          // ビュー宛なら更新可能ビューかどうかを続けて確かめる
+          let table = r.table, colMap = r.colMap;
+          if (this.views[table]) {
+              const vi = this._analyzeUpdatableView(table);
+              if (!vi.updatable) return { editable: false, reason: vi.reason };
+          }
+          const t = this.tables[table] || this.tables[(this._analyzeUpdatableView(table) || {}).table];
+          if (!t) return { editable: false, reason: `base table '${table}' not found` };
+          // 出力名 -> 基底列名 の逆引き（キー列が結果に載っているか調べる）
+          const outOf = (baseCol) => Object.keys(colMap).find(k => colMap[k] === baseCol);
+          const compPk = (t.compositeKeys || []).find(ck => ck.isPK);
+          let keyBase = null;
+          if (t.primaryKey) keyBase = [t.primaryKey];
+          else if (compPk) keyBase = [...compPk.cols];
+          else if ((t.uniqueCols || []).length > 0) keyBase = [t.uniqueCols[0]];
+          if (!keyBase) return { editable: false, reason: `'${table}' has no PRIMARY KEY or UNIQUE column to identify rows` };
+          const keyCols = keyBase.map(outOf);
+          if (keyCols.some(k => k === undefined)) {
+              return { editable: false, reason: `include ${keyBase.join(', ')} in the result to edit rows` };
+          }
+          return { editable: true, table, keyCols, keyBase, colMap };
+      },
+
+      // ビュー列名 -> 基底表列名。未知の列名はビューに存在しないのでエラーにする
+      _mapViewColumn(info, col) {
+          const key = String(col).toLowerCase();
+          const base = info.colMap[key];
+          if (!base) throw new Error(`Column '${col}' not found in view '${info.view}'.`);
+          return base;
+      },
+
+      // ビュー宛の式（WHERE / SET の右辺）に現れるビュー列名を基底表の列名へ置き換える。
+      // `SELECT nm AS ename ...` のビューに `WHERE ename = 'x'` と書けるようにするため。
+      // 1 回の replace で解決するので `SELECT b AS a, a AS b` のような入れ替えでも壊れない
+      _mapViewExpr(info, text) {
+          if (!text) return text;
+          // 別名と基底名が全て同じなら書き換え不要
+          const needs = Object.keys(info.colMap).some(k => info.colMap[k] !== k);
+          if (!needs) return text;
+          const sm = [];
+          let s = this._maskStrings(text, sm);
+          s = s.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\b|\b([a-zA-Z_][a-zA-Z0-9_]*)\b(\s*\()?/g,
+              (m, q, qc, bare, call) => {
+                  if (q !== undefined) {
+                      // ビュー名で修飾された参照は基底表名＋基底列名へ
+                      if (q.toLowerCase() !== info.view) return m;
+                      const base = info.colMap[qc.toLowerCase()];
+                      return base ? `${info.table}.${base}` : m;
+                  }
+                  if (call) return m;   // 関数呼び出し名は触らない
+                  const base = info.colMap[bare.toLowerCase()];
+                  return (base && base !== bare.toLowerCase()) ? base : m;
+              });
+          return this._restoreStrings(s, sm);
+      },
+
+      // 二つの条件を AND で結ぶ（片方が無ければもう片方をそのまま返す）
+      _andConditions(a, b) {
+          if (!a) return b || null;
+          if (!b) return a;
+          return `(${a}) AND (${b})`;
+      },
+
+      // WITH CHECK OPTION: 変更後の行がビューの WHERE を満たすか検証する。
+      // 満たさない行が 1 つでもあれば、基底表を変更前のクローンへ戻して失敗させる
+      // （式評価は行単位でしか行えないため、事前検証ではなく「実行して検証して戻す」方式。
+      //   クローンのコストは CHECK OPTION 付きビューへの書き込み時だけ発生する）
+      _assertViewCheckOption(info, savedClone) {
+          if (!info.checkOption || !info.where) return;
+          const t = this.tables[info.table];
+          const sm = [];
+          const fn = this.compileCondition(this._maskStrings(info.where, sm), sm);
+          const aliases = { [info.table]: info.table };
+          for (let i = 0; i < t.rowCount; i++) {
+              let ok;
+              try { ok = fn({ [info.table]: i }, this.tables, aliases); } catch (e) { ok = false; }
+              if (!ok) {
+                  // ビュー外の行が「元からあった行」なら違反ではない。変更前と同じ行数・
+                  // 同じ値なら触っていないので、クローンと突き合わせて判定する
+                  if (savedClone && i < savedClone.rowCount && this._rowsEqual(savedClone, t, i)) continue;
+                  if (savedClone) this.tables[info.table] = savedClone;
+                  throw new Error(`CHECK OPTION failed for view '${info.view}': the resulting row is outside the view definition.`);
+              }
+          }
+      },
+
+      // 2つの表オブジェクトの同一行インデックスの内容が等しいか（CHECK OPTION 判定用）
+      _rowsEqual(a, b, idx) {
+          for (const c of Object.keys(b.cols)) {
+            if (!a.cols[c]) return false;
+            const va = a.getValue(c, idx), vb = b.getValue(c, idx);
+            if (va !== vb && !(va === null && vb === null)) return false;
+          }
+          return true;
+      },
+
+      // ビューに対する INSTEAD OF トリガーがあれば発火して true を返す。
+      // これがあるビューは（集約や結合を含んでいても）書き込み可能になる
+      _fireInsteadOfTriggers(event, view, rows) {
+          if (!this.triggers) return false;
+          const list = [];
+          for (const nm in this.triggers) {
+              const tg = this.triggers[nm];
+              if (tg.table === view && tg.timing === 'instead of' && tg.event === event) list.push(tg);
+          }
+          if (list.length === 0) return false;
+          this._fireTriggers('instead of', event, view, rows);
+          return true;
+      },
+
+      // ビュー宛の INSERT / UPDATE / DELETE を基底表宛へ書き換えて実行する。
+      // 呼び出し元（executeQuery のディスパッチ）は対象がビューのときだけここへ来る
+      _executeViewDml(kind, sql, strMap) {
+          const nameM = kind === 'insert'
+              ? sql.match(/^(?:insert|replace)\s+(?:ignore\s+)?into\s+([a-zA-Z0-9_]+)/i)
+              : (kind === 'update' ? sql.match(/^update\s+([a-zA-Z0-9_]+)/i) : sql.match(/^delete\s+from\s+([a-zA-Z0-9_]+)/i));
+          const view = nameM[1].toLowerCase();
+          const info = this._analyzeUpdatableView(view);
+
+          // INSTEAD OF トリガーがあれば、更新可能性を問わずそちらへ委譲する
+          const io = this._insteadOfRowsFor(kind, view, sql, info, strMap);
+          if (io) return io;
+
+          if (!info.updatable) {
+              throw new Error(`View '${view}' is not updatable: ${info.reason}. Define an INSTEAD OF trigger to make it writable.`);
+          }
+          const needsCheck = !!(info.checkOption && info.where);
+          const saved = needsCheck ? this.tables[info.table].cloneFull() : null;
+          let rewritten;
+          if (kind === 'insert') {
+              rewritten = this._rewriteViewInsert(sql, info);
+          } else if (kind === 'update') {
+              rewritten = this._rewriteViewUpdate(sql, info);
+          } else {
+              rewritten = this._rewriteViewDelete(sql, info);
+          }
+          const res = kind === 'insert' ? this._executeInsert(rewritten, strMap)
+                    : (kind === 'update' ? this._executeUpdate(rewritten, strMap) : this._executeDelete(rewritten, strMap));
+          // DELETE は行がビューから出るだけなので CHECK OPTION の検証は不要
+          if (needsCheck && kind !== 'delete') this._assertViewCheckOption(info, saved);
+          return res;
+      },
+
+      // INSTEAD OF トリガー用に「発火行」を組み立てて発火する。
+      // 定義が無ければ null を返す（通常の書き換え経路へ進む）
+      _insteadOfRowsFor(kind, view, sql, info, strMap) {
+          const has = Object.keys(this.triggers || {}).some(nm => {
+              const tg = this.triggers[nm];
+              return tg.table === view && tg.timing === 'instead of' && tg.event === kind;
+          });
+          if (!has) return null;
+          let rows;
+          if (kind === 'insert') {
+              // VALUES の各行を NEW として渡す（列名はビューの列名のまま）
+              const parsed = this._parseInsertValuesForTrigger(sql, strMap);
+              rows = parsed.map(r => ({ oldRow: null, newRow: r }));
+          } else {
+              // 対象行はビューを SELECT して取り出す（更新不可なビューでも SELECT はできる）。
+              // ビュー展開はトップレベルの executeQuery でしか走らないため、文字列リテラルを
+              // 戻してから独立した文として実行する。外側の文が持つ相関レジストリは退避する
+              const whereM = sql.match(/\swhere\s+([\s\S]+)$/i);
+              const q = `SELECT * FROM ${view}` + (whereM ? ` WHERE ${this._restoreStrings(whereM[1], strMap)}` : '');
+              const savedCorr = this._corrSubs;
+              let sel;
+              try { sel = this.executeQuery(q); } finally { this._corrSubs = savedCorr; }
+              if (sel.error) throw new Error(sel.error);
+              if (kind === 'delete') {
+                  rows = sel.data.map(r => ({ oldRow: r, newRow: null }));
+              } else {
+                  // UPDATE: SET 句を適用した予定値を NEW として渡す
+                  const setM = sql.match(/^update\s+[a-zA-Z0-9_]+\s+set\s+([\s\S]+?)(?:\s+where\s+[\s\S]+)?$/i);
+                  if (!setM) throw new Error("Syntax Error in UPDATE.");
+                  const assigns = this.splitSelectClause(setM[1]).map(part => {
+                      const eq = part.indexOf('=');
+                      if (eq === -1) throw new Error("Syntax Error in SET clause.");
+                      return { col: part.slice(0, eq).trim().replace(/^[a-zA-Z0-9_]+\s*\.\s*/, '').toLowerCase(), expr: part.slice(eq + 1).trim() };
+                  });
+                  rows = sel.data.map(r => {
+                      const nr = Object.assign(Object.create(null), r);
+                      // 右辺はビュー行の現在値を差し込んで評価する（`qty = qty + 1` も書ける）
+                      assigns.forEach(a => { nr[a.col] = this._constExprValue(a.expr, strMap, r); });
+                      return { oldRow: r, newRow: nr };
+                  });
+              }
+          }
+          if (rows.length === 0) return { data: [{ Result: 'Success', Message: '0 rows affected (INSTEAD OF trigger).' }], affectedRows: 0 };
+          this._fireInsteadOfTriggers(kind, view, rows);
+          return { data: [{ Result: 'Success', Message: `${rows.length} rows affected (INSTEAD OF trigger).` }], affectedRows: rows.length };
+      },
+
+      // INSTEAD OF UPDATE の SET 式を、対象行の値を差し込んだうえで評価する
+      _constExprValue(expr, strMap, row) {
+          const sm = [];
+          let text = this._maskStrings(expr, sm);
+          // 式に現れる列名はビュー行の現在値へ置換する（NEW.x の算出に使う）
+          text = text.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (mm, id) => {
+              const k = id.toLowerCase();
+              if (!(k in row)) return mm;
+              const v = row[k];
+              if (v === null || v === undefined) return 'NULL';
+              if (typeof v === 'number') return `(${v})`;
+              if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+              sm.push(this._quoteLiteral(String(v)));
+              return `__STR_${sm.length - 1}__`;
+          });
+          const fn = this.compileCondition(text, sm);
+          return fn({}, this.tables, {});
+      },
+
+      // INSTEAD OF INSERT 用に VALUES 句を行オブジェクトへ展開する
+      _parseInsertValuesForTrigger(sql, strMap) {
+          const m = sql.match(/^(?:insert|replace)\s+(?:ignore\s+)?into\s+([a-zA-Z0-9_]+)\s*(?:\(([^)]*)\))?\s*values\s*([\s\S]+)$/i);
+          if (!m) throw new Error("INSTEAD OF INSERT triggers require INSERT ... VALUES (...).");
+          const view = m[1].toLowerCase();
+          let cols = m[2] ? m[2].split(',').map(c => c.trim().toLowerCase()) : null;
+          if (!cols) {
+              const info = this._analyzeUpdatableView(view);
+              cols = info.updatable ? Object.keys(info.colMap) : null;
+              if (!cols) throw new Error(`INSERT into view '${view}' requires an explicit column list.`);
+          }
+          const rows = [];
+          let rest = m[3].trim();
+          for (let guard = 0; guard < 10000 && rest.length > 0; guard++) {
+              const open = rest.indexOf('(');
+              if (open === -1) break;
+              const close = this._scanBalanced(rest, open);
+              if (close === -1) throw new Error("Syntax Error in VALUES clause.");
+              const vals = this.splitSelectClause(rest.slice(open + 1, close));
+              if (vals.length !== cols.length) throw new Error(`VALUES has ${vals.length} values but ${cols.length} columns were given.`);
+              const row = Object.create(null);
+              cols.forEach((c, i) => { row[c] = this.compileCondition(vals[i].trim(), strMap)({}, this.tables, {}); });
+              rows.push(row);
+              rest = rest.slice(close + 1).replace(/^\s*,\s*/, '');
+          }
+          return rows;
+      },
+
+      // INSERT INTO view (a, b) VALUES ... -> INSERT INTO base (mapped_a, mapped_b) VALUES ...
+      _rewriteViewInsert(sql, info) {
+          const m = sql.match(/^((?:insert|replace)\s+(?:ignore\s+)?into\s+)([a-zA-Z0-9_]+)(\s*)(?:\(([^)]*)\))?([\s\S]*)$/i);
+          if (!m) throw new Error("Syntax Error in INSERT.");
+          let colList;
+          if (m[4]) {
+              colList = this.splitSelectClause(m[4]).map(c => this._mapViewColumn(info, c.trim()));
+          } else {
+              // 列リスト省略時はビューの列順を使う（基底表の全列ではない）
+              colList = Object.keys(info.colMap).map(c => info.colMap[c]);
+          }
+          return `${m[1]}${info.table} (${colList.join(', ')})${m[5]}`;
+      },
+
+      // UPDATE view SET a = x WHERE p -> UPDATE base SET mapped_a = x WHERE (view where) AND (p)
+      _rewriteViewUpdate(sql, info) {
+          const m = sql.match(/^update\s+([a-zA-Z0-9_]+)\s+set\s+([\s\S]+?)(?:\s+where\s+([\s\S]+))?$/i);
+          if (!m) throw new Error("Syntax Error in UPDATE.");
+          const setParts = this.splitSelectClause(m[2]).map(part => {
+              const eq = part.indexOf('=');
+              if (eq === -1) throw new Error("Syntax Error in SET clause.");
+              const col = part.slice(0, eq).trim().replace(/^[a-zA-Z0-9_]+\s*\.\s*/, '');
+              // 右辺の式にもビュー列名が現れ得る（`SET ename = ename || '!'`）
+              return `${this._mapViewColumn(info, col)} = ${this._mapViewExpr(info, part.slice(eq + 1).trim())}`;
+          });
+          const where = this._andConditions(info.where, m[3] ? this._mapViewExpr(info, m[3].trim()) : null);
+          return `UPDATE ${info.table} SET ${setParts.join(', ')}` + (where ? ` WHERE ${where}` : '');
+      },
+
+      // DELETE FROM view WHERE p -> DELETE FROM base WHERE (view where) AND (p)
+      _rewriteViewDelete(sql, info) {
+          const m = sql.match(/^delete\s+from\s+([a-zA-Z0-9_]+)(?:\s+where\s+([\s\S]+))?$/i);
+          if (!m) throw new Error("Syntax Error in DELETE.");
+          const where = this._andConditions(info.where, m[2] ? this._mapViewExpr(info, m[2].trim()) : null);
+          return `DELETE FROM ${info.table}` + (where ? ` WHERE ${where}` : '');
+      },
+
       // 制約検証用の値正規化: 数値型列に与えられた数値文字列は setValue で数値へ
       // キャストされて格納されるため、検証時も同じ表現（数値）へ揃える。
       // （揃えないと '2' と 2 が別値と判定され、UNIQUE すり抜けや FK 誤検出が起きる）
@@ -20,8 +413,9 @@
           for (const col in defaults) {
               if (cols.indexOf(col) === -1) {
                   const dv = defaults[col];
-                  // DEFAULT CURRENT_TIMESTAMP は挿入時点の時刻へ解決する
-                  extraCols.push({ col, val: this._isNowMarker(dv) ? this._nowString() : dv });
+                  // DEFAULT CURRENT_TIMESTAMP / 式 DEFAULT は挿入時点で解決する。
+                  // 式は行ごとに評価する必要がある（NEXTVAL は行ごとに違う値を返す）
+                  extraCols.push({ col, val: dv, perRow: this._isNowMarker(dv) || this._isExprDefault(dv) });
               }
           }
           const ai = tData.autoIncrementCol;
@@ -32,7 +426,8 @@
                   const v = tData.getValue(ai, i);
                   if (typeof v === 'number' && v > maxId) maxId = v;
               }
-              aiNext = maxId + 1;
+              // TRUNCATE ... CONTINUE IDENTITY で覚えた下限があればそちらを優先する
+              aiNext = Math.max(maxId + 1, tData.identityFloor || 1);
               if (cols.indexOf(ai) === -1 && !extraCols.some(e => e.col === ai)) {
                   extraCols.push({ col: ai, val: null });
               }
@@ -40,7 +435,7 @@
           const newCols = cols.concat(extraCols.map(e => e.col));
           const aiIdx = ai ? newCols.indexOf(ai) : -1;
           valuesList.forEach(vals => {
-              extraCols.forEach(e => vals.push(e.val));
+              extraCols.forEach(e => vals.push(e.perRow ? this._resolveDefaultValue(e.val) : e.val));
               if (aiIdx !== -1) {
                   if (vals[aiIdx] === null || vals[aiIdx] === undefined) vals[aiIdx] = aiNext++;
                   else if (typeof vals[aiIdx] === 'number' && vals[aiIdx] >= aiNext) aiNext = vals[aiIdx] + 1;
@@ -54,34 +449,84 @@
           return newCols;
       },
 
+      // ============ 外部キー: 単一列と複合列を同じ経路で扱うための補助 ============
+      // FK は単一列のとき { col, refCol }、複合列のとき { cols: [...], refCols: [...] } を
+      // 持つ。既存のダンプ（単一列形）をそのまま読めるよう、参照側は必ずこの2つを通す
+      _fkCols(fk) { return fk.cols || [fk.col]; },
+      _fkRefCols(fk) { return fk.refCols || [fk.refCol]; },
+      _fkLabel(fk) { return `${fk.refTable}(${this._fkRefCols(fk).join(', ')})`; },
+      _fkChildLabel(tblName, fk) { return `${tblName}(${this._fkCols(fk).join(', ')})`; },
+
+      // 参照先で「タプルが一致する行」を探す。先頭列はインデックスで絞り、
+      // 残りの列は取得した候補行だけを突き合わせる（複合でも索引が効く）
+      _fkMatchRows(refTbl, refCols, vals) {
+          const rows = refTbl.findValueRows(refCols[0], vals[0]);
+          if (refCols.length === 1 || rows.length === 0) return rows;
+          return rows.filter(r => refCols.every((c, i) => refTbl.getValue(c, r) === vals[i]));
+      },
+
+      // FK のタプル。いずれかが NULL なら制約は満たされたものとする（SQL標準の MATCH SIMPLE）
+      _fkTupleOrNull(get, cols) {
+          const out = [];
+          for (const c of cols) {
+              const v = get(c);
+              if (v === null || v === undefined) return null;
+              out.push(v);
+          }
+          return out;
+      },
+
       // INSERT 時の FK 存在チェック（INSERT VALUES / INSERT SELECT 共用）
       _checkInsertFKs(tData, cols, valuesList) {
           if (!tData.foreignKeys || tData.foreignKeys.length === 0) return;
           tData.foreignKeys.forEach(fk => {
               const refTbl = this.tables[fk.refTable];
               if (!refTbl) throw new Error(`Foreign key constraint failed: Table '${fk.refTable}' not found.`);
-              const colIdx = cols.indexOf(fk.col);
-              if (colIdx === -1) return;
-              // 自己参照 FK: 同一バッチ内で挿入される refCol 値も有効とみなす。
+              const fkCols = this._fkCols(fk), refCols = this._fkRefCols(fk);
+              const colIdxs = fkCols.map(c => cols.indexOf(c));
+              // 1列も指定されていなければ全て既定値（＝NULL 扱い）なので検査不要
+              if (colIdxs.every(i => i === -1)) return;
+              // 自己参照 FK: 同一バッチ内で挿入される参照先タプルも有効とみなす。
               // （ツリー/階層データを 1 文でまとめて投入するケースに対応）
               let batchRefVals = null;
               if (refTbl === tData) {
-                  const refIdx = cols.indexOf(fk.refCol);
+                  const refIdxs = refCols.map(c => cols.indexOf(c));
                   batchRefVals = new Set();
-                  if (refIdx !== -1) valuesList.forEach(vals => {
-                      const rv = vals[refIdx];
-                      if (rv !== null && rv !== undefined) batchRefVals.add(rv);
+                  if (refIdxs.every(i => i !== -1)) valuesList.forEach(vals => {
+                      const tup = refIdxs.map(i => vals[i]);
+                      if (tup.every(v => v !== null && v !== undefined)) batchRefVals.add(JSON.stringify(tup));
                   });
               }
               valuesList.forEach(vals => {
-                  let val = vals[colIdx];
-                  if (val === null || val === undefined) return;
-                  val = this._normalizeByColType(tData, fk.col, val);
-                  if (refTbl.findValueRows(fk.refCol, val).length > 0) return;
-                  if (batchRefVals && batchRefVals.has(val)) return;
-                  throw new Error(`Foreign key constraint failed: Value '${val}' not found in ${fk.refTable}(${fk.refCol})`);
+                  const tuple = this._fkTupleOrNull(
+                      (c) => { const i = cols.indexOf(c); return i === -1 ? null : vals[i]; }, fkCols);
+                  if (tuple === null) return;   // NULL を含むタプルは検査対象外
+                  const norm = tuple.map((v, i) => this._normalizeByColType(tData, fkCols[i], v));
+                  if (this._fkMatchRows(refTbl, refCols, norm).length > 0) return;
+                  if (batchRefVals && batchRefVals.has(JSON.stringify(norm))) return;
+                  throw new Error(`Foreign key constraint failed: Value '${norm.join(', ')}' not found in ${this._fkLabel(fk)}`);
               });
           });
+      },
+
+      // 一意性検査で使う「比較用の値」。列に照合順序があれば正規化する
+      _uniqKey(tData, col, val) {
+          const coll = tData.collations && tData.collations[col];
+          return coll ? this._collateValue(val, coll) : val;
+      },
+      // col = val に一致する行番号。照合順序がある列は索引が生値で作られているため
+      // 索引を使わず全走査して正規化後の値どうしで突き合わせる
+      _uniqRows(tData, col, val) {
+          const coll = tData.collations && tData.collations[col];
+          if (!coll) return tData.findValueRows(col, val);
+          const target = this._collateValue(val, coll);
+          const out = [];
+          for (let i = 0; i < tData.rowCount; i++) {
+              const v = tData.getValue(col, i);
+              if (v === null || v === undefined) continue;
+              if (this._collateValue(v, coll) === target) out.push(i);
+          }
+          return out;
       },
 
       // 複合 UNIQUE / PRIMARY KEY のタプル重複チェック（INSERT 用）。
@@ -94,7 +539,7 @@
               for (let i = 0; i < tData.rowCount; i++) {
                   const tup = ck.cols.map(c => tData.getValue(c, i));
                   if (tup.some(v => v === null || v === undefined)) continue;
-                  existing.add(JSON.stringify(tup));
+                  existing.add(JSON.stringify(tup.map((v, j) => this._uniqKey(tData, ck.cols[j], v))));
               }
               const batchSeen = new Set();
               valuesList.forEach(vals => {
@@ -107,7 +552,7 @@
                       if (ck.isPK) throw new Error(`PRIMARY KEY constraint failed: NULL not allowed in composite key (${ck.cols.join(', ')}).`);
                       return;
                   }
-                  const sig = JSON.stringify(tup);
+                  const sig = JSON.stringify(tup.map((v, j) => this._uniqKey(tData, ck.cols[j], v)));
                   if (batchSeen.has(sig) || existing.has(sig)) {
                       throw new Error(`${label} constraint failed: Duplicate value (${tup.join(', ')}) in (${ck.cols.join(', ')}).`);
                   }
@@ -140,9 +585,10 @@
                   }
                   const cType = tData.colTypes[col];
                   if ((cType === 'INTEGER' || cType === 'FLOAT') && typeof val === 'string' && val.trim() !== '' && !isNaN(val)) val = Number(val);
-                  if (batchSeen.has(val)) throw new Error(`${label} constraint failed: Duplicate value '${val}' in column '${col}'.`);
-                  batchSeen.add(val);
-                  if (tData.findValueRows(col, val).length > 0) {
+                  const ukey = this._uniqKey(tData, col, val);
+                  if (batchSeen.has(ukey)) throw new Error(`${label} constraint failed: Duplicate value '${val}' in column '${col}'.`);
+                  batchSeen.add(ukey);
+                  if (this._uniqRows(tData, col, val).length > 0) {
                       throw new Error(`${label} constraint failed: Value '${val}' already exists in column '${col}'.`);
                   }
               });
@@ -245,14 +691,16 @@
                   for (const fk of child.foreignKeys) {
                       if (fk.refTable !== tbl) continue;
                       const action = (fk.onDelete || 'RESTRICT').toUpperCase();
-                      const vals = new Set();
+                      const fkCols = this._fkCols(fk), refCols = this._fkRefCols(fk);
+                      // 削除される親行のタプル一覧（NULL を含むものは参照され得ない）
+                      const tuples = [];
                       indices.forEach(idx => {
-                          const v = tData.getValue(fk.refCol, idx);
-                          if (v !== null && v !== undefined) vals.add(v);
+                          const t = this._fkTupleOrNull((c) => tData.getValue(c, idx), refCols);
+                          if (t !== null) tuples.push(t);
                       });
-                      if (vals.size === 0) continue;
+                      if (tuples.length === 0) continue;
                       const childRows = [];
-                      vals.forEach(v => child.findValueRows(fk.col, v).forEach(r => childRows.push(r)));
+                      tuples.forEach(t => this._fkMatchRows(child, fkCols, t).forEach(r => childRows.push(r)));
                       if (childRows.length === 0) continue;
                       if (action === 'CASCADE') {
                           const dset = getDel(otherName);
@@ -261,16 +709,17 @@
                           if (newly.length > 0) queue.push([otherName, newly]);
                       } else if (action === 'SET NULL') {
                           // NOT NULL 列への SET NULL は矛盾するため、変更前（計画段階）に拒否する
-                          if ((child.notNullCols || []).includes(fk.col)) {
-                              throw new Error(`Foreign key constraint failed: ON DELETE SET NULL conflicts with NOT NULL on ${otherName}(${fk.col})`);
+                          const nn = fkCols.find(c => (child.notNullCols || []).includes(c));
+                          if (nn) {
+                              throw new Error(`Foreign key constraint failed: ON DELETE SET NULL conflicts with NOT NULL on ${otherName}(${nn})`);
                           }
                           const nmap = getNull(otherName);
                           childRows.forEach(r => {
                               let s = nmap.get(r); if (!s) { s = new Set(); nmap.set(r, s); }
-                              s.add(fk.col);
+                              fkCols.forEach(c => s.add(c));
                           });
                       } else {
-                          throw new Error(`Foreign key constraint failed: Cannot delete record referenced by ${otherName}(${fk.col})`);
+                          throw new Error(`Foreign key constraint failed: Cannot delete record referenced by ${this._fkChildLabel(otherName, fk)}`);
                       }
                   }
               }
@@ -300,16 +749,22 @@
       // pending: [{ idx, changes }] を FK 存在 / NOT NULL / UNIQUE(PK) について適用前に検証する。
       // バッチ内で複数行が同じ一意値へ更新される衝突も検出する
       _validatePendingChanges(tData, pending) {
-          // FK 存在チェック
+          // FK 存在チェック。複合 FK では「変更後の行のタプル全体」で参照先を引く必要があるため、
+          // changes に無い列は現在値を使って組み立てる（idx が無い経路では検査を単一列に留める）
           if (tData.foreignKeys && tData.foreignKeys.length > 0) {
-              pending.forEach(({ changes }) => {
+              pending.forEach(({ idx, changes }) => {
                   tData.foreignKeys.forEach(fk => {
-                      if (changes[fk.col] === undefined || changes[fk.col] === null) return;
+                      const fkCols = this._fkCols(fk);
+                      // FK を構成する列が1つも変わらないなら参照は壊れない
+                      if (!fkCols.some(c => c in changes)) return;
                       const refTbl = this.tables[fk.refTable];
                       if (!refTbl) throw new Error(`Foreign key constraint failed: Table '${fk.refTable}' not found.`);
-                      const fkVal = this._normalizeByColType(tData, fk.col, changes[fk.col]);
-                      if (refTbl.findValueRows(fk.refCol, fkVal).length === 0) {
-                          throw new Error(`Foreign key constraint failed: Value '${fkVal}' not found in ${fk.refTable}(${fk.refCol})`);
+                      const tuple = this._fkTupleOrNull(
+                          (c) => (c in changes) ? changes[c] : (idx === undefined ? null : tData.getValue(c, idx)), fkCols);
+                      if (tuple === null) return;   // NULL を含むタプルは検査対象外
+                      const norm = tuple.map((v, i) => this._normalizeByColType(tData, fkCols[i], v));
+                      if (this._fkMatchRows(refTbl, this._fkRefCols(fk), norm).length === 0) {
+                          throw new Error(`Foreign key constraint failed: Value '${norm.join(', ')}' not found in ${this._fkLabel(fk)}`);
                       }
                   });
               });
@@ -334,7 +789,7 @@
                   if (targetSet2.has(i)) continue;
                   const tup = ck.cols.map(c => tData.getValue(c, i));
                   if (tup.some(v => v === null || v === undefined)) continue;
-                  existing.add(JSON.stringify(tup));
+                  existing.add(JSON.stringify(tup.map((v, j) => this._uniqKey(tData, ck.cols[j], v))));
               }
               pending.forEach(({ idx, changes }) => {
                   const tup = ck.cols.map(c => {
@@ -346,7 +801,7 @@
                       if (ck.isPK && ck.cols.some(c => c in changes)) throw new Error(`PRIMARY KEY constraint failed: NULL not allowed in composite key (${ck.cols.join(', ')}).`);
                       return;
                   }
-                  const sig = JSON.stringify(tup);
+                  const sig = JSON.stringify(tup.map((v, j) => this._uniqKey(tData, ck.cols[j], v)));
                   if (existing.has(sig)) throw new Error(`${label} constraint failed: Duplicate value (${tup.join(', ')}) in (${ck.cols.join(', ')}).`);
                   existing.add(sig);
               });
@@ -369,7 +824,7 @@
                       if (col === pkCol && (col in changes)) throw new Error(`PRIMARY KEY constraint failed: NULL not allowed in column '${col}'.`);
                       return;
                   }
-                  if (tData.findValueRows(col, v).some(r => r !== idx)) {
+                  if (this._uniqRows(tData, col, v).some(r => r !== idx)) {
                       throw new Error(`${label} constraint failed: Value '${v}' already exists in column '${col}'.`);
                   }
                   return;
@@ -381,7 +836,8 @@
                   if (targetSet.has(i)) continue;
                   const v = tData.getValue(col, i);
                   if (v === null || v === undefined) continue;
-                  if (!valToRow.has(v)) valToRow.set(v, i);
+                  const k0 = this._uniqKey(tData, col, v);
+                  if (!valToRow.has(k0)) valToRow.set(k0, i);
               }
               pending.forEach(({ idx, changes }) => {
                   const v = this._normalizeByColType(tData, col, (col in changes) ? changes[col] : tData.getValue(col, idx));
@@ -389,10 +845,11 @@
                       if (col === pkCol && (col in changes)) throw new Error(`PRIMARY KEY constraint failed: NULL not allowed in column '${col}'.`);
                       return;
                   }
-                  if (valToRow.has(v) && valToRow.get(v) !== idx) {
+                  const k = this._uniqKey(tData, col, v);
+                  if (valToRow.has(k) && valToRow.get(k) !== idx) {
                       throw new Error(`${label} constraint failed: Value '${v}' already exists in column '${col}'.`);
                   }
-                  valToRow.set(v, idx);
+                  valToRow.set(k, idx);
               });
           });
       },
@@ -573,9 +1030,8 @@
               vals.forEach((v, i) => {
                   if (v === this._DEFAULT_MARKER) {
                       const col = cols[i];
-                      let dv = (tData && tData.defaults && col in tData.defaults) ? tData.defaults[col] : null;
-                      if (this._isNowMarker(dv)) dv = this._nowString();
-                      vals[i] = dv;
+                      const dv = (tData && tData.defaults && col in tData.defaults) ? tData.defaults[col] : null;
+                      vals[i] = this._resolveDefaultValue(dv);
                   }
               });
           });
@@ -620,11 +1076,12 @@
               if (!otherTbl.foreignKeys || otherTbl.foreignKeys.length === 0) continue;
               otherTbl.foreignKeys.forEach(fk => {
                   if (fk.refTable !== table) return;
+                  const fkCols = this._fkCols(fk), refCols = this._fkRefCols(fk);
                   targetIndices.forEach(idx => {
-                      const delVal = tData.getValue(fk.refCol, idx);
-                      if (delVal === null || delVal === undefined) return;
-                      if (otherTbl.findValueRows(fk.col, delVal).length > 0) {
-                          throw new Error(`Foreign key constraint failed: Cannot delete record referenced by ${otherTblName}(${fk.col})`);
+                      const tuple = this._fkTupleOrNull((c) => tData.getValue(c, idx), refCols);
+                      if (tuple === null) return;
+                      if (this._fkMatchRows(otherTbl, fkCols, tuple).length > 0) {
+                          throw new Error(`Foreign key constraint failed: Cannot delete record referenced by ${this._fkChildLabel(otherTblName, fk)}`);
                       }
                   });
               });
@@ -661,8 +1118,13 @@
           this._cowColumns(table, 'ALL');
 
           let updates = null;
+          // MySQL の VALUES(col) は「挿入されようとした値」を指す。ON CONFLICT の
+          // EXCLUDED.col と同じ意味なので、疑似テーブル参照へ書き換えて経路を共有する
+          const rewriteValuesFn = (txt) => txt.replace(/\bVALUES\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)/gi, (m, c) => `excluded.${c}`);
           if (mode.odkuStr) {
-              updates = this.splitSelectClause(mode.odkuStr).map(s => {
+              const setText = rewriteValuesFn(mode.odkuStr);
+              if (setText !== mode.odkuStr) mode.excluded = true;
+              updates = this.splitSelectClause(setText).map(s => {
                   const eqIdx = s.indexOf('=');
                   if (eqIdx === -1) throw new Error("Syntax Error in ON DUPLICATE KEY UPDATE.");
                   const col = s.substring(0, eqIdx).trim().toLowerCase();
@@ -670,6 +1132,9 @@
                   return { col, evalFunc: this.compileCondition(s.substring(eqIdx + 1).trim(), strMap) };
               });
           }
+          // DO UPDATE ... WHERE の述語（衝突行と挿入予定値の両方を参照できる）
+          const whereFn = mode.odkuWhere ? this.compileCondition(rewriteValuesFn(mode.odkuWhere), strMap) : null;
+          if (mode.odkuWhere && /\bexcluded\s*\./i.test(mode.odkuWhere)) mode.excluded = true;
 
           const aliases = { [table]: table };
           const uniqueSet = new Set(tData.uniqueCols || []);
@@ -730,6 +1195,9 @@
               pending[pi] = null;
           };
           // 溜めた削除（REPLACE）と挿入をまとめて適用する
+          // RETURNING 用に、実際に挿入・更新した行の物理索引を控える。
+          // REPLACE は削除で索引がずれるため対象外（呼び出し側で拒否している）
+          const touched = [];
           const flush = () => {
               if (deleteSet.size > 0) {
                   const delIdx = [...deleteSet];
@@ -742,6 +1210,7 @@
               pending = [];
               pendingVals = new Map();
               if (rows.length === 0) return;
+              const beforeCount = tData.rowCount;
               try {
                   // insertRows は行配列へ DEFAULT/AUTO_INCREMENT 列を追記するためコピーを渡す
                   inserted += this.insertRows(table, cols, rows.map(r => [...r]));
@@ -756,6 +1225,7 @@
                       }
                   });
               }
+              for (let i = beforeCount; i < tData.rowCount; i++) touched.push(i);
           };
 
           valuesList.forEach(vals => {
@@ -801,6 +1271,8 @@
                       dbs = Object.assign(Object.create(null), this.tables, { __excluded: exTbl });
                       aliases['excluded'] = '__excluded';
                   }
+                  // DO UPDATE ... WHERE: 条件を満たさない衝突行は更新しない（PostgreSQL）
+                  if (whereFn && !whereFn(ptrs, dbs, aliases)) return;
                   updates.forEach(u => { changes[u.col] = u.evalFunc(ptrs, dbs, aliases); });
                   this._validatePendingChanges(tData, [{ idx, changes }]);
                   this._validateChecksForChanges(table, [{ idx, changes }]);
@@ -815,6 +1287,7 @@
                       }
                   });
                   Object.keys(changes).forEach(c => tData.setValue(c, idx, changes[c]));
+                  touched.push(idx);
                   updated++;
               });
           });
@@ -824,7 +1297,8 @@
           if (replaced) parts.push(`${replaced} replaced`);
           if (updated) parts.push(`${updated} updated`);
           if (ignored) parts.push(`${ignored} ignored`);
-          return { affectedRows: inserted + replaced + updated, message: parts.join(', ') + '.' };
+          return { affectedRows: inserted + replaced + updated, message: parts.join(', ') + '.',
+                   touched: [...new Set(touched)].sort((a, b) => a - b) };
       },
 
       // 制約検証を通した上で行を原子的に挿入する共通処理
@@ -1010,20 +1484,53 @@
               whenStr = whenStr.slice(cut);
           }
 
-          let matchedUpdate = null, matchedDelete = false, notMatchedInsert = null;
+          // WHEN 節は「順序付きの候補リスト」として持つ。同じ種別が複数あってもよく、
+          // 最初に条件を満たしたものだけが適用される（SQL Server / Oracle と同じ規則）
+          const matchedClauses = [];          // WHEN MATCHED [AND c] THEN UPDATE|DELETE
+          const notMatchedClauses = [];       // WHEN NOT MATCHED [BY TARGET] [AND c] THEN INSERT
+          const bySourceClauses = [];         // WHEN NOT MATCHED BY SOURCE [AND c] THEN UPDATE|DELETE
+          // 'AND <条件> THEN' の条件部分を切り出す（THEN は深度0のものを使う）
+          const splitAndThen = (text) => {
+              const t = text.replace(/^\s+/, '');
+              const am = t.match(/^and\s+/i);
+              if (!am) {
+                  const tm = t.match(/^then\s+([\s\S]+)$/i);
+                  if (!tm) return null;
+                  return { cond: null, body: tm[1].trim() };
+              }
+              const after = t.slice(am[0].length);
+              const tp = this._findKwDepth0(after, 'then');
+              if (tp === -1) return null;
+              return { cond: after.slice(0, tp).trim(), body: after.slice(tp + 4).trim() };
+          };
           clauses.forEach(cl => {
-              let m;
-              if ((m = cl.match(/^when\s+matched\s+then\s+update\s+set\s+([\s\S]+)$/i))) {
-                  matchedUpdate = m[1].trim();
-              } else if (/^when\s+matched\s+then\s+delete$/i.test(cl)) {
-                  matchedDelete = true;
-              } else if ((m = cl.match(/^when\s+not\s+matched(?:\s+by\s+target)?\s+then\s+insert\s*\(([^)]*)\)\s*values\s*\(([\s\S]+)\)$/i))) {
-                  notMatchedInsert = { colsStr: m[1].trim(), valsExpr: m[2].trim() };
+              let head, rest2;
+              if ((head = cl.match(/^when\s+not\s+matched\s+by\s+source\b/i))) rest2 = cl.slice(head[0].length);
+              else if ((head = cl.match(/^when\s+not\s+matched(?:\s+by\s+target)?\b/i))) rest2 = cl.slice(head[0].length);
+              else if ((head = cl.match(/^when\s+matched\b/i))) rest2 = cl.slice(head[0].length);
+              else throw new Error("Unsupported MERGE WHEN clause: " + cl.slice(0, 60));
+              const parsed = splitAndThen(rest2);
+              if (!parsed) throw new Error("Unsupported MERGE WHEN clause: " + cl.slice(0, 60));
+              const kind = /by\s+source/i.test(head[0]) ? 'bysource' : (/not\s+matched/i.test(head[0]) ? 'notmatched' : 'matched');
+              const body = parsed.body;
+              let um, im;
+              if ((um = body.match(/^update\s+set\s+([\s\S]+)$/i))) {
+                  if (kind === 'notmatched') throw new Error("WHEN NOT MATCHED [BY TARGET] supports INSERT only (use BY SOURCE for UPDATE/DELETE).");
+                  (kind === 'matched' ? matchedClauses : bySourceClauses).push({ cond: parsed.cond, action: 'update', setStr: um[1].trim() });
+              } else if (/^delete$/i.test(body)) {
+                  if (kind === 'notmatched') throw new Error("WHEN NOT MATCHED [BY TARGET] supports INSERT only (use BY SOURCE for UPDATE/DELETE).");
+                  (kind === 'matched' ? matchedClauses : bySourceClauses).push({ cond: parsed.cond, action: 'delete' });
+              } else if ((im = body.match(/^insert\s*\(([^)]*)\)\s*values\s*\(([\s\S]+)\)$/i))) {
+                  if (kind !== 'notmatched') throw new Error("INSERT is only allowed in WHEN NOT MATCHED [BY TARGET].");
+                  notMatchedClauses.push({ cond: parsed.cond, colsStr: im[1].trim(), valsExpr: im[2].trim() });
+              } else if (/^insert\s+default\s+values$/i.test(body)) {
+                  if (kind !== 'notmatched') throw new Error("INSERT is only allowed in WHEN NOT MATCHED [BY TARGET].");
+                  notMatchedClauses.push({ cond: parsed.cond, colsStr: null, valsExpr: null });
               } else {
                   throw new Error("Unsupported MERGE WHEN clause: " + cl.slice(0, 60));
               }
           });
-          if (!matchedUpdate && !matchedDelete && !notMatchedInsert) {
+          if (matchedClauses.length === 0 && notMatchedClauses.length === 0 && bySourceClauses.length === 0) {
               throw new Error("MERGE requires at least one actionable WHEN clause.");
           }
 
@@ -1043,30 +1550,79 @@
           );
 
           let affected = 0, inserted = 0, updated = 0, deleted = 0;
+          const onConds = [];   // WHEN NOT MATCHED BY SOURCE 用に「どれかの source 行に一致する条件」を集める
+          // ソース列を含まない条件（NOT MATCHED 側の AND 条件）を単体で評価する
+          const evalStandalone = (condText) => {
+              const r = this.executeQuery(`SELECT 1 AS __ok WHERE ${condText}`);
+              if (r.error) throw new Error("MERGE WHEN condition failed: " + r.error);
+              return r.data.length > 0;
+          };
           for (const srcRow of srcRows) {
               const rowLC = Object.create(null);
               for (const k in srcRow) rowLC[k.toLowerCase()] = srcRow[k];
               const cond = stripTargetQ(substSrc(onCond, rowLC));
+              onConds.push(cond);
               const cntRes = this.executeQuery(`SELECT COUNT(*) AS __mc FROM ${target} WHERE ${cond}`);
               if (cntRes.error) throw new Error("MERGE ON condition failed: " + cntRes.error);
               const matched = (cntRes.data[0].__mc || 0) > 0;
 
               if (matched) {
-                  if (matchedUpdate) {
-                      const setStr = stripTargetQ(substSrc(matchedUpdate, rowLC));
-                      const uRes = this.executeQuery(`UPDATE ${target} SET ${setStr} WHERE ${cond}`);
-                      if (uRes.error) throw new Error("MERGE UPDATE failed: " + uRes.error);
+                  // 追加条件は対象行にも依存し得るので、UPDATE/DELETE の WHERE へ畳み込む。
+                  // 先に条件を満たす節が見つかった時点で確定する（後続の節は評価しない）
+                  for (const mc of matchedClauses) {
+                      const extra = mc.cond ? stripTargetQ(substSrc(mc.cond, rowLC)) : null;
+                      const where = extra ? `(${cond}) AND (${extra})` : cond;
+                      if (extra) {
+                          const chk = this.executeQuery(`SELECT COUNT(*) AS __mc FROM ${target} WHERE ${where}`);
+                          if (chk.error) throw new Error("MERGE WHEN MATCHED condition failed: " + chk.error);
+                          if ((chk.data[0].__mc || 0) === 0) continue;
+                      }
+                      if (mc.action === 'update') {
+                          const setStr = stripTargetQ(substSrc(mc.setStr, rowLC));
+                          const uRes = this.executeQuery(`UPDATE ${target} SET ${setStr} WHERE ${where}`);
+                          if (uRes.error) throw new Error("MERGE UPDATE failed: " + uRes.error);
+                          updated += uRes.scannedRows || 0;
+                      } else {
+                          const dRes = this.executeQuery(`DELETE FROM ${target} WHERE ${where}`);
+                          if (dRes.error) throw new Error("MERGE DELETE failed: " + dRes.error);
+                          deleted += dRes.scannedRows || 0;
+                      }
+                      break;
+                  }
+              } else {
+                  for (const nc of notMatchedClauses) {
+                      // 一致する対象行が無いので、追加条件はソース行の値だけで判定できる
+                      if (nc.cond && !evalStandalone(substSrc(nc.cond, rowLC))) continue;
+                      const iSql = nc.colsStr === null
+                          ? `INSERT INTO ${target} DEFAULT VALUES`
+                          : `INSERT INTO ${target} (${nc.colsStr}) VALUES (${substSrc(nc.valsExpr, rowLC)})`;
+                      const iRes = this.executeQuery(iSql);
+                      if (iRes.error) throw new Error("MERGE INSERT failed: " + iRes.error);
+                      inserted += iRes.scannedRows || 0;
+                      break;
+                  }
+              }
+          }
+
+          // WHEN NOT MATCHED BY SOURCE: どの source 行とも一致しなかった対象行に作用する。
+          // 「いずれかの ON 条件に一致する」の否定で対象を絞る（条件は行ごとに実体化済み）
+          if (bySourceClauses.length > 0) {
+              const uniq = [...new Set(onConds)];
+              if (uniq.length > 500) {
+                  throw new Error("WHEN NOT MATCHED BY SOURCE supports up to 500 distinct source rows in this implementation.");
+              }
+              const unmatched = uniq.length === 0 ? 'TRUE' : `NOT (${uniq.map(c => `(${c})`).join(' OR ')})`;
+              for (const bc of bySourceClauses) {
+                  const where = bc.cond ? `(${unmatched}) AND (${stripTargetQ(bc.cond)})` : unmatched;
+                  if (bc.action === 'update') {
+                      const uRes = this.executeQuery(`UPDATE ${target} SET ${stripTargetQ(bc.setStr)} WHERE ${where}`);
+                      if (uRes.error) throw new Error("MERGE (BY SOURCE) UPDATE failed: " + uRes.error);
                       updated += uRes.scannedRows || 0;
-                  } else if (matchedDelete) {
-                      const dRes = this.executeQuery(`DELETE FROM ${target} WHERE ${cond}`);
-                      if (dRes.error) throw new Error("MERGE DELETE failed: " + dRes.error);
+                  } else {
+                      const dRes = this.executeQuery(`DELETE FROM ${target} WHERE ${where}`);
+                      if (dRes.error) throw new Error("MERGE (BY SOURCE) DELETE failed: " + dRes.error);
                       deleted += dRes.scannedRows || 0;
                   }
-              } else if (notMatchedInsert) {
-                  const valsExpr = substSrc(notMatchedInsert.valsExpr, rowLC);
-                  const iRes = this.executeQuery(`INSERT INTO ${target} (${notMatchedInsert.colsStr}) VALUES (${valsExpr})`);
-                  if (iRes.error) throw new Error("MERGE INSERT failed: " + iRes.error);
-                  inserted += iRes.scannedRows || 0;
               }
           }
           affected = inserted + updated + deleted;
@@ -1094,11 +1650,31 @@
               sql = `${dvM[1]} (${cols.join(', ')}) VALUES (${cols.map(() => 'DEFAULT').join(', ')})`;
           }
 
+          // OVERRIDING { SYSTEM | USER } VALUE（SQL標準）: 識別列に値を明示した時の扱いを選ぶ。
+          //   SYSTEM VALUE = 与えた値をそのまま採用する（本実装の既定動作）
+          //   USER VALUE   = 与えた値を捨てて自動採番させる
+          let overridingUser = false;
+          const ovM = sql.match(/\s+overriding\s+(system|user)\s+value\s+(?=values\b|select\b|\()/i);
+          if (ovM) {
+              overridingUser = /^user$/i.test(ovM[1]);
+              sql = sql.slice(0, ovM.index) + ' ' + sql.slice(ovM.index + ovM[0].length);
+          }
+          // 識別列に与えられた値を捨てる（後段の自動採番に任せる）
+          const applyOverriding = (table, cols, valuesList) => {
+              if (!overridingUser) return;
+              const ai = this.tables[table] && this.tables[table].autoIncrementCol;
+              if (!ai) return;
+              const at = cols.indexOf(ai);
+              if (at === -1) return;
+              valuesList.forEach(vals => { vals[at] = null; });
+          };
+
           // 挿入モード: REPLACE INTO / INSERT (OR) IGNORE / ON DUPLICATE KEY UPDATE / ON CONFLICT
           const isReplaceStmt = /^replace\s+into\b/i.test(sql);
           let isIgnore = /^insert\s+(?:or\s+)?ignore\s+into\b/i.test(sql);
           let odkuStr = null;
           let useExcluded = false;
+          let odkuWhere = null;
           const odkuM = sql.match(/\s+on\s+duplicate\s+key\s+update\s+([\s\S]+)$/i);
           if (odkuM) { odkuStr = odkuM[1].trim(); sql = sql.slice(0, odkuM.index); }
           // PostgreSQL ON CONFLICT [(cols) | ON CONSTRAINT name] { DO NOTHING | DO UPDATE SET ... }
@@ -1111,13 +1687,21 @@
               } else {
                   odkuStr = confM[2].trim();
                   useExcluded = true;
+                  // DO UPDATE SET ... WHERE cond: 衝突行のうち条件を満たすものだけ更新する。
+                  // 深度0の WHERE で切る（SET 式に含まれる括弧内の WHERE に反応しないため）
+                  const wp = this._topLevelKeyword(odkuStr, 'where');
+                  if (wp !== -1) {
+                      odkuWhere = odkuStr.slice(wp + 5).trim();
+                      odkuStr = odkuStr.slice(0, wp).trim();
+                  }
               }
               sql = sql.slice(0, confM.index);
           }
 
-          // 衝突時に挿入されない/置換される行があり「挿入した行」を一意に定められないため拒否する
-          if (ret.returning && (isReplaceStmt || isIgnore || odkuStr)) {
-              throw new Error("RETURNING is not supported with REPLACE / INSERT IGNORE / ON DUPLICATE KEY UPDATE / ON CONFLICT.");
+          // REPLACE は行の削除で物理索引がずれるため「返す行」を特定できない。
+          // IGNORE / ON CONFLICT は実際に書き込んだ行だけを返す（PostgreSQL と同じ）
+          if (ret.returning && isReplaceStmt) {
+              throw new Error("RETURNING is not supported with REPLACE INTO (rows are deleted and re-inserted). Use INSERT ... ON CONFLICT instead.");
           }
 
           // INSERT INTO t DEFAULT VALUES: 全列を DEFAULT / AUTO_INCREMENT / NULL で補完した1行を挿入
@@ -1157,15 +1741,18 @@
                   if (cols.length !== selectCols.length) throw new Error("Column count doesn't match select count.");
 
                   const valuesList = insertData.map(row => selectCols.map(sc => row[sc]));
+                  applyOverriding(table, cols, valuesList);
                   if (isReplaceStmt || isIgnore || odkuStr) {
-                      const res = this._executeUpsertRows(table, cols, valuesList, { replace: isReplaceStmt, ignore: isIgnore, odkuStr, excluded: useExcluded }, strMap);
+                      const res = this._executeUpsertRows(table, cols, valuesList, { replace: isReplaceStmt, ignore: isIgnore, odkuStr, excluded: useExcluded, odkuWhere }, strMap);
                       affectedRows = res.affectedRows;
-                      resultSet = [{Result:"Success", Message: res.message}];
+                      resultSet = ret.returning
+                          ? this._evalReturning(table, res.touched || [], ret.returning, strMap)
+                          : [{Result:"Success", Message: res.message}];
                       return { data: resultSet, affectedRows };
                   }
                   affectedRows = this.insertRows(table, cols, valuesList);
               } else if (isReplaceStmt || isIgnore || odkuStr) {
-                  return { data: [{Result:"Success", Message:"0 rows inserted."}], affectedRows: 0 };
+                  return { data: ret.returning ? [] : [{Result:"Success", Message:"0 rows inserted."}], affectedRows: 0 };
               }
               resultSet = ret.returning
                   ? this._returningForAppended(table, affectedRows, ret.returning, strMap)
@@ -1194,11 +1781,14 @@
                   parsedValsList.push(vals);
               });
               this._resolveDefaultMarkers(table, cols, parsedValsList);
+              applyOverriding(table, cols, parsedValsList);
 
               if (isReplaceStmt || isIgnore || odkuStr) {
-                  const res = this._executeUpsertRows(table, cols, parsedValsList, { replace: isReplaceStmt, ignore: isIgnore, odkuStr, excluded: useExcluded }, strMap);
+                  const res = this._executeUpsertRows(table, cols, parsedValsList, { replace: isReplaceStmt, ignore: isIgnore, odkuStr, excluded: useExcluded, odkuWhere }, strMap);
                   affectedRows = res.affectedRows;
-                  resultSet = [{Result:"Success", Message: res.message}];
+                  resultSet = ret.returning
+                      ? this._evalReturning(table, res.touched || [], ret.returning, strMap)
+                      : [{Result:"Success", Message: res.message}];
               } else {
                   affectedRows = this.insertRows(table, cols, parsedValsList);
                   resultSet = ret.returning
@@ -1218,7 +1808,7 @@
               });
               this._resolveDefaultMarkers(table, cols, [vals]);
               if (isReplaceStmt || isIgnore || odkuStr) {
-                  const res = this._executeUpsertRows(table, cols, [vals], { replace: isReplaceStmt, ignore: isIgnore, odkuStr, excluded: useExcluded }, strMap);
+                  const res = this._executeUpsertRows(table, cols, [vals], { replace: isReplaceStmt, ignore: isIgnore, odkuStr, excluded: useExcluded, odkuWhere }, strMap);
                   affectedRows = res.affectedRows;
                   resultSet = [{Result:"Success", Message: res.message}];
               } else {
@@ -1259,6 +1849,47 @@
               return i;
           }
           return -1;
+      },
+
+      // 複数表 UPDATE/DELETE のソースが派生表（`FROM (VALUES ...)` / `FROM (SELECT ...)`）の
+      // 場合に、先に一時表へ実体化して「ただの表名」にする。
+      // これにより _rewriteMultiTableDml の既存経路（単一表＋相関サブクエリ）へそのまま載る。
+      // 一括更新を値の並びで書く `UPDATE t SET ... FROM (VALUES (..),(..)) AS v(a, b)` は
+      // 移行スクリプトの定番なので、ここを通せるようにしておく
+      _materializeDmlSources(sql, strMap) {
+          if (!/^(update|delete)\b/i.test(sql)) return sql;
+          if (!/\b(from|using|join)\s*\(/i.test(sql)) return sql;
+          for (let guard = 0; guard < 8; guard++) {
+              const m = sql.match(/\b(FROM|USING|JOIN)\s*\(/i);
+              if (!m) break;
+              const open = sql.indexOf('(', m.index + m[1].length);
+              const close = this._scanBalanced(sql, open);
+              if (close === -1) throw new Error("Syntax Error: unbalanced parentheses in the DML source.");
+              const body = sql.slice(open + 1, close).trim();
+              let rows;
+              if (/^values\b/i.test(body)) {
+                  const res = this._executeValuesStatement(body, strMap);
+                  rows = res.data;
+              } else if (/^select\b/i.test(body)) {
+                  const res = this.executeQuery(this._restoreStrings(body, strMap));
+                  if (res.error) throw new Error(`DML source query failed: ${res.error}`);
+                  rows = res.data;
+              } else {
+                  break;   // 派生表ではない（部分式など）ので触らない
+              }
+              let after = sql.slice(close + 1);
+              let alias = null, colNames = null;
+              // 別名は必須。後続の句キーワードを別名と取り違えないよう明示的に除外する
+              const alM = after.match(/^\s*(?:AS\s+)?(?!where\b|set\b|on\b|join\b|using\b|order\b|limit\b|returning\b)([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\))?/i);
+              if (!alM) throw new Error("A derived table in UPDATE/DELETE requires an alias.");
+              alias = alM[1];
+              if (alM[2]) colNames = alM[2].split(',').map(c => c.trim().toLowerCase());
+              after = after.slice(alM[0].length);
+              const tmpName = '__tmp_dmlsrc_' + (this._tmpCounter = (this._tmpCounter || 0) + 1);
+              this._materializeRows(tmpName, rows, colNames);
+              sql = sql.slice(0, m.index) + `${m[1]} ${tmpName} ${alias}` + after;
+          }
+          return sql;
       },
 
       _rewriteMultiTableDml(sql) {
@@ -1384,19 +2015,28 @@
           let orderByStr = null;
           const om = sql.match(/\s+order\s+by\s+([\s\S]+)$/i);
           if (om) { orderByStr = om[1].trim(); sql = sql.slice(0, om.index); }
-          const m = sql.match(/update\s+([a-zA-Z0-9_]+)\s+set\s+([\s\S]+?)(?:\s+where\s+([\s\S]+))?$/i);
+          // UPDATE t [AS] alias SET ... （エイリアス修飾は商用DBで常用される）
+          const m = sql.match(/update\s+([a-zA-Z0-9_]+)(?:\s+(?:as\s+)?(?!set\b)([a-zA-Z0-9_]+))?\s+set\s+([\s\S]+?)(?:\s+where\s+([\s\S]+))?$/i);
           if (m) {
              const table = m[1].toLowerCase();
              if (!this.tables[table]) throw this._tableNotFound(table);
 
-             let setStr = m[2];
-             let whereStr = m[3];
+             const alias = m[2] ? m[2].toLowerCase() : null;
+             let setStr = m[3];
+             let whereStr = m[4];
 
              let setParts = this.splitSelectClause(setStr);
              let setEvaluators = setParts.map(s => {
                  let eqIdx = s.indexOf('=');
                  if(eqIdx === -1) throw new Error("Syntax Error in SET clause.");
                  let col = s.substring(0, eqIdx).trim().toLowerCase();
+                 // 代入先は `alias.col` / `table.col` の修飾付きでも書ける
+                 const dot = col.indexOf('.');
+                 if (dot !== -1) {
+                     const q = col.slice(0, dot);
+                     if (q !== table && q !== alias) throw new Error(`Unknown table qualifier '${q}' in SET clause.`);
+                     col = col.slice(dot + 1);
+                 }
                  if (!this.tables[table].cols[col]) throw new Error(`Column '${col}' not found.`);
                  if (this.tables[table].generatedCols && col in this.tables[table].generatedCols) throw new Error(`Cannot assign to generated column '${col}'.`);
                  let expr = s.substring(eqIdx + 1).trim();
@@ -1410,12 +2050,14 @@
              const tData = this.tables[table];
              const rowCount = tData.rowCount;
              let targetIndices = [];
-             let aliases = { [table]: table };
+             // ptrs / aliases はどちらも「別名 -> 実表」で引かれるので、別名と実名の両方を張る
+             let aliases = alias ? { [alias]: table, [table]: table } : { [table]: table };
+             const mkPtrs = alias ? (i) => ({ [alias]: i, [table]: i }) : (i) => ({ [table]: i });
 
              if (whereStr) {
                 let whereFunc = this.compileCondition(whereStr, strMap);
                 for (let i = 0; i < rowCount; i++) {
-                    if (whereFunc({ [table]: i }, this.tables, aliases)) targetIndices.push(i);
+                    if (whereFunc(mkPtrs(i), this.tables, aliases)) targetIndices.push(i);
                 }
              } else {
                  for (let i = 0; i < rowCount; i++) targetIndices.push(i);
@@ -1432,28 +2074,35 @@
                  otherTbl.foreignKeys.forEach(fk => {
                      if (fk.refTable !== table) return;
                      const action = (fk.onUpdate || 'RESTRICT').toUpperCase();
+                     const fkCols = this._fkCols(fk), refCols = this._fkRefCols(fk);
                      targetIndices.forEach(idx => {
-                         const oldVal = tData.getValue(fk.refCol, idx);
-                         if (oldVal === null || oldVal === undefined) return;
-                         let willChange = false, newVal = oldVal;
-                         setEvaluators.forEach(ev => {
-                             if (ev.col === fk.refCol) {
-                                 newVal = ev.evalFunc({ [table]: idx }, this.tables, aliases);
-                                 if (newVal !== oldVal) willChange = true;
-                             }
+                         const oldTuple = this._fkTupleOrNull((c) => tData.getValue(c, idx), refCols);
+                         if (oldTuple === null) return;
+                         // 参照される列のうち 1 つでも実際に値が変わるなら波及の対象
+                         let willChange = false;
+                         const newTuple = refCols.map((c, i) => {
+                             let v = oldTuple[i];
+                             setEvaluators.forEach(ev => {
+                                 if (ev.col !== c) return;
+                                 v = ev.evalFunc(mkPtrs(idx), this.tables, aliases);
+                                 if (v !== oldTuple[i]) willChange = true;
+                             });
+                             return v;
                          });
                          if (!willChange) return;
-                         const rows = otherTbl.findValueRows(fk.col, oldVal);
+                         const rows = this._fkMatchRows(otherTbl, fkCols, oldTuple);
                          if (rows.length === 0) return;
-                         if (action === 'CASCADE') rows.forEach(r => childUpdates.push({ table: otherTblName, idx: r, col: fk.col, val: newVal }));
-                         else if (action === 'SET NULL') {
+                         if (action === 'CASCADE') {
+                             rows.forEach(r => fkCols.forEach((c, i) => childUpdates.push({ table: otherTblName, idx: r, col: c, val: newTuple[i] })));
+                         } else if (action === 'SET NULL') {
                              // NOT NULL 列への SET NULL は矛盾するため、変更前（計画段階）に拒否する
-                             if ((otherTbl.notNullCols || []).includes(fk.col)) {
-                                 throw new Error(`Foreign key constraint failed: ON UPDATE SET NULL conflicts with NOT NULL on ${otherTblName}(${fk.col})`);
+                             const nn = fkCols.find(c => (otherTbl.notNullCols || []).includes(c));
+                             if (nn) {
+                                 throw new Error(`Foreign key constraint failed: ON UPDATE SET NULL conflicts with NOT NULL on ${otherTblName}(${nn})`);
                              }
-                             rows.forEach(r => childUpdates.push({ table: otherTblName, idx: r, col: fk.col, val: null }));
+                             rows.forEach(r => fkCols.forEach(c => childUpdates.push({ table: otherTblName, idx: r, col: c, val: null })));
                          }
-                         else throw new Error(`Foreign key constraint failed: Cannot update record referenced by ${otherTblName}(${fk.col})`);
+                         else throw new Error(`Foreign key constraint failed: Cannot update record referenced by ${this._fkChildLabel(otherTblName, fk)}`);
                      });
                  });
              }
@@ -1462,7 +2111,7 @@
              // FK 存在 / NOT NULL / UNIQUE(PK) の検証は ON DUPLICATE KEY UPDATE と共通の
              // _validatePendingChanges へ委譲する（バッチ内重複の検出を含む）
              const pending = targetIndices.map(idx => {
-                 let ptr = { [table]: idx };
+                 let ptr = mkPtrs(idx);
                  let changes = {};
                  setEvaluators.forEach(ev => {
                      changes[ev.col] = ev.evalFunc(ptr, this.tables, aliases);
@@ -1534,6 +2183,10 @@
              }
 
              affectedRows = targetIndices.length;
+             // WHERE なしの全行更新は取り違えが致命的になりやすいので警告に残す
+             if (!whereStr && affectedRows > 0) {
+                 this._warn('NO_WHERE', `UPDATE on '${table}' had no WHERE clause: all ${affectedRows} rows were updated.`);
+             }
              resultSet = ret.returning
                  ? this._evalReturning(table, targetIndices, ret.returning, strMap)
                  : [{Result:"Success", Message:`${affectedRows} rows updated.`}];
@@ -1555,21 +2208,26 @@
           let orderByStr = null;
           const om = sql.match(/\s+order\s+by\s+([\s\S]+)$/i);
           if (om) { orderByStr = om[1].trim(); sql = sql.slice(0, om.index); }
-          const m = sql.match(/delete\s+from\s+([a-zA-Z0-9_]+)(?:\s+where\s+([\s\S]+))?$/i);
+          // DELETE FROM t [AS] alias WHERE alias.col ... （エイリアス修飾は商用DBで常用される）。
+          // 別名候補は WHERE 等のキーワードを除外して拾う
+          const m = sql.match(/delete\s+from\s+([a-zA-Z0-9_]+)(?:\s+(?:as\s+)?(?!where\b|order\b|limit\b|using\b|returning\b)([a-zA-Z0-9_]+))?(?:\s+where\s+([\s\S]+))?$/i);
           if (m) {
              const table = m[1].toLowerCase();
              if (!this.tables[table]) throw this._tableNotFound(table);
              this._cowColumns(table, 'ALL');
-             const whereStr = m[2];
+             const alias = m[2] ? m[2].toLowerCase() : null;
+             const whereStr = m[3];
              const tData = this.tables[table];
              const rowCount = tData.rowCount;
              let targetIndices = [];
-             let aliases = { [table]: table };
+             // ptrs / aliases はどちらも「別名 -> 実表」で引かれるので、別名と実名の両方を張る
+             let aliases = alias ? { [alias]: table, [table]: table } : { [table]: table };
+             const mkPtrs = alias ? (i) => ({ [alias]: i, [table]: i }) : (i) => ({ [table]: i });
 
              if (whereStr) {
                 let whereFunc = this.compileCondition(whereStr, strMap);
                 for (let i = 0; i < rowCount; i++) {
-                    if (whereFunc({ [table]: i }, this.tables, aliases)) targetIndices.push(i);
+                    if (whereFunc(mkPtrs(i), this.tables, aliases)) targetIndices.push(i);
                 }
              } else {
                  for (let i = 0; i < rowCount; i++) targetIndices.push(i);
@@ -1603,6 +2261,10 @@
              if (fireDelTriggers) this._fireTriggers('after', 'delete', table, delOldRows);
 
              affectedRows = targetIndices.length;
+             // WHERE なしの全行削除も同様（TRUNCATE との取り違えを可視化する）
+             if (!m[3] && affectedRows > 0) {
+                 this._warn('NO_WHERE', `DELETE on '${table}' had no WHERE clause: all ${affectedRows} rows were deleted.`);
+             }
              resultSet = returningRows || [{Result:"Success", Message:`${affectedRows} rows deleted.`}];
           } else throw new Error("Syntax Error in DELETE.");
 

@@ -57,7 +57,23 @@
     'ARRAY_REMOVE', 'ARRAY_TO_STRING', 'STRING_TO_ARRAY', 'ARRAY_SORT', 'ORDINALITY', 'EXCLUDE',
     'OTHERS', 'TIES', 'REGR_SLOPE', 'REGR_INTERCEPT', 'REGR_R2', 'REGR_COUNT', 'REGR_AVGX', 'REGR_AVGY',
     'REGR_SXX', 'REGR_SYY', 'REGR_SXY', 'MODE', 'LEVENSHTEIN', 'SIMILARITY', 'EDIT_DISTANCE',
-    'REGEXP_MATCHES', 'REGEXP_SPLIT_TO_ARRAY', 'SAFE_DIVIDE', 'DIV', 'ZONE', 'REINDEX', 'CHECKPOINT'];
+    'REGEXP_MATCHES', 'REGEXP_SPLIT_TO_ARRAY', 'SAFE_DIVIDE', 'DIV', 'ZONE', 'REINDEX', 'CHECKPOINT',
+    // v1.18 で追加された構文・関数
+    'INSTEAD', 'OPTION', 'CASCADED', 'LOCAL', 'DEFERRABLE', 'DEFERRED', 'IMMEDIATE', 'INITIALLY',
+    'CONSTRAINT', 'DECIMAL', 'NUMERIC', 'VARCHAR', 'BIGINT', 'SMALLINT', 'PRECISION', 'STATISTICS',
+    'JSON_INSERT', 'JSON_REPLACE', 'JSON_ARRAY_INSERT', 'JSON_CONTAINS_PATH', 'KEYS',
+    // v1.19 で追加された構文
+    'MINVALUE', 'MAXVALUE', 'CACHE', 'CYCLE', 'RESTART', 'SOURCE', 'TARGET', 'STATUS',
+    // v1.20 で追加された構文
+    'DOMAIN', 'DOMAINS', 'TYPE', 'TYPES', 'ENUM', 'USER', 'USERS', 'ROLE', 'ROLES', 'GRANTS',
+    'SEARCH', 'DEPTH', 'BREADTH', 'FIRST', 'CONTINUE', 'IDENTITY', 'DIV', 'VALUE',
+    // v1.21 で追加された構文
+    'GROUPING_ID', 'OVERRIDING', 'LATERAL', 'WARNINGS', 'BINARY', 'NUMERIC', 'DATA',
+    // v1.22 で追加された構文
+    'CONNECT', 'PRIOR', 'LEVEL', 'SIBLINGS', 'NOCYCLE', 'ROWNUM', 'SYS_CONNECT_BY_PATH',
+    'CONNECT_BY_ROOT', 'CONNECT_BY_ISLEAF', 'RATIO_TO_REPORT', 'KEEP', 'INCLUDE',
+    'CONCURRENTLY', 'CONSTRAINTS', 'DEFERRED', 'IMMEDIATE', 'SCHEMAS', 'ISOLATION',
+    'CURRENT_CATALOG', 'CURRENT_DATABASE'];
 
     // --- SQL 整形（純粋関数。文字列リテラル/コメントを保護して主要句を改行する） ---
     // 完全なパーサではなく単文の可読性向上を狙う軽量フォーマッタ。括弧内（サブクエリ）は
@@ -229,6 +245,61 @@
     }
 
     // dir: -1 = 過去へ / +1 = 新しい方へ（履歴の先を越えると編集中の下書きに戻る）
+    // ============================================================================
+    // クエリ履歴パネル: Ctrl+↑↓ の巡回だけでは「少し前に書いたあの1文」に戻れないので、
+    // 検索して読み込み・実行できる一覧を用意する
+    // ============================================================================
+    function renderHistoryList() {
+        const list = document.getElementById('historyList');
+        const q = (document.getElementById('historySearch').value || '').trim().toLowerCase();
+        // 新しいものを上に出す
+        const all = loadQueryHistory().slice().reverse();
+        const items = q === '' ? all : all.filter(s => s.toLowerCase().includes(q));
+        document.getElementById('historyCount').textContent = q === ''
+            ? `(${all.length})`
+            : `(${items.length} / ${all.length})`;
+        list.innerHTML = '';
+        if (items.length === 0) {
+            list.innerHTML = `<div class="text-sm text-gray-400 text-center py-10">${all.length === 0 ? '履歴はまだありません。' : '一致する履歴がありません。'}</div>`;
+            return;
+        }
+        items.forEach(sql => {
+            const row = document.createElement('div');
+            row.className = 'flex items-start gap-2 py-2 group';
+            const btn = document.createElement('button');
+            btn.className = 'flex-1 text-left font-mono text-xs text-gray-700 hover:text-blue-700 whitespace-pre-wrap break-all';
+            btn.textContent = sql;   // textContent 経由なのでエスケープ不要
+            btn.addEventListener('click', () => {
+                setQueryValue(sql);
+                closeModal('historyModal');
+                els.query.focus();
+            });
+            const run = document.createElement('button');
+            run.className = 'shrink-0 text-xs border border-blue-300 bg-blue-50 hover:bg-blue-100 text-blue-700 px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity';
+            run.textContent = 'Run';
+            run.addEventListener('click', () => {
+                setQueryValue(sql);
+                closeModal('historyModal');
+                runQuery();
+            });
+            row.appendChild(btn);
+            row.appendChild(run);
+            list.appendChild(row);
+        });
+    }
+
+    document.getElementById('openHistoryBtn').addEventListener('click', () => {
+        document.getElementById('historySearch').value = '';
+        renderHistoryList();
+        document.getElementById('historySearch').focus();
+    });
+    document.getElementById('historySearch').addEventListener('input', renderHistoryList);
+    document.getElementById('historyClearBtn').addEventListener('click', () => {
+        try { localStorage.removeItem(HISTORY_KEY); } catch (e) { /* localStorage 無効環境 */ }
+        historyIndex = -1;
+        renderHistoryList();
+    });
+
     function navigateHistory(dir) {
         const h = loadQueryHistory();
         if (h.length === 0) return;
@@ -262,12 +333,258 @@
         }
     }
 
+    // ============================================================================
+    // エディタタブ: 複数のクエリを並行して書き溜める（商用クライアントと同じ操作体系）。
+    //   ・タブごとに本文と undo/redo 履歴を持つ
+    //   ・localStorage へ保存し、リロードしても書きかけが残る
+    //   ・ラベルは SQL から自動生成（ダブルクリックで手動命名も可）
+    // ============================================================================
+    const TABS_KEY = 'luminadb_editor_tabs';
+    const TABS_MAX = 12;
+    let tabs = [];
+    let activeTabId = null;
+    let tabSeq = 0;
+
+    // SQL から短いタブ名を作る（'SELECT users' 等）。空なら 'Untitled'
+    function deriveTabName(sql) {
+        const t = String(sql || '').trim().replace(/\s+/g, ' ');
+        if (t === '') return 'Untitled';
+        const vm = t.match(/^([a-zA-Z_]+)/);
+        if (!vm) return t.slice(0, 18);
+        const verb = vm[1].toUpperCase();
+        // UPDATE / MERGE は動詞の直後が対象表。その他は FROM / INTO / TABLE 等の後ろを見る
+        const direct = t.match(/^(?:update|merge\s+into|merge)\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+        const kw = direct ? null : t.match(/\b(?:from|into|table|view|index)\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+        const target = direct ? direct[1] : (kw ? kw[1] : null);
+        return (target ? `${verb} ${target}` : verb).slice(0, 22);
+    }
+
+    const activeTab = () => tabs.find(t => t.id === activeTabId) || null;
+
+    // 現在の入力をタブへ反映して保存する（input イベントが飛ばない
+    // プログラム由来の書き換え — 履歴読込・整形・Clear などから呼ぶ）
+    function touchActiveTab() {
+        if (tabs.length === 0) return;
+        syncActiveTab();
+        renderTabs();
+        persistTabs();
+    }
+
+    function persistTabs() {
+        if (isTesting) return;
+        try {
+            localStorage.setItem(TABS_KEY, JSON.stringify({
+                activeTabId,
+                tabs: tabs.map(t => ({ id: t.id, name: t.name, custom: !!t.custom, sql: t.sql }))
+            }));
+        } catch (e) { /* localStorage が使えない環境ではセッション限りで続行 */ }
+    }
+
+    // 現在の入力内容と undo/redo を、いま開いているタブへ書き戻す
+    function syncActiveTab() {
+        const t = activeTab();
+        if (!t) return;
+        t.sql = els.query.value;
+        t.undoStack = undoStack;
+        t.redoStack = redoStack;
+        if (!t.custom) t.name = deriveTabName(t.sql);
+    }
+
+    function renderTabs() {
+        const wrap = document.getElementById('editorTabs');
+        if (!wrap) return;
+        wrap.innerHTML = '';
+        tabs.forEach((t, i) => {
+            const on = t.id === activeTabId;
+            const el = document.createElement('div');
+            el.className = 'shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-t border-b-2 text-xs cursor-pointer select-none transition-colors '
+                + (on ? 'bg-white border-blue-500 text-gray-800 font-medium shadow-sm'
+                      : 'bg-gray-50 border-transparent text-gray-500 hover:bg-gray-100 hover:text-gray-700');
+            el.dataset.tabId = t.id;
+            el.title = `${t.name}${i < 9 ? ` (Alt+${i + 1})` : ''} — ダブルクリックで名前を変更`;
+            const label = document.createElement('span');
+            label.className = 'truncate max-w-[10rem]';
+            label.textContent = t.name;
+            el.appendChild(label);
+            if (tabs.length > 1) {
+                const x = document.createElement('button');
+                x.className = 'text-gray-400 hover:text-red-600 leading-none px-0.5';
+                x.textContent = '×';
+                x.title = 'このタブを閉じる';
+                x.dataset.closeId = t.id;
+                el.appendChild(x);
+            }
+            wrap.appendChild(el);
+        });
+    }
+
+    // タブを切り替える（現在の内容を保存してから、対象タブの内容を復元する）
+    function selectTab(id) {
+        if (id === activeTabId) return;
+        const target = tabs.find(t => t.id === id);
+        if (!target) return;
+        clearTimeout(saveTimeout);
+        syncActiveTab();
+        activeTabId = id;
+        undoStack = target.undoStack && target.undoStack.length > 0 ? target.undoStack : [target.sql];
+        redoStack = target.redoStack || [];
+        els.query.value = target.sql;
+        updateHighlight();
+        renderTabs();
+        persistTabs();
+        els.query.focus();
+    }
+
+    function addTab(sql) {
+        if (tabs.length >= TABS_MAX) { showToast(`タブは最大 ${TABS_MAX} 枚までです。`, true); return; }
+        clearTimeout(saveTimeout);
+        syncActiveTab();
+        const t = { id: ++tabSeq, name: deriveTabName(sql), custom: false, sql: sql || '', undoStack: [sql || ''], redoStack: [] };
+        tabs.push(t);
+        activeTabId = t.id;
+        undoStack = t.undoStack;
+        redoStack = [];
+        els.query.value = t.sql;
+        updateHighlight();
+        renderTabs();
+        persistTabs();
+        els.query.focus();
+    }
+
+    function closeTab(id) {
+        if (tabs.length <= 1) return;
+        const i = tabs.findIndex(t => t.id === id);
+        if (i === -1) return;
+        const wasActive = tabs[i].id === activeTabId;
+        tabs.splice(i, 1);
+        if (wasActive) {
+            const next = tabs[Math.min(i, tabs.length - 1)];
+            activeTabId = next.id;
+            undoStack = next.undoStack && next.undoStack.length > 0 ? next.undoStack : [next.sql];
+            redoStack = next.redoStack || [];
+            els.query.value = next.sql;
+            updateHighlight();
+        }
+        renderTabs();
+        persistTabs();
+    }
+
+    function renameTab(id) {
+        const t = tabs.find(x => x.id === id);
+        if (!t) return;
+        const name = window.prompt('タブ名', t.name);
+        if (name === null) return;
+        const trimmed = name.trim();
+        if (trimmed === '') { t.custom = false; t.name = deriveTabName(t.sql); }
+        else { t.custom = true; t.name = trimmed.slice(0, 40); }
+        renderTabs();
+        persistTabs();
+    }
+
+    function initTabs() {
+        let saved = null;
+        try { saved = JSON.parse(localStorage.getItem(TABS_KEY) || 'null'); } catch (e) { saved = null; }
+        if (saved && Array.isArray(saved.tabs) && saved.tabs.length > 0) {
+            tabs = saved.tabs.slice(0, TABS_MAX).map(t => ({
+                id: ++tabSeq,
+                name: typeof t.name === 'string' && t.name !== '' ? t.name : deriveTabName(t.sql),
+                custom: !!t.custom,
+                sql: typeof t.sql === 'string' ? t.sql : '',
+                undoStack: [typeof t.sql === 'string' ? t.sql : ''],
+                redoStack: []
+            }));
+            // 保存時の activeTabId は採番し直した id と対応しないため、位置で復元する
+            const idx = Math.max(0, (saved.tabs || []).findIndex(t => t.id === saved.activeTabId));
+            activeTabId = tabs[Math.min(idx, tabs.length - 1)].id;
+        } else {
+            // 初回起動: 現在エディタに入っている内容をそのまま 1 枚目のタブにする
+            const cur = els.query.value;
+            tabs = [{ id: ++tabSeq, name: deriveTabName(cur), custom: false, sql: cur, undoStack: [cur], redoStack: [] }];
+            activeTabId = tabs[0].id;
+        }
+        const act = activeTab();
+        els.query.value = act.sql;
+        undoStack = act.undoStack;
+        redoStack = [];
+        updateHighlight();
+        renderTabs();
+    }
+
+    document.getElementById('editorTabs').addEventListener('click', (e) => {
+        const closeBtn = e.target.closest('[data-close-id]');
+        if (closeBtn) { e.stopPropagation(); closeTab(Number(closeBtn.dataset.closeId)); return; }
+        const tab = e.target.closest('[data-tab-id]');
+        if (tab) selectTab(Number(tab.dataset.tabId));
+    });
+    document.getElementById('editorTabs').addEventListener('dblclick', (e) => {
+        const tab = e.target.closest('[data-tab-id]');
+        if (tab) renameTab(Number(tab.dataset.tabId));
+    });
+    document.getElementById('tabAddBtn').addEventListener('click', () => addTab(''));
+
     function setQueryValue(val) {
         els.query.value = val;
         updateHighlight();
         saveQueryState();
+        touchActiveTab();
     }
 
+    // カーソル位置へテキストを挿入する（サイドバーのカラム名クリック等から使う）。
+    // 直前が識別子文字なら区切りの空白を足し、挿入後はカーソルを末尾へ送る
+    function insertAtCursor(text) {
+        const el = els.query;
+        const pos = el.selectionStart === null ? el.value.length : el.selectionStart;
+        const end = el.selectionEnd === null ? pos : el.selectionEnd;
+        const before = el.value.slice(0, pos);
+        const sep = (before !== '' && /[a-zA-Z0-9_.]$/.test(before)) ? ' ' : '';
+        const ins = sep + text;
+        el.value = before + ins + el.value.slice(end);
+        el.selectionStart = el.selectionEnd = pos + ins.length;
+        updateHighlight();
+        saveQueryState();
+        touchActiveTab();
+        el.focus();
+    }
+
+    // カーソル位置を含む 1 文だけを切り出す（商用クライアントの
+    // 「カーソル位置の文を実行」相当）。';' 区切りで、文字列リテラル内は無視する。
+    // 見つからなければ null を返す（呼び出し側は全文実行へ落とす）
+    function statementAtCursor(text, caret) {
+        if (!text || text.trim() === '') return null;
+        const bounds = [];
+        let start = 0, inStr = false, quote = '';
+        for (let i = 0; i < text.length; i++) {
+            const c = text[i];
+            if (inStr) {
+                if (c === '\\') { i++; continue; }
+                if (c === quote) {
+                    // '' / "" は引用符のエスケープなので閉じたと見なさない
+                    if (text[i + 1] === quote) { i++; continue; }
+                    inStr = false;
+                }
+                continue;
+            }
+            if (c === "'" || c === '"') { inStr = true; quote = c; continue; }
+            if (c === ';') { bounds.push([start, i]); start = i + 1; }
+        }
+        bounds.push([start, text.length]);
+        const pos = Math.max(0, Math.min(caret === null || caret === undefined ? text.length : caret, text.length));
+        // カーソルがちょうど ';' の直後にある場合は「直前の文」を選ぶのが自然
+        for (const [s, e] of bounds) {
+            if (pos >= s && pos <= e) {
+                const seg = text.slice(s, e).trim();
+                if (seg !== '') return seg;
+            }
+        }
+        // 空セグメント上にいるときは前方の直近の非空文を返す
+        for (let i = bounds.length - 1; i >= 0; i--) {
+            const seg = text.slice(bounds[i][0], bounds[i][1]).trim();
+            if (seg !== '' && bounds[i][0] <= pos) return seg;
+        }
+        return null;
+    }
+
+    initTabs();
     saveQueryState();
     updateHighlight();
 
@@ -275,7 +592,13 @@
         updateHighlight();
         showSuggestions();
         clearTimeout(saveTimeout);
-        saveTimeout = setTimeout(saveQueryState, 400);
+        saveTimeout = setTimeout(() => {
+            saveQueryState();
+            // 入力が落ち着いたところでタブ本文とラベルを更新して保存する
+            syncActiveTab();
+            renderTabs();
+            persistTabs();
+        }, 400);
     });
 
     els.query.addEventListener('scroll', () => {
@@ -310,10 +633,26 @@
         }
 
         const cmdKey = e.metaKey || e.ctrlKey;
+        // エディタタブ: Ctrl+Alt+T 新規 / Ctrl+Alt+W 閉じる / Alt+1..9 で切替。
+        // Ctrl+T / Ctrl+W はブラウザ自身が奪うので Alt を足している
+        if (cmdKey && e.altKey && e.key.toLowerCase() === 't') {
+            e.preventDefault(); addTab(''); return;
+        }
+        if (cmdKey && e.altKey && e.key.toLowerCase() === 'w') {
+            e.preventDefault(); closeTab(activeTabId); return;
+        }
+        if (e.altKey && !cmdKey && /^[1-9]$/.test(e.key)) {
+            const t = tabs[Number(e.key) - 1];
+            if (t) { e.preventDefault(); selectTab(t.id); }
+            return;
+        }
         if (e.key === 'Enter' && cmdKey) {
             e.preventDefault();
             clearTimeout(saveTimeout); saveQueryState();
-            runQuery();
+            // Ctrl+Enter はカーソル位置の 1 文だけ、Ctrl+Shift+Enter は全文を実行する。
+            // 複数文を書き溜めたスクラッチパッドから 1 文ずつ試せるようにするため
+            if (e.shiftKey) runQuery();
+            else runQueryAtCursor();
             return;
         }
         // Ctrl+↑ / Ctrl+↓: クエリ履歴の巡回

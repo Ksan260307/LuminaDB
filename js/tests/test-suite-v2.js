@@ -163,8 +163,14 @@
             r.data[0].cd === 0.25 && r.data[1].cd === 0.75 && r.data[2].cd === 0.75 && r.data[3].cd === 1 && r.data[4].cd === 1 },
         { name: "V2Win: NTH_VALUE", sql: "SELECT id, NTH_VALUE(v, 2) OVER(PARTITION BY grp ORDER BY v ASC) AS nv FROM v2win ORDER BY id ASC", check: r =>
             r.data[0].nv === 20 && r.data[3].nv === 20 && r.data[4].nv === null },
-        { name: "V2Win: Window With Group By Rejected", sql: "SELECT grp, ROW_NUMBER() OVER(ORDER BY grp) AS rn FROM v2win GROUP BY grp", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Window functions cannot be combined') },
-        { name: "V2Win: Window With Aggregate Rejected", sql: "SELECT COUNT(*) AS c, ROW_NUMBER() OVER(ORDER BY id) AS rn FROM v2win", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Window functions cannot be combined') },
+        // v1.21: ウィンドウ関数は集計後の行に対して評価されるようになった（旧: 明示エラー）
+        { name: "V2Win: Window Over Group By", sql: "SELECT grp, ROW_NUMBER() OVER(ORDER BY grp) AS rn FROM v2win GROUP BY grp ORDER BY rn",
+          check: r => !r.error && r.data.length >= 1 && r.data[0].rn === 1 },
+        { name: "V2Win: Window Over Bare Aggregate", sql: "SELECT COUNT(*) AS c, ROW_NUMBER() OVER() AS rn FROM v2win",
+          check: r => !r.error && r.data.length === 1 && r.data[0].rn === 1 },
+        // 集計後のウィンドウに明示フレームは付けられない（サブクエリを案内する）
+        { name: "V2Win: Explicit Frame Over Group By Rejected", sql: "SELECT grp, SUM(SUM(id)) OVER (ROWS UNBOUNDED PRECEDING) AS s FROM v2win GROUP BY grp",
+          isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Explicit window frames') },
         { name: "V2Win: Cleanup", sql: "DROP TABLE v2win", check: r => r.data[0].Result === "Success" },
 
         // ============================================================
@@ -210,8 +216,19 @@
             r.data.length === 1 && r.data[0].id === 4 && r.data[0].name === 'd' && r.data[0].v === 40 },
         { name: "V2Ret: DELETE RETURNING Actually Deleted", sql: "SELECT COUNT(*) AS c FROM v2ret", check: r => r.data[0].c === 3 },
         { name: "V2Ret: REPLACE RETURNING Rejected", sql: "REPLACE INTO v2ret (id, name, v) VALUES (1, 'z', 0) RETURNING *", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('RETURNING is not supported') },
-        { name: "V2Ret: IGNORE RETURNING Rejected", sql: "INSERT IGNORE INTO v2ret (id, name, v) VALUES (1, 'z', 0) RETURNING *", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('RETURNING is not supported') },
-        { name: "V2Ret: ODKU RETURNING Rejected", sql: "INSERT INTO v2ret (id, name, v) VALUES (1, 'z', 0) ON DUPLICATE KEY UPDATE v = 1 RETURNING *", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('RETURNING is not supported') },
+        // v1.22: IGNORE / ON CONFLICT の RETURNING は「実際に書き込んだ行だけ」を返すようになった
+        // （PostgreSQL と同じ。REPLACE は削除で索引がずれるため引き続き非対応）
+        { name: "V2Ret: IGNORE RETURNING Skips Conflicts", sql: "INSERT IGNORE INTO v2ret (id, name, v) VALUES (1, 'z', 0) RETURNING *", check: r =>
+            !r.error && r.data.length === 0 },
+        { name: "V2Ret: IGNORE RETURNING Returns Inserted", sql: "INSERT IGNORE INTO v2ret (id, name, v) VALUES (91, 'ign', 7) RETURNING id, v", check: r =>
+            !r.error && r.data.length === 1 && r.data[0].id === 91 && r.data[0].v === 7 },
+        { name: "V2Ret: ODKU RETURNING Updated Row", sql: "INSERT INTO v2ret (id, name, v) VALUES (1, 'z', 0) ON DUPLICATE KEY UPDATE v = 1 RETURNING id, v", check: r =>
+            !r.error && r.data.length === 1 && r.data[0].id === 1 && r.data[0].v === 1 },
+        { name: "V2Ret: Upsert RETURNING Cleanup", fn: () => {
+            db.executeQuery("DELETE FROM v2ret WHERE id = 91");
+            db.executeQuery("UPDATE v2ret SET v = 110 WHERE id = 1");
+            return db.executeQuery("SELECT v FROM v2ret WHERE id = 1").data[0].v === 110;
+        }},
         { name: "V2Ret: Returning Named Column Assignment Unaffected", fn: () => {
             db.executeQuery("CREATE TABLE v2retc (id INTEGER, returning INTEGER)");
             db.executeQuery("INSERT INTO v2retc (id, returning) VALUES (1, 0)");

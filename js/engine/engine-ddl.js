@@ -9,7 +9,7 @@
         'Regexp': 'REGEXP_REPLACE REGEXP_SUBSTR REGEXP_LIKE REGEXP_COUNT REGEXP_INSTR',
         'Numeric': 'ABS CEIL CEILING FLOOR ROUND TRUNCATE TRUNC MOD REMAINDER SIGN POWER POW SQUARE SQRT CBRT EXP LN LOG LOG10 LOG2 PI RAND RANDOM SIN COS TAN COT SINH COSH TANH ASIN ACOS ATAN ATAN2 DEGREES RADIANS GREATEST LEAST GCD LCM FACTORIAL WIDTH_BUCKET NANVL BITAND BITOR BITXOR BITNOT SHIFTLEFT SHIFTRIGHT ISNUMERIC BIT_COUNT CRC32 FORMAT_BYTES',
         'Date & Time': 'NOW CURRENT_TIMESTAMP SYSDATE SYSTIMESTAMP GETDATE GETUTCDATE SYSDATETIME SYSUTCDATETIME UTC_TIMESTAMP CURDATE CURRENT_DATE UTC_DATE CURTIME CURRENT_TIME DATE TIME YEAR MONTH DAY DAYOFMONTH HOUR MINUTE SECOND DAYOFWEEK DAYOFYEAR WEEKDAY WEEK WEEKOFYEAR QUARTER MONTHNAME DAYNAME LAST_DAY EOMONTH NEXT_DAY DATEDIFF DATEADD DATEPART DATENAME DATE_ADD DATE_SUB ADD_MONTHS MONTHS_BETWEEN ADDDATE SUBDATE EXTRACT DATE_PART TIMESTAMPDIFF TIMESTAMPADD DATE_FORMAT STR_TO_DATE UNIX_TIMESTAMP FROM_UNIXTIME SEC_TO_TIME TIME_TO_SEC MAKEDATE MAKETIME MAKE_DATE MAKE_TIMESTAMP TO_DAYS FROM_DAYS DATE_TRUNC',
-        'JSON': 'JSON_EXTRACT JSON_VALUE JSON_ARRAY JSON_OBJECT JSON_LENGTH JSON_KEYS JSON_VALID JSON_TYPE JSON_CONTAINS JSON_SET JSON_REMOVE JSON_PRETTY JSON_QUOTE JSON_UNQUOTE JSON_ARRAY_APPEND JSON_MERGE_PATCH JSON_DEPTH',
+        'JSON': 'JSON_EXTRACT JSON_VALUE JSON_ARRAY JSON_OBJECT JSON_LENGTH JSON_KEYS JSON_VALID JSON_TYPE JSON_CONTAINS JSON_CONTAINS_PATH JSON_SET JSON_INSERT JSON_REPLACE JSON_REMOVE JSON_PRETTY JSON_QUOTE JSON_UNQUOTE JSON_ARRAY_APPEND JSON_ARRAY_INSERT JSON_MERGE_PATCH JSON_DEPTH',
         'Null & Flow': 'COALESCE IFNULL ISNULL NVL NVL2 ZEROIFNULL NULLIFZERO NULLIF DECODE CHOOSE IF IIF CASE CAST CONVERT TRY_CAST TRY_CONVERT',
         'Conversion': 'CAST CONVERT TRY_CAST TRY_CONVERT TO_NUMBER TO_CHAR TO_HEX TO_DATE TO_TIMESTAMP',
         'Encoding & Hash': 'MD5 SHA1 TO_BASE64 FROM_BASE64 INET_ATON INET_NTOA',
@@ -63,9 +63,34 @@
           return { onDelete: norm(dm), onUpdate: norm(um) };
       },
 
+      // ADD CONSTRAINT <name> で付いた名前を表へ登録する（DROP CONSTRAINT の逆引き用）。
+      // 実体は uniqueCols / compositeKeys / foreignKeys 側にあり、ここは索引だけを持つ
+      _recordConstraintName(t, name, kind, cols) {
+          if (!name) return;
+          t.constraintNames = t.constraintNames || Object.create(null);
+          if (t.constraintNames[name]) throw new Error(`Constraint '${name}' already exists.`);
+          t.constraintNames[name] = { kind, cols: [...cols] };
+      },
+
+      // 名前で引いた制約の実体を外す。単一列と複合で保持場所が違うため両方を掃除する
+      _dropNamedConstraint(t, name, entry) {
+          const cols = entry.cols || [];
+          if (entry.kind === 'fk') {
+              t.foreignKeys = (t.foreignKeys || []).filter(fk => !(fk.name === name || (!fk.name && this._fkCols(fk).join(',') === cols.join(','))));
+          } else if (entry.kind === 'unique') {
+              if (cols.length === 1) t.uniqueCols = (t.uniqueCols || []).filter(c => c !== cols[0]);
+              t.compositeKeys = (t.compositeKeys || []).filter(ck => ck.isPK || ck.cols.join(',') !== cols.join(','));
+          } else if (entry.kind === 'pk') {
+              if (cols.length === 1 && t.primaryKey === cols[0]) t.primaryKey = null;
+              t.compositeKeys = (t.compositeKeys || []).filter(ck => !(ck.isPK && ck.cols.join(',') === cols.join(',')));
+          }
+          delete t.constraintNames[name];
+      },
+
       // DEFAULT 句のリテラルトークンを JS 値へ解釈する
       // （CREATE TABLE / ALTER ... SET DEFAULT / ADD COLUMN DEFAULT で共用）
       _parseDefaultLiteral(raw, strMap) {
+          raw = String(raw).trim();
           // CURRENT_TIMESTAMP / NOW(): 挿入時に評価するマーカーとして保存する
           if (/^(?:current_timestamp|now\(\))$/i.test(raw)) return { __currentTimestamp: true };
           const strM = raw.match(/^__STR_(\d+)__$/);
@@ -74,12 +99,114 @@
           if (raw.toLowerCase() === 'true') return true;
           if (raw.toLowerCase() === 'false') return false;
           if (!isNaN(raw)) return Number(raw);
+          // 関数呼び出し / 括弧式は「挿入時に評価する式」として保存する
+          // （NEXTVAL('s') / UUID() / (1+2) など。以前はテキストのまま格納され、
+          //   挿入時に型変換エラーになるか文字列がそのまま入っていた）
+          if (raw.indexOf('(') !== -1) {
+              const expr = strMap ? this._restoreStrings(raw, strMap) : raw;
+              // 定義時に構文と関数名を検証する。実行時の未知関数は行評価の catch に
+              // 飲まれて黙って NULL になるため、ここで名前を照合しておく
+              const sm = [];
+              const masked = this._maskStrings(expr, sm);
+              let fm;
+              const fnRe = /\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/g;
+              while ((fm = fnRe.exec(masked))) {
+                  const fname = fm[1].toLowerCase();
+                  if (LUMINA_BUILTIN_FN_NAMES.has(fname)) continue;
+                  if (this.functions && this.functions[fname]) continue;
+                  if (['case', 'cast', 'convert', 'if', 'iif', 'coalesce', 'array'].includes(fname)) continue;
+                  throw new Error(`Unknown function '${fm[1]}' in DEFAULT expression.`);
+              }
+              this.compileCondition(masked, sm);
+              return { __expr: expr };
+          }
           return raw;
       },
 
       // DEFAULT CURRENT_TIMESTAMP のマーカー判定と現在時刻文字列
       _isNowMarker(v) {
           return !!(v && typeof v === 'object' && v.__currentTimestamp === true);
+      },
+
+      // DEFAULT に式（関数呼び出しや括弧式）が指定されているか。
+      // `DEFAULT NEXTVAL('s')` / `DEFAULT UUID()` / `DEFAULT (1+2)` を挿入時に評価するため、
+      // 定義時はテキストのまま保持しておく
+      _isExprDefault(v) {
+          return !!(v && typeof v === 'object' && typeof v.__expr === 'string');
+      },
+
+      // CREATE VIEW v (c1, c2) AS SELECT ... の列リストを本体の別名として畳み込む。
+      // 派生表で包むと更新可能ビューでなくなってしまうため、SELECT 句の各項目へ
+      // 直接 AS を付け替える。列数は本体を 1 度実行して確認する
+      _applyViewColumnList(body, colList, strMap) {
+          const probe = this.executeQuery(`SELECT * FROM (${this._restoreStrings(body, strMap)}) __vcl LIMIT 0`);
+          if (probe.error) throw new Error(`VIEW body failed: ${probe.error}`);
+          const produced = probe.columns || (probe.data[0] ? Object.keys(probe.data[0]) : null);
+          // LIMIT 0 で行が無い場合は SELECT 句の項目数で代用する
+          const selEnd = this._topLevelKeyword(body, 'from');
+          const selClause = selEnd === -1 ? body.replace(/^select\s+/i, '') : body.slice(0, selEnd).replace(/^select\s+/i, '');
+          const items = this.splitSelectClause(selClause).map(x => x.trim()).filter(x => x !== '');
+          // '*' は位置で別名を付けられない（展開後の列数が定義時に確定しない）ので先に弾く
+          if (items.some(x => x === '*' || /\.\s*\*$/.test(x))) {
+              throw new Error("A view column list cannot be combined with SELECT * — list the columns explicitly.");
+          }
+          const arity = produced ? produced.length : items.length;
+          if (arity !== colList.length) {
+              throw new Error(`View column list has ${colList.length} names but the query returns ${arity} columns.`);
+          }
+          if (items.length !== colList.length) {
+              throw new Error(`View column list has ${colList.length} names but the SELECT clause has ${items.length} items.`);
+          }
+          const renamed = items.map((item, i) => `${item.replace(/\s+as\s+[a-zA-Z0-9_]+$/i, '')} AS ${colList[i]}`);
+          const rebuilt = `SELECT ${renamed.join(', ')}` + (selEnd === -1 ? '' : ' ' + body.slice(selEnd));
+          // 付け替えた結果が本当にその列名を返すか確かめる（AS 無しの別名などを取りこぼさない）
+          const check = this.executeQuery(`SELECT * FROM (${this._restoreStrings(rebuilt, strMap)}) __vcl LIMIT 1`);
+          if (check.error) throw new Error(`View column list could not be applied: ${check.error}`);
+          const got = check.columns || (check.data[0] ? Object.keys(check.data[0]) : colList);
+          if (got.join(',') !== colList.join(',')) {
+              throw new Error(`View column list could not be applied (got ${got.join(', ')}). Use explicit 'expr AS name' items.`);
+          }
+          return rebuilt;
+      },
+
+      // `DEFAULT <値>` の値部分を切り出す。関数呼び出しや括弧式も 1 トークンとして
+      // 取れるよう、空白ではなく括弧の対応で終端を決める。
+      // 見つからなければ null、見つかれば { raw, start, end }（end は値の直後）
+      _takeDefaultToken(text) {
+          const dm = text.match(/\bdefault\s+/i);
+          if (!dm) return null;
+          let e = dm.index + dm[0].length, depth = 0;
+          while (e < text.length) {
+              const ch = text[e];
+              if (ch === '(') depth++;
+              else if (ch === ')') { if (depth === 0) break; depth--; }
+              else if (/\s/.test(ch) && depth === 0) {
+                  // 空白の次が '(' なら関数名と引数の間の空白なので続行する
+                  if (!/^\s*\(/.test(text.slice(e))) break;
+              }
+              e++;
+          }
+          return { raw: text.slice(dm.index + dm[0].length, e), start: dm.index, end: e };
+      },
+
+      // DEFAULT の保存形を DDL 表示用のテキストへ戻す（SHOW CREATE TABLE / DESCRIBE / メタデータ共用）
+      _defaultToText(dv) {
+          if (dv === undefined) return null;
+          if (this._isNowMarker(dv)) return 'CURRENT_TIMESTAMP';
+          if (this._isExprDefault(dv)) return dv.__expr;
+          return dv;
+      },
+
+      // DEFAULT の保存形（リテラル / CURRENT_TIMESTAMP マーカー / 式マーカー）を実値へ解決する。
+      // 式は行ごとに呼ばれるので NEXTVAL のように毎回違う値を返すものも正しく働く
+      _resolveDefaultValue(dv) {
+          if (this._isNowMarker(dv)) return this._nowString();
+          if (this._isExprDefault(dv)) {
+              const sm = [];
+              const fn = this.compileCondition(this._maskStrings(dv.__expr, sm), sm);
+              return fn({}, this.tables, {});
+          }
+          return dv;
       },
       _nowString() {
           return new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -713,10 +840,50 @@
       // 値の採番は実DBと同様に非トランザクション（ROLLBACK しても戻らない）。
       // 定義の作成/削除のみ undo ログ対象（_logSeqState）
 
+      // CREATE / ALTER SEQUENCE のオプション句を解釈する。
+      // 対応: START WITH / INCREMENT BY / MINVALUE / MAXVALUE / NO MINVALUE / NO MAXVALUE /
+      //       CYCLE / NO CYCLE / CACHE n（CACHE は単一プロセスなので受理して無視）
+      _parseSeqOptions(text) {
+          const opts = {};
+          let rest = ' ' + (text || '').trim() + ' ';
+          const take = (re, apply) => {
+              const m = rest.match(re);
+              if (m) { apply(m); rest = rest.slice(0, m.index) + ' ' + rest.slice(m.index + m[0].length); }
+              return !!m;
+          };
+          take(/\s(?:start\s+with|start)\s+(-?\d+)\s/i, m => { opts.start = parseInt(m[1], 10); });
+          take(/\s(?:increment\s+by|increment)\s+(-?\d+)\s/i, m => { opts.increment = parseInt(m[1], 10); });
+          take(/\sno\s+minvalue\s/i, () => { opts.minValue = null; })
+              || take(/\sminvalue\s+(-?\d+)\s/i, m => { opts.minValue = parseInt(m[1], 10); });
+          take(/\sno\s+maxvalue\s/i, () => { opts.maxValue = null; })
+              || take(/\smaxvalue\s+(-?\d+)\s/i, m => { opts.maxValue = parseInt(m[1], 10); });
+          take(/\sno\s+cycle\s/i, () => { opts.cycle = false; })
+              || take(/\scycle\s/i, () => { opts.cycle = true; });
+          // CACHE は「何個先まで採番を確保するか」の性能ヒント。単一プロセスでは意味を持たない
+          take(/\scache\s+(\d+)\s/i, m => { opts.cache = parseInt(m[1], 10); });
+          take(/\sowned\s+by\s+[a-zA-Z0-9_.]+\s/i, () => {});
+          if (rest.trim() !== '') opts.__leftover = rest.trim();
+          return opts;
+      },
+
       _seqNext(name) {
           const s = this.sequences[String(name).toLowerCase()];
           if (!s) throw new Error(`Sequence '${name}' not found.`);
-          s.value = s.value === null ? s.start : s.value + s.increment;
+          if (s.value === null) { s.value = s.start; return s.value; }
+          const next = s.value + s.increment;
+          // 上限/下限に達したら CYCLE なら反対端へ折り返し、そうでなければエラー
+          const overMax = s.maxValue !== undefined && s.maxValue !== null && next > s.maxValue;
+          const underMin = s.minValue !== undefined && s.minValue !== null && next < s.minValue;
+          if (overMax || underMin) {
+              if (!s.cycle) {
+                  throw new Error(`Sequence '${name}' reached its ${overMax ? 'MAXVALUE' : 'MINVALUE'} (${overMax ? s.maxValue : s.minValue}).`);
+              }
+              s.value = overMax
+                  ? (s.minValue !== undefined && s.minValue !== null ? s.minValue : s.start)
+                  : (s.maxValue !== undefined && s.maxValue !== null ? s.maxValue : s.start);
+              return s.value;
+          }
+          s.value = next;
           return s.value;
       },
 
@@ -754,6 +921,28 @@
                   return { Kind: k.slice(0, i).toUpperCase(), Object: k.slice(i + 1), Comment: this.comments[k] };
               });
               return { data, affectedRows: data.length };
+          }
+          // SHOW SCHEMAS / DATABASES: 単一スキーマ構成だが、CREATE SCHEMA で記録した名前も出す
+          if (/^show\s+(schemas|databases)$/i.test(sql.trim())) {
+              const names = ['main'].concat(Object.keys(this.schemas || {}).filter(n => n !== 'main'));
+              const data = names.map(n => ({ Schema: n, Note: n === 'main' ? 'all objects live here' : 'accepted for compatibility' }));
+              return { data, affectedRows: data.length };
+          }
+          // SHOW TRANSACTION ISOLATION LEVEL（PostgreSQL）: 実効レベルは常に SERIALIZABLE
+          if (/^show\s+transaction\s+isolation\s+level$/i.test(sql.trim())) {
+              const requested = (this.sessionSettings || {})['transaction isolation level'];
+              return { data: [{ 'transaction_isolation': 'SERIALIZABLE', Requested: requested ? String(requested) : 'SERIALIZABLE' }], affectedRows: 1 };
+          }
+          // SHOW WARNINGS / SHOW COUNT(*) WARNINGS（MySQL）: 直前の文が出した警告を読む。
+          // 警告は致命的でない問題（黙って無視された操作・切り捨て等）の記録
+          if (/^show\s+warnings(?:\s+limit\s+\d+)?$/i.test(sql.trim())) {
+              const lim = sql.match(/limit\s+(\d+)/i);
+              const all = this._warnings || [];
+              const data = lim ? all.slice(0, parseInt(lim[1], 10)) : all.slice();
+              return { data, affectedRows: data.length };
+          }
+          if (/^show\s+count\s*\(\s*\*\s*\)\s+warnings$/i.test(sql.trim())) {
+              return { data: [{ 'Warnings': (this._warnings || []).length }], affectedRows: 1 };
           }
           // SHOW SETTINGS: セッション設定（SET TRANSACTION 等で受理した値）
           if (/^show\s+settings$/i.test(sql.trim())) {
@@ -860,7 +1049,8 @@
           const trgM = sql.trim().match(/^show\s+triggers(?:\s+from\s+([a-zA-Z0-9_]+))?$/i);
           if (trgM) {
               const target = trgM[1] ? trgM[1].toLowerCase() : null;
-              if (target && !this.tables[target]) throw this._tableNotFound(target);
+              // INSTEAD OF トリガーはビューに付くので、対象にビュー名も許す
+              if (target && !this.tables[target] && !this.views[target]) throw this._tableNotFound(target);
               const data = Object.keys(this.triggers)
                   .filter(n => !target || this.triggers[n].table === target)
                   .map(n => {
@@ -876,7 +1066,10 @@
           if (/^show\s+sequences$/i.test(sql.trim())) {
               const data = Object.keys(this.sequences).map(n => {
                   const s = this.sequences[n];
-                  return { Sequence: n, Start: s.start, Increment: s.increment, Value: s.value };
+                  return { Sequence: n, Start: s.start, Increment: s.increment, Value: s.value,
+                           MinValue: s.minValue === undefined ? null : s.minValue,
+                           MaxValue: s.maxValue === undefined ? null : s.maxValue,
+                           Cycle: !!s.cycle };
               });
               return { data, affectedRows: data.length };
           }
@@ -884,17 +1077,89 @@
               const data = Object.keys(this.prepared).map(n => ({ Statement: n, Sql: this.prepared[n] }));
               return { data, affectedRows: data.length };
           }
-          const idxM = sql.trim().match(/^show\s+indexes(?:\s+from\s+([a-zA-Z0-9_]+))?$/i);
+          // SHOW INDEXES / SHOW INDEX / SHOW KEYS [FROM table]（後2つは MySQL の綴り）
+          const idxM = sql.trim().match(/^show\s+(?:indexes|index|keys)(?:\s+from\s+([a-zA-Z0-9_]+))?$/i);
           if (idxM) {
               const target = idxM[1] ? idxM[1].toLowerCase() : null;
               if (target && !this.tables[target]) throw new Error(`Table '${target}' not found.`);
+              const named = this.indexNames || Object.create(null);
               const data = [];
               Object.keys(this.tables)
                   .filter(t => !t.startsWith('__tmp_') && (!target || t === target))
                   .forEach(t => {
-                      Object.keys(this.tables[t].indices).forEach(c => {
-                          data.push({ Table: t, Column: c, Keys: this.tables[t].indices[c].size });
+                      const tbl = this.tables[t];
+                      // 列ハッシュを持つ索引（PK/UNIQUE 由来の暗黙索引も含む）
+                      Object.keys(tbl.indices).forEach(c => {
+                          // その列を含む名前付き索引があれば名前・並び順を添える
+                          let nm = '', dir = 'ASC', uniq = tbl.primaryKey === c || (tbl.uniqueCols || []).includes(c);
+                          for (const k of Object.keys(named)) {
+                              const ix = named[k];
+                              if (ix.table !== t) continue;
+                              const key = (ix.keys || []).find(kk => kk.col === c);
+                              if (!key && !(ix.cols || []).includes(c)) continue;
+                              nm = k; dir = key ? key.dir : 'ASC'; uniq = uniq || !!ix.unique;
+                              break;
+                          }
+                          data.push({ Table: t, Name: nm, Column: c, Expression: '', Direction: dir, Unique: uniq, Keys: tbl.indices[c].size });
                       });
+                      // 式キー（対応する列が無いのでメタデータとしてのみ存在する）
+                      Object.keys(named).forEach(k => {
+                          if (named[k].table !== t) return;
+                          (named[k].keys || []).filter(kk => kk.expr).forEach(kk => {
+                              data.push({ Table: t, Name: k, Column: '', Expression: kk.expr, Direction: kk.dir, Unique: !!named[k].unique, Keys: 0 });
+                          });
+                      });
+                  });
+              return { data, affectedRows: data.length };
+          }
+          // SHOW DOMAINS / TYPES: ユーザー定義ドメインと列挙型の一覧
+          if (/^show\s+(domains|types)$/i.test(sql.trim())) {
+              const data = Object.keys(this.domains || {}).map(n => {
+                  const d = this.domains[n];
+                  return { Name: n, Kind: d.kind.toUpperCase(), BaseType: d.base,
+                           NotNull: !!d.notNull, Default: d.defaultText,
+                           Constraint: d.values ? `IN (${d.values.join(', ')})` : (d.check || null) };
+              });
+              return { data, affectedRows: data.length };
+          }
+          // SHOW GRANTS / USERS / ROLES: 権限は強制していないので名簿を返すだけ
+          if (/^show\s+grants(?:\s+for\s+[a-zA-Z0-9_]+)?$/i.test(sql.trim())) {
+              const data = Object.keys(this.roles || {}).map(n => ({
+                  Grantee: n, Kind: this.roles[n].kind.toUpperCase(), Privileges: 'ALL',
+                  Note: 'LuminaDB does not enforce privileges; GRANT/REVOKE are accepted for script compatibility.'
+              }));
+              return { data, affectedRows: data.length };
+          }
+          if (/^show\s+(users|roles)$/i.test(sql.trim())) {
+              const want = /users/i.test(sql) ? 'user' : 'role';
+              const data = Object.keys(this.roles || {}).filter(n => this.roles[n].kind === want)
+                  .map(n => ({ Name: n, Kind: want.toUpperCase() }));
+              return { data, affectedRows: data.length };
+          }
+          // SHOW TABLE STATUS [LIKE 'pat'] (MySQL): 表ごとの行数・列数・制約の概況
+          const tstM = sql.trim().match(/^show\s+table\s+status(?:\s+like\s+(__STR_\d+__|'[^']*'))?$/i);
+          if (tstM) {
+              let pat = null;
+              if (tstM[1]) {
+                  const sm2 = tstM[1].match(/^__STR_(\d+)__$/);
+                  const lit = sm2 ? this._unquoteLiteral(strMap[Number(sm2[1])]) : tstM[1].slice(1, -1);
+                  pat = new RegExp('^' + String(lit).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
+              }
+              const data = Object.keys(this.tables)
+                  .filter(t => !t.startsWith('__tmp_') && (!pat || pat.test(t)))
+                  .map(t => {
+                      const tbl = this.tables[t];
+                      const compPk = (tbl.compositeKeys || []).find(ck => ck.isPK);
+                      return {
+                          Name: t, Engine: 'Lumina', Rows: tbl.rowCount, Columns: Object.keys(tbl.cols).length,
+                          Indexes: Object.keys(tbl.indices).length,
+                          ForeignKeys: (tbl.foreignKeys || []).length,
+                          Checks: (tbl.checks || []).length,
+                          PrimaryKey: tbl.primaryKey || (compPk ? compPk.cols.join(', ') : null),
+                          AutoIncrement: tbl.autoIncrementCol || null,
+                          Temporary: !!tbl.isTemp,
+                          Comment: this.comments['table:' + t] || null
+                      };
                   });
               return { data, affectedRows: data.length };
           }
@@ -908,7 +1173,8 @@
           if (scvM) {
               const name = scvM[1].toLowerCase();
               if (!this.views[name]) throw new Error(`View '${name}' not found.`);
-              return { data: [{ View: name, CreateView: `CREATE VIEW ${name} AS ${this.views[name]}` }], affectedRows: 1 };
+              const vco = (this.viewMeta && this.viewMeta[name]) ? ` WITH ${this.viewMeta[name].checkOption} CHECK OPTION` : '';
+              return { data: [{ View: name, CreateView: `CREATE VIEW ${name} AS ${this.views[name]}${vco}` }], affectedRows: 1 };
           }
           // SHOW CHECKS [FROM table]: CHECK 制約の一覧
           const chkM = sql.trim().match(/^show\s+checks(?:\s+from\s+([a-zA-Z0-9_]+))?$/i);
@@ -1026,18 +1292,20 @@
               });
               // FK: 参照先に存在しない値
               (t.foreignKeys || []).forEach(fk => {
+                  const fkCols = this._fkCols(fk), refCols = this._fkRefCols(fk);
+                  const label = `FOREIGN KEY (${fkCols.join(', ')}) -> ${this._fkLabel(fk)}`;
                   const refTbl = this.tables[fk.refTable];
                   if (!refTbl) {
-                      report(`FOREIGN KEY (${fk.col}) -> ${fk.refTable}(${fk.refCol})`, 1, `Referenced table '${fk.refTable}' not found`);
+                      report(label, 1, `Referenced table '${fk.refTable}' not found`);
                       return;
                   }
                   let orphans = 0;
                   for (let i = 0; i < t.rowCount; i++) {
-                      const v = t.getValue(fk.col, i);
-                      if (v === null || v === undefined) continue;
-                      if (refTbl.findValueRows(fk.refCol, v).length === 0) orphans++;
+                      const tuple = this._fkTupleOrNull((c) => t.getValue(c, i), fkCols);
+                      if (tuple === null) continue;
+                      if (this._fkMatchRows(refTbl, refCols, tuple).length === 0) orphans++;
                   }
-                  report(`FOREIGN KEY (${fk.col}) -> ${fk.refTable}(${fk.refCol})`, orphans, `${orphans} orphaned value(s)`);
+                  report(label, orphans, `${orphans} orphaned value(s)`);
               });
               // CHECK 制約
               const checkFns = this._compileChecks(t);
@@ -1096,7 +1364,9 @@
           const t = this.tables[name];
           if (!t) throw this._tableNotFound(name);
           const data = t.getColumnNames().map(c => {
-              const fk = (t.foreignKeys || []).find(f => f.col === c);
+              // 複合 FK では対応する参照先列を位置で引く
+              const fk = (t.foreignKeys || []).find(f => this._fkCols(f).includes(c));
+              const fkRef = fk ? this._fkRefCols(fk)[this._fkCols(fk).indexOf(c)] : null;
               // 複合キーの構成列は '(composite)' 付きで表示する
               const ckPk = (t.compositeKeys || []).some(ck => ck.isPK && ck.cols.includes(c));
               const ckUq = (t.compositeKeys || []).some(ck => !ck.isPK && ck.cols.includes(c));
@@ -1105,9 +1375,10 @@
                   Type: t.colTypes[c] || 'ANY',
                   Key: t.primaryKey === c ? 'PRIMARY' : ((t.uniqueCols || []).includes(c) ? 'UNIQUE' : (ckPk ? 'PRIMARY (composite)' : (ckUq ? 'UNIQUE (composite)' : ''))),
                   Indexed: !!t.indices[c],
-                  ForeignKey: fk ? `${fk.refTable}(${fk.refCol})` : '',
+                  Collation: (t.collations && t.collations[c]) || '',
+                  ForeignKey: fk ? `${fk.refTable}(${fkRef})` : '',
                   NotNull: (t.notNullCols || []).includes(c),
-                  Default: (t.defaults && c in t.defaults) ? (this._isNowMarker(t.defaults[c]) ? 'CURRENT_TIMESTAMP' : String(t.defaults[c])) : '',
+                  Default: (t.defaults && c in t.defaults) ? String(this._defaultToText(t.defaults[c])) : '',
                   Extra: t.autoIncrementCol === c ? 'AUTO_INCREMENT' : ((t.generatedCols && c in t.generatedCols) ? `GENERATED AS (${t.generatedCols[c]})` : '')
               };
           });
@@ -1176,6 +1447,18 @@
 
       _executeSetSessionVar(sql, strMap) {
           const raw = this._restoreStrings(sql, strMap).replace(/;$/, '');
+          // SET CONSTRAINTS { ALL | name[, ...] } { DEFERRED | IMMEDIATE }（SQL標準）。
+          // LuminaDB の制約検査は文の完了時点で必ず走る（＝常に IMMEDIATE）ため、
+          // DEFERRED は受理したうえで「遅延しない」ことを警告で伝える
+          const scM = raw.match(/^set\s+constraints\s+(all|[a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s+(deferred|immediate)$/i);
+          if (scM) {
+              const mode = scM[2].toUpperCase();
+              this.sessionSettings['constraints'] = mode;
+              if (mode === 'DEFERRED') {
+                  this._warn('CONSTRAINTS_IMMEDIATE', 'SET CONSTRAINTS ... DEFERRED is accepted but constraints are always checked immediately in LuminaDB.');
+              }
+              return { data: [{ Result: 'Success', Message: `Constraints set to ${mode} for ${scM[1]}.` }], affectedRows: 0 };
+          }
           const m = raw.match(/^set\s+(?:session\s+|local\s+|global\s+)?([a-zA-Z_][a-zA-Z0-9_.]*)\s*(?::=|=|\s+to\s+)\s*([\s\S]+)$/i);
           if (!m) throw new Error("Syntax Error in SET. Use SET [SESSION] <name> = <value>.");
           const name = m[1].toLowerCase().replace(/^@@/, '');
@@ -1323,7 +1606,7 @@
               const data = t.getColumnNames().map((c, i) => ({
                   cid: i, name: c, type: (t.colTypes && t.colTypes[c]) ? t.colTypes[c] : 'ANY',
                   notnull: (t.notNullCols.includes(c) || pks.includes(c)) ? 1 : 0,
-                  dflt_value: this._isNowMarker(t.defaults[c]) ? 'CURRENT_TIMESTAMP' : (t.defaults[c] === undefined ? null : t.defaults[c]),
+                  dflt_value: this._defaultToText(t.defaults[c]),
                   pk: pks.includes(c) ? pks.indexOf(c) + 1 : 0
               }));
               return { data, affectedRows: data.length };
@@ -1336,10 +1619,14 @@
               return { data, affectedRows: data.length };
           }
           if (name === 'foreign_key_list') {
-              const data = (t.foreignKeys || []).map((fk, i) => ({
-                  id: i, seq: 0, table: fk.refTable, from: fk.col, to: fk.refCol,
-                  on_update: fk.onUpdate || 'RESTRICT', on_delete: fk.onDelete || 'RESTRICT', match: 'NONE'
-              }));
+              const data = [];
+              (t.foreignKeys || []).forEach((fk, i) => {
+                  const fc = this._fkCols(fk), rc = this._fkRefCols(fk);
+                  fc.forEach((c, j) => data.push({
+                      id: i, seq: j, table: fk.refTable, from: c, to: rc[j],
+                      on_update: fk.onUpdate || 'RESTRICT', on_delete: fk.onDelete || 'RESTRICT', match: 'NONE'
+                  }));
+              });
               return { data, affectedRows: data.length };
           }
           throw new Error(`Unsupported PRAGMA '${name}'. Supported: table_info / table_list / index_list / foreign_key_list / user_version.`);
@@ -1348,7 +1635,8 @@
       // ============ INFORMATION_SCHEMA（標準のカタログビュー） ============
       // information_schema.<name> を参照するクエリの FROM を一時テーブルへ差し替える。
       // expandViews より前に呼ばれる（ビュー本文からの参照も同じ経路を通る）
-      _INFO_SCHEMA_VIEWS: ['tables', 'columns', 'views', 'key_column_usage', 'table_constraints', 'schemata', 'routines', 'sequences'],
+      _INFO_SCHEMA_VIEWS: ['tables', 'columns', 'views', 'key_column_usage', 'table_constraints', 'schemata', 'routines', 'sequences',
+                           'referential_constraints', 'check_constraints', 'statistics', 'triggers', 'parameters'],
 
       expandInfoSchema(sql) {
           // sqlite_master（SQLite 互換のカタログ表）も同じ仕組みで実体化する
@@ -1406,7 +1694,9 @@
           if (kind === 'views') {
               Object.keys(this.views).forEach(vn => rows.push({
                   TABLE_CATALOG: 'lumina', TABLE_SCHEMA: SCHEMA, TABLE_NAME: vn,
-                  VIEW_DEFINITION: this.views[vn], IS_UPDATABLE: 'NO'
+                  VIEW_DEFINITION: this.views[vn],
+                  IS_UPDATABLE: this._analyzeUpdatableView(vn).updatable ? 'YES' : 'NO',
+                  CHECK_OPTION: (this.viewMeta && this.viewMeta[vn]) ? this.viewMeta[vn].checkOption : 'NONE'
               }));
               return rows;
           }
@@ -1420,7 +1710,8 @@
                       rows.push({
                           TABLE_CATALOG: 'lumina', TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn, COLUMN_NAME: c,
                           ORDINAL_POSITION: pos,
-                          COLUMN_DEFAULT: this._isNowMarker(t.defaults[c]) ? 'CURRENT_TIMESTAMP' : (t.defaults[c] === undefined ? null : t.defaults[c]),
+                          COLUMN_DEFAULT: this._defaultToText(t.defaults[c]),
+                          COLLATION_NAME: (t.collations && t.collations[c]) || null,
                           IS_NULLABLE: (t.notNullCols.includes(c) || isPk) ? 'NO' : 'YES',
                           DATA_TYPE: (t.colTypes && t.colTypes[c]) ? t.colTypes[c] : 'TEXT',
                           COLUMN_KEY: isPk ? 'PRI' : (t.uniqueCols.includes(c) ? 'UNI' : (t.indices[c] ? 'MUL' : '')),
@@ -1439,10 +1730,13 @@
                       CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: 'PRIMARY', TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn,
                       COLUMN_NAME: c, ORDINAL_POSITION: i + 1, REFERENCED_TABLE_NAME: null, REFERENCED_COLUMN_NAME: null
                   }));
-                  (t.foreignKeys || []).forEach((fk, i) => rows.push({
-                      CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: fk.name || `fk_${tn}_${fk.col}`, TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn,
-                      COLUMN_NAME: fk.col, ORDINAL_POSITION: i + 1, REFERENCED_TABLE_NAME: fk.refTable, REFERENCED_COLUMN_NAME: fk.refCol
-                  }));
+                  (t.foreignKeys || []).forEach(fk => {
+                      const fc = this._fkCols(fk), rc = this._fkRefCols(fk);
+                      fc.forEach((c, j) => rows.push({
+                          CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: fk.name || `fk_${tn}_${fc.join('_')}`, TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn,
+                          COLUMN_NAME: c, ORDINAL_POSITION: j + 1, REFERENCED_TABLE_NAME: fk.refTable, REFERENCED_COLUMN_NAME: rc[j]
+                      }));
+                  });
               });
               return rows;
           }
@@ -1453,7 +1747,7 @@
                       rows.push({ CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: 'PRIMARY', TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn, CONSTRAINT_TYPE: 'PRIMARY KEY' });
                   }
                   t.uniqueCols.forEach(c => rows.push({ CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: `uq_${tn}_${c}`, TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn, CONSTRAINT_TYPE: 'UNIQUE' }));
-                  (t.foreignKeys || []).forEach(fk => rows.push({ CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: fk.name || `fk_${tn}_${fk.col}`, TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn, CONSTRAINT_TYPE: 'FOREIGN KEY' }));
+                  (t.foreignKeys || []).forEach(fk => rows.push({ CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: fk.name || `fk_${tn}_${this._fkCols(fk).join('_')}`, TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn, CONSTRAINT_TYPE: 'FOREIGN KEY' }));
                   (t.checks || []).forEach((ck, i) => rows.push({ CONSTRAINT_SCHEMA: SCHEMA, CONSTRAINT_NAME: ck.name || `chk_${tn}_${i + 1}`, TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn, CONSTRAINT_TYPE: 'CHECK' }));
               });
               return rows;
@@ -1469,10 +1763,102 @@
               }));
               return rows;
           }
+          // REFERENTIAL_CONSTRAINTS: FK ごとの参照アクション一覧（マイグレーション検証で使う）
+          if (kind === 'referential_constraints') {
+              userTables.forEach(tn => {
+                  (this.tables[tn].foreignKeys || []).forEach(fk => rows.push({
+                      CONSTRAINT_CATALOG: 'lumina', CONSTRAINT_SCHEMA: SCHEMA,
+                      CONSTRAINT_NAME: fk.name || `fk_${tn}_${this._fkCols(fk).join('_')}`,
+                      UNIQUE_CONSTRAINT_SCHEMA: SCHEMA, UNIQUE_CONSTRAINT_NAME: 'PRIMARY',
+                      MATCH_OPTION: 'NONE',
+                      UPDATE_RULE: fk.onUpdate || 'RESTRICT', DELETE_RULE: fk.onDelete || 'RESTRICT',
+                      TABLE_NAME: tn, REFERENCED_TABLE_NAME: fk.refTable
+                  }));
+              });
+              return rows;
+          }
+          // CHECK_CONSTRAINTS: CHECK 制約の式（SQL標準）
+          if (kind === 'check_constraints') {
+              userTables.forEach(tn => {
+                  (this.tables[tn].checks || []).forEach((ck, i) => rows.push({
+                      CONSTRAINT_CATALOG: 'lumina', CONSTRAINT_SCHEMA: SCHEMA,
+                      CONSTRAINT_NAME: ck.name || `chk_${tn}_${i + 1}`,
+                      TABLE_NAME: tn, CHECK_CLAUSE: ck.expr
+                  }));
+              });
+              return rows;
+          }
+          // STATISTICS: 索引の一覧（MySQL 互換の列名）。SEQ_IN_INDEX はキー内の位置
+          if (kind === 'statistics') {
+              const named = this.indexNames || Object.create(null);
+              userTables.forEach(tn => {
+                  const t = this.tables[tn];
+                  Object.keys(named).filter(k => named[k].table === tn).forEach(k => {
+                      (named[k].keys || (named[k].cols || []).map(c => ({ col: c, dir: 'ASC' }))).forEach((key, i) => rows.push({
+                          TABLE_CATALOG: 'lumina', TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn,
+                          NON_UNIQUE: named[k].unique ? 0 : 1, INDEX_NAME: k,
+                          SEQ_IN_INDEX: i + 1, COLUMN_NAME: key.col || null, EXPRESSION: key.expr || null,
+                          COLLATION: key.dir === 'DESC' ? 'D' : 'A', INDEX_TYPE: 'HASH',
+                          CARDINALITY: key.col && t.indices[key.col] ? t.indices[key.col].size : null
+                      }));
+                  });
+                  // PRIMARY KEY / UNIQUE 由来の暗黙索引（名前付き索引に含まれないもの）
+                  const covered = new Set();
+                  Object.keys(named).filter(k => named[k].table === tn)
+                      .forEach(k => (named[k].cols || []).forEach(c => covered.add(c)));
+                  const implicit = [...(t.primaryKey ? [t.primaryKey] : []), ...(t.uniqueCols || [])];
+                  [...new Set(implicit)].filter(c => !covered.has(c) && t.indices[c]).forEach(c => rows.push({
+                      TABLE_CATALOG: 'lumina', TABLE_SCHEMA: SCHEMA, TABLE_NAME: tn,
+                      NON_UNIQUE: 0, INDEX_NAME: t.primaryKey === c ? 'PRIMARY' : `uq_${tn}_${c}`,
+                      SEQ_IN_INDEX: 1, COLUMN_NAME: c, EXPRESSION: null,
+                      COLLATION: 'A', INDEX_TYPE: 'HASH', CARDINALITY: t.indices[c].size
+                  }));
+              });
+              return rows;
+          }
+          // TRIGGERS: トリガー定義の一覧（SQL標準）
+          if (kind === 'triggers') {
+              Object.keys(this.triggers || {}).forEach(tg => {
+                  const d = this.triggers[tg];
+                  rows.push({
+                      TRIGGER_CATALOG: 'lumina', TRIGGER_SCHEMA: SCHEMA, TRIGGER_NAME: tg,
+                      EVENT_MANIPULATION: String(d.event || '').toUpperCase(),
+                      EVENT_OBJECT_SCHEMA: SCHEMA, EVENT_OBJECT_TABLE: d.table,
+                      ACTION_TIMING: String(d.timing || '').toUpperCase(),
+                      ACTION_ORIENTATION: 'ROW',
+                      ACTION_STATEMENT: Array.isArray(d.statements) ? d.statements.join('; ') : String(d.statements || '')
+                  });
+              });
+              return rows;
+          }
+          // PARAMETERS: ストアドプロシージャ / UDF の仮引数一覧
+          if (kind === 'parameters') {
+              Object.keys(this.procParams || {}).forEach(p => {
+                  (this.procParams[p] || []).forEach((prm, i) => rows.push({
+                      SPECIFIC_CATALOG: 'lumina', SPECIFIC_SCHEMA: SCHEMA, SPECIFIC_NAME: p,
+                      ORDINAL_POSITION: i + 1, PARAMETER_MODE: 'IN',
+                      PARAMETER_NAME: typeof prm === 'string' ? prm : (prm && prm.name) || null,
+                      DATA_TYPE: (prm && prm.type) || null, ROUTINE_TYPE: 'PROCEDURE'
+                  }));
+              });
+              Object.keys(this.functions).forEach(f => {
+                  (this.functions[f].params || []).forEach((prm, i) => rows.push({
+                      SPECIFIC_CATALOG: 'lumina', SPECIFIC_SCHEMA: SCHEMA, SPECIFIC_NAME: f,
+                      ORDINAL_POSITION: i + 1, PARAMETER_MODE: 'IN',
+                      PARAMETER_NAME: typeof prm === 'string' ? prm : (prm && prm.name) || null,
+                      DATA_TYPE: (prm && prm.type) || null, ROUTINE_TYPE: 'FUNCTION'
+                  }));
+              });
+              return rows;
+          }
           // sequences
           Object.keys(this.sequences).forEach(s => {
               const q = this.sequences[s];
-              rows.push({ SEQUENCE_CATALOG: 'lumina', SEQUENCE_SCHEMA: SCHEMA, SEQUENCE_NAME: s, START_VALUE: q.start, INCREMENT: q.increment, LAST_VALUE: q.value });
+              rows.push({ SEQUENCE_CATALOG: 'lumina', SEQUENCE_SCHEMA: SCHEMA, SEQUENCE_NAME: s,
+                          START_VALUE: q.start, INCREMENT: q.increment, LAST_VALUE: q.value,
+                          MINIMUM_VALUE: q.minValue === undefined ? null : q.minValue,
+                          MAXIMUM_VALUE: q.maxValue === undefined ? null : q.maxValue,
+                          CYCLE_OPTION: q.cycle ? 'YES' : 'NO' });
           });
           return rows;
       },
@@ -1519,15 +1905,50 @@
                      sql = sql.slice(0, pw.index);
                  }
              }
-             const m = sql.match(/create\s+(unique\s+)?index\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+on\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)\s*$/i);
+             // INCLUDE (col, ...): 被覆索引の付加列（PostgreSQL / SQL Server）。
+             // LuminaDB の索引は列単位ハッシュで、結果は必ず実表から読むため付加列は不要。
+             // 列名だけ検証して記録し、警告で「効果は無い」ことを伝える
+             let includeCols = null;
+             {
+                 const inc = sql.match(/\s+include\s*\(\s*([a-zA-Z0-9_\s,]+?)\s*\)\s*$/i);
+                 if (inc) {
+                     includeCols = inc[1].split(',').map(x => x.trim().toLowerCase()).filter(x => x !== '');
+                     sql = sql.slice(0, inc.index);
+                 }
+             }
+             // CONCURRENTLY は「他の書き込みを止めずに張る」指定。単一スレッドの本実装では
+             // 常に即時完了なので受理して無視する（移行スクリプトをそのまま通すため）
+             const concurrently = /\bcreate\s+(?:unique\s+)?index\s+concurrently\b/i.test(sql);
+             if (concurrently) sql = sql.replace(/(\bindex)\s+concurrently\b/i, '$1');
+             // 列リストは `col [ASC|DESC] [NULLS FIRST|LAST]` と関数式 `LOWER(nm)` を受ける
+             const m = sql.match(/create\s+(unique\s+)?index\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+on\s+([a-zA-Z0-9_]+)\s*\(\s*([\s\S]+?)\s*\)\s*$/i);
              if (m) {
                 const idxName = m[3].toLowerCase();
                 const table = m[4].toLowerCase();
-                const cols = m[5].split(',').map(c => c.trim().toLowerCase());
                 const t = this.tables[table];
                 if (!t) throw this._tableNotFound(table);
-                cols.forEach(c => { if (!t.cols[c]) throw new Error(`Column '${c}' not found in table '${table}'.`); });
-                if (m[2] && cols.every(c => t.indices[c])) {
+                // 索引キーを解析する。並び順（ASC/DESC/NULLS）はハッシュ索引には影響しないため
+                // メタデータとして記録するだけ。式キーは対応する列が無いのでハッシュを張らない
+                const keys = this.splitSelectClause(m[5]).map(raw => {
+                    const item = raw.trim();
+                    if (item === '') throw new Error("Syntax Error in CREATE INDEX: empty index key.");
+                    const km = item.match(/^([a-zA-Z0-9_]+)(?:\s+(asc|desc))?(?:\s+nulls\s+(first|last))?$/i);
+                    if (km) {
+                        const col = km[1].toLowerCase();
+                        if (!t.cols[col]) throw new Error(`Column '${col}' not found in table '${table}'.`);
+                        return { col, dir: (km[2] || 'ASC').toUpperCase(), nulls: km[3] ? km[3].toUpperCase() : null };
+                    }
+                    // 式インデックス: 構文と列名を検証する（実データ1行で評価して誤りを弾く）。
+                    // 列単位ハッシュでは加速できないので式テキストの記録に留める
+                    const dm = item.match(/^([\s\S]+?)(?:\s+(asc|desc))?(?:\s+nulls\s+(first|last))?$/i);
+                    const exprText = dm[1].trim();
+                    const ef = this.compileCondition(exprText, strMap);
+                    if (t.rowCount > 0) ef({ [table]: 0 }, this.tables, { [table]: table });
+                    return { expr: this._restoreStrings(exprText, strMap), dir: (dm[2] || 'ASC').toUpperCase(), nulls: dm[3] ? dm[3].toUpperCase() : null };
+                });
+                const cols = keys.filter(k => k.col).map(k => k.col);
+                const exprKeys = keys.filter(k => k.expr);
+                if (m[2] && cols.length > 0 && exprKeys.length === 0 && cols.every(c => t.indices[c])) {
                     return { data: [{ Result: "Success", Message: `Index on ${table}(${cols.join(', ')}) already exists. Skipped.` }], affectedRows: 0 };
                 }
                 this._logTableMeta(table);
@@ -1558,9 +1979,23 @@
                 cols.forEach(c => t.createIndex(c));
                 const whereText = partialWhere ? this._restoreStrings(partialWhere, strMap) : null;
                 this.indexNames = this.indexNames || Object.create(null);
-                this.indexNames[idxName] = { table, cols, unique: !!m[1], where: whereText };
-                resultSet = [{ Result: "Success", Message: `Index '${idxName}' created on ${table}(${cols.join(', ')})${whereText ? ` (partial predicate '${whereText}' recorded; a full index is built)` : ''}.` }];
-             } else throw new Error("Syntax Error in CREATE INDEX. Use CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col[, col...]).");
+                const keyText = keys.map(k => `${k.col || k.expr}${k.dir === 'DESC' ? ' DESC' : ''}${k.nulls ? ' NULLS ' + k.nulls : ''}`).join(', ');
+                if (includeCols) {
+                    includeCols.forEach(c => {
+                        if (!t.cols[c]) throw new Error(`Column '${c}' not found in table '${table}' (INCLUDE list).`);
+                    });
+                    this._warn('INDEX_INCLUDE', `INCLUDE columns on '${idxName}' are recorded only: LuminaDB always reads matched rows from the table, so a covering index has no effect.`);
+                }
+                if (concurrently) {
+                    this._warn('INDEX_CONCURRENTLY', `CONCURRENTLY on '${idxName}' is accepted and ignored: index creation is always immediate in LuminaDB.`);
+                }
+                this.indexNames[idxName] = { table, cols, keys, unique: !!m[1], where: whereText, include: includeCols };
+                const notes = [];
+                if (whereText) notes.push(`partial predicate '${whereText}' recorded; a full index is built`);
+                if (exprKeys.length > 0) notes.push('expression keys are recorded as metadata only (hash indexes are per column)');
+                if (includeCols) notes.push(`INCLUDE (${includeCols.join(', ')}) recorded`);
+                resultSet = [{ Result: "Success", Message: `Index '${idxName}' created on ${table}(${keyText})${notes.length ? ` (${notes.join('; ')})` : ''}.` }];
+             } else throw new Error("Syntax Error in CREATE INDEX. Use CREATE [UNIQUE] INDEX [IF NOT EXISTS] [CONCURRENTLY] name ON table (key[, key...]) [INCLUDE (col, ...)] [WHERE pred], where key is col [ASC|DESC] [NULLS FIRST|LAST] or an expression.");
           }
           else if (/^create\s+(?:or\s+replace\s+)?function\b/i.test(sql)) {
              // ユーザー定義スカラー関数。本体は単一の式（RETURN <expr>）に限定する。
@@ -1636,19 +2071,34 @@
              resultSet = [{ Result: "Success", Message: `Materialized view '${name}' dropped.` }];
           }
           else if (/^create\s+(?:or\s+replace\s+)?view/i.test(sql)) {
-             const m = sql.match(/^create\s+(or\s+replace\s+)?view\s+([a-zA-Z0-9_]+)\s+as\s+([\s\S]+)$/i);
+             // CREATE [OR REPLACE] VIEW name [(c1, c2, ...)] AS SELECT ...
+             // 列リストを付けると本体の出力列を位置で改名する（SQL標準）
+             const m = sql.match(/^create\s+(or\s+replace\s+)?view\s+([a-zA-Z0-9_]+)\s*(?:\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\)\s*)?as\s+([\s\S]+)$/i);
              if (m) {
                 const orReplace = !!m[1];
                 const name = m[2].toLowerCase();
+                const colList = m[3] ? m[3].split(',').map(c => c.trim().toLowerCase()) : null;
                 if (this.tables[name]) throw new Error(`Table '${name}' already exists.`);
                 if (this.views[name] && !orReplace) throw new Error(`View '${name}' already exists.`);
-                let body = m[3].trim().replace(/;$/, '');
+                let body = m[4].trim().replace(/;$/, '');
+                // WITH [LOCAL|CASCADED] CHECK OPTION: このビュー経由の書き込みが
+                // ビューの WHERE を満たすことを強制する（更新可能ビューのガード）
+                let checkOption = null;
+                const coM = body.match(/\s+with\s+(local\s+|cascaded\s+)?check\s+option\s*$/i);
+                if (coM) {
+                    checkOption = coM[1] ? coM[1].trim().toUpperCase() : 'CASCADED';
+                    body = body.slice(0, coM.index).trim();
+                }
                 if (!/^select\b/i.test(body)) throw new Error("VIEW definition must be a SELECT statement.");
                 if (new RegExp(`\\b(from|join)\\s+${name}\\b`, 'i').test(body)) throw new Error("View cannot reference itself.");
+                if (colList) body = this._applyViewColumnList(body, colList, strMap);
                 const replaced = orReplace && this.views[name];
                 this._logViewState(name);
                 this.views[name] = this._restoreStrings(body, strMap);
-                resultSet = [{ Result: "Success", Message: `View '${name}' ${replaced ? 'replaced' : 'created'}.` }];
+                this.viewMeta = this.viewMeta || Object.create(null);
+                if (checkOption) this.viewMeta[name] = { checkOption };
+                else delete this.viewMeta[name];
+                resultSet = [{ Result: "Success", Message: `View '${name}' ${replaced ? 'replaced' : 'created'}${checkOption ? ' WITH CHECK OPTION' : ''}.` }];
              } else throw new Error("Syntax Error in CREATE VIEW.");
           }
           else if (/^create\s+(?:or\s+replace\s+)?procedure/i.test(sql)) {
@@ -1687,14 +2137,20 @@
              // 行トリガー: CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON table
              //            FOR EACH ROW <文>[; <文> ...]（BEGIN ... END で括っても良い）
              // 本文では NEW.col / OLD.col が発火行の値リテラルへ置換される
-             const m = sql.match(/^create\s+(or\s+replace\s+)?trigger\s+([a-zA-Z0-9_]+)\s+(before|after)\s+(insert|update|delete)\s+on\s+([a-zA-Z0-9_]+)\s+for\s+each\s+row\s+([\s\S]+)$/i);
-             if (!m) throw new Error("Syntax Error in CREATE TRIGGER. Use CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON table FOR EACH ROW <statement>[; ...].");
+             // INSTEAD OF はビュー専用（更新不可なビューを書き込み可能にする常用手段）
+             const m = sql.match(/^create\s+(or\s+replace\s+)?trigger\s+([a-zA-Z0-9_]+)\s+(before|after|instead\s+of)\s+(insert|update|delete)\s+on\s+([a-zA-Z0-9_]+)\s+for\s+each\s+row\s+([\s\S]+)$/i);
+             if (!m) throw new Error("Syntax Error in CREATE TRIGGER. Use CREATE TRIGGER name {BEFORE|AFTER|INSTEAD OF} {INSERT|UPDATE|DELETE} ON {table|view} FOR EACH ROW <statement>[; ...].");
              const orReplace = !!m[1];
              const name = m[2].toLowerCase();
-             const timing = m[3].toLowerCase();
+             const timing = m[3].toLowerCase().replace(/\s+/g, ' ');
              const event = m[4].toLowerCase();
              const table = m[5].toLowerCase();
-             if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
+             if (timing === 'instead of') {
+                 if (!this.views[table]) throw new Error(`INSTEAD OF triggers can only be created on views ('${table}' is not a view).`);
+             } else if (!this.tables[table]) {
+                 if (this.views[table]) throw new Error(`'${table}' is a view; use CREATE TRIGGER ... INSTEAD OF ... ON ${table}.`);
+                 throw new Error(`Table '${table}' not found.`);
+             }
              if (this.triggers[name] && !orReplace) throw new Error(`Trigger '${name}' already exists.`);
              let body = m[6].trim();
              const beMatch = body.match(/^begin\s+([\s\S]+?)\s*end$/i);
@@ -1719,21 +2175,139 @@
                 resultSet = [{Result:"Success", Message:`Trigger '${name}' dropped.`}];
              } else throw new Error("Syntax Error in DROP TRIGGER.");
           }
+          else if (/^create\s+domain\b/i.test(sql)) {
+             // CREATE DOMAIN name [AS] <型> [DEFAULT v] [NOT NULL] [CHECK (VALUE ...)]
+             // 列の型として使うと基底型へ展開し、CHECK は VALUE を列名に置き換えて
+             // 列レベル CHECK として付ける（PostgreSQL のドメインと同じ運用感）
+             const m = sql.match(/^create\s+domain\s+([a-zA-Z0-9_]+)\s+(?:as\s+)?([\s\S]+)$/i);
+             if (!m) throw new Error("Syntax Error in CREATE DOMAIN. Use CREATE DOMAIN name AS <type> [DEFAULT v] [NOT NULL] [CHECK (VALUE ...)].");
+             const name = m[1].toLowerCase();
+             if (this.domains[name]) throw new Error(`Domain or type '${name}' already exists.`);
+             let rest = m[2].trim();
+             let check = null;
+             const ck = this._extractCheck(rest);
+             if (ck) { check = this._restoreStrings(ck.expr, strMap); rest = ck.rest; }
+             let notNull = false;
+             if (/\bnot\s+null\b/i.test(rest)) { notNull = true; rest = rest.replace(/\bnot\s+null\b/i, ' '); }
+             let defaultText = null;
+             const dt = this._takeDefaultToken(rest);
+             if (dt) { defaultText = this._restoreStrings(dt.raw, strMap); rest = rest.slice(0, dt.start) + ' ' + rest.slice(dt.end); }
+             const base = rest.trim().split(/\s+/)[0];
+             if (!base) throw new Error("CREATE DOMAIN requires a base type.");
+             if (check && !/\bVALUE\b/i.test(check)) throw new Error("A domain CHECK must reference VALUE.");
+             this._logDomainState(name);
+             this.domains[name] = { name, kind: 'domain', base: base.toUpperCase(), check, notNull, defaultText, values: null };
+             resultSet = [{ Result: "Success", Message: `Domain '${name}' created (${base.toUpperCase()}).` }];
+          }
+          else if (/^create\s+type\b/i.test(sql)) {
+             // CREATE TYPE name AS ENUM ('a', 'b', ...): 値集合を CHECK として強制する
+             const m = sql.match(/^create\s+type\s+([a-zA-Z0-9_]+)\s+as\s+enum\s*\(([\s\S]*)\)$/i);
+             if (!m) throw new Error("Syntax Error in CREATE TYPE. Use CREATE TYPE name AS ENUM ('a', 'b', ...).");
+             const name = m[1].toLowerCase();
+             if (this.domains[name]) throw new Error(`Domain or type '${name}' already exists.`);
+             const rawValues = this.splitSelectClause(m[2]).map(v => v.trim()).filter(v => v !== '');
+             if (rawValues.length === 0) throw new Error("CREATE TYPE ... AS ENUM requires at least one value.");
+             const values = rawValues.map(t => {
+                 const sm2 = t.match(/^__STR_(\d+)__$/);
+                 if (!sm2) throw new Error("ENUM values must be string literals.");
+                 return this._unquoteLiteral(strMap[Number(sm2[1])]);
+             });
+             this._logDomainState(name);
+             this.domains[name] = { name, kind: 'enum', base: 'TEXT', check: null, notNull: false, defaultText: null, values };
+             resultSet = [{ Result: "Success", Message: `Type '${name}' created (ENUM with ${values.length} values).` }];
+          }
+          else if (/^drop\s+(domain|type)\b/i.test(sql)) {
+             const m = sql.match(/^drop\s+(domain|type)\s+(if\s+exists\s+)?([a-zA-Z0-9_]+)$/i);
+             if (!m) throw new Error("Syntax Error in DROP DOMAIN/TYPE.");
+             const name = m[3].toLowerCase();
+             if (!this.domains[name]) {
+                 if (m[2]) return { data: [{ Result: "Success", Message: `${m[1].toUpperCase()} '${name}' does not exist. Skipped.` }], affectedRows: 0 };
+                 throw new Error(`${m[1].toUpperCase()} '${name}' not found.`);
+             }
+             this._logDomainState(name);
+             delete this.domains[name];
+             resultSet = [{ Result: "Success", Message: `${m[1].toUpperCase()} '${name}' dropped.` }];
+          }
+          else if (/^create\s+(user|role)\b/i.test(sql)) {
+             // LuminaDB に認証機構は無い。移行スクリプトをそのまま流せるよう名簿だけ持つ
+             const m = sql.match(/^create\s+(user|role)\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)([\s\S]*)$/i);
+             if (!m) throw new Error("Syntax Error in CREATE USER/ROLE.");
+             const kind = m[1].toLowerCase(), name = m[3].toLowerCase();
+             if (this.roles[name]) {
+                 if (m[2]) return { data: [{ Result: "Success", Message: `${kind} '${name}' already exists. Skipped.` }], affectedRows: 0 };
+                 throw new Error(`${kind === 'user' ? 'User' : 'Role'} '${name}' already exists.`);
+             }
+             this.roles[name] = { name, kind };
+             resultSet = [{ Result: "Success", Message: `${kind === 'user' ? 'User' : 'Role'} '${name}' created (accepted for script compatibility; LuminaDB does not enforce privileges).` }];
+          }
+          else if (/^drop\s+(user|role)\b/i.test(sql)) {
+             const m = sql.match(/^drop\s+(user|role)\s+(if\s+exists\s+)?([a-zA-Z0-9_]+)$/i);
+             if (!m) throw new Error("Syntax Error in DROP USER/ROLE.");
+             const kind = m[1].toLowerCase();
+             const label = kind === 'user' ? 'User' : 'Role';
+             const name = m[3].toLowerCase();
+             if (!this.roles[name]) {
+                 if (m[2]) return { data: [{ Result: "Success", Message: `${label} '${name}' does not exist. Skipped.` }], affectedRows: 0 };
+                 throw new Error(`${label} '${name}' not found.`);
+             }
+             delete this.roles[name];
+             resultSet = [{ Result: "Success", Message: `${label} '${name}' dropped.` }];
+          }
           else if (/^create\s+sequence/i.test(sql)) {
              // CREATE SEQUENCE [IF NOT EXISTS] name [START WITH n] [INCREMENT BY n]
-             const m = sql.match(/^create\s+sequence\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)(?:\s+start\s+with\s+(-?\d+))?(?:\s+increment\s+by\s+(-?\d+))?$/i);
-             if (!m) throw new Error("Syntax Error in CREATE SEQUENCE. Use CREATE SEQUENCE [IF NOT EXISTS] name [START WITH n] [INCREMENT BY n].");
+             //   [MINVALUE n | NO MINVALUE] [MAXVALUE n | NO MAXVALUE] [CYCLE | NO CYCLE] [CACHE n]
+             const m = sql.match(/^create\s+sequence\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)([\s\S]*)$/i);
+             if (!m) throw new Error("Syntax Error in CREATE SEQUENCE. Use CREATE SEQUENCE [IF NOT EXISTS] name [START WITH n] [INCREMENT BY n] [MINVALUE n] [MAXVALUE n] [CYCLE] [CACHE n].");
              const name = m[2].toLowerCase();
+             const opts = this._parseSeqOptions(m[3]);
+             if (opts.__leftover) throw new Error(`Syntax Error in CREATE SEQUENCE near '${opts.__leftover}'. Supported: START WITH / INCREMENT BY / MINVALUE / MAXVALUE / CYCLE / NO CYCLE / CACHE.`);
              if (this.sequences[name]) {
                  if (m[1]) return { data: [{ Result: "Success", Message: `Sequence '${name}' already exists. Skipped.` }], affectedRows: 0 };
                  throw new Error(`Sequence '${name}' already exists.`);
              }
-             const start = m[3] !== undefined ? parseInt(m[3], 10) : 1;
-             const increment = m[4] !== undefined ? parseInt(m[4], 10) : 1;
+             const increment = opts.increment !== undefined ? opts.increment : 1;
              if (increment === 0) throw new Error("INCREMENT BY must not be 0.");
+             // START 未指定時は昇順なら MINVALUE（既定 1）、降順なら MAXVALUE から始める
+             const minValue = opts.minValue !== undefined ? opts.minValue : null;
+             const maxValue = opts.maxValue !== undefined ? opts.maxValue : null;
+             let start = opts.start;
+             if (start === undefined) start = increment > 0 ? (minValue !== null ? minValue : 1) : (maxValue !== null ? maxValue : -1);
+             if (minValue !== null && maxValue !== null && minValue > maxValue) throw new Error("MINVALUE must not exceed MAXVALUE.");
+             if ((minValue !== null && start < minValue) || (maxValue !== null && start > maxValue)) {
+                 throw new Error(`START WITH ${start} is outside the sequence range.`);
+             }
              this._logSeqState(name);
-             this.sequences[name] = { start, increment, value: null };
-             resultSet = [{ Result: "Success", Message: `Sequence '${name}' created (START WITH ${start}, INCREMENT BY ${increment}).` }];
+             this.sequences[name] = { start, increment, value: null, minValue, maxValue, cycle: !!opts.cycle, cache: opts.cache || 1 };
+             const extra = [minValue !== null ? `MINVALUE ${minValue}` : '', maxValue !== null ? `MAXVALUE ${maxValue}` : '', opts.cycle ? 'CYCLE' : ''].filter(Boolean);
+             resultSet = [{ Result: "Success", Message: `Sequence '${name}' created (START WITH ${start}, INCREMENT BY ${increment}${extra.length ? ', ' + extra.join(', ') : ''}).` }];
+          }
+          else if (/^alter\s+sequence/i.test(sql)) {
+             // ALTER SEQUENCE name [RESTART [WITH n]] [その他のオプション]
+             const m = sql.match(/^alter\s+sequence\s+(if\s+exists\s+)?([a-zA-Z0-9_]+)([\s\S]*)$/i);
+             if (!m) throw new Error("Syntax Error in ALTER SEQUENCE. Use ALTER SEQUENCE name [RESTART [WITH n]] [INCREMENT BY n] [MINVALUE n] [MAXVALUE n] [CYCLE].");
+             const name = m[2].toLowerCase();
+             const s = this.sequences[name];
+             if (!s) {
+                 if (m[1]) return { data: [{ Result: "Success", Message: `Sequence '${name}' does not exist. Skipped.` }], affectedRows: 0 };
+                 throw new Error(`Sequence '${name}' not found.`);
+             }
+             let tail = m[3] || '';
+             // RESTART [WITH n]: 次の NEXTVAL が n（省略時は START）を返すよう value を未採番へ戻す
+             let restartTo;
+             const rm = tail.match(/\srestart(?:\s+with\s+(-?\d+))?\b/i);
+             if (rm) { restartTo = rm[1] !== undefined ? parseInt(rm[1], 10) : null; tail = tail.slice(0, rm.index) + ' ' + tail.slice(rm.index + rm[0].length); }
+             const opts = this._parseSeqOptions(tail);
+             if (opts.__leftover) throw new Error(`Syntax Error in ALTER SEQUENCE near '${opts.__leftover}'.`);
+             if (opts.increment === 0) throw new Error("INCREMENT BY must not be 0.");
+             this._logSeqState(name);
+             if (opts.start !== undefined) s.start = opts.start;
+             if (opts.increment !== undefined) s.increment = opts.increment;
+             if (opts.minValue !== undefined) s.minValue = opts.minValue;
+             if (opts.maxValue !== undefined) s.maxValue = opts.maxValue;
+             if (opts.cycle !== undefined) s.cycle = opts.cycle;
+             if (opts.cache !== undefined) s.cache = opts.cache;
+             if (rm) { if (restartTo !== null) s.start = restartTo; s.value = null; }
+             resultSet = [{ Result: "Success", Message: `Sequence '${name}' altered${rm ? ` (restarts at ${s.start})` : ''}.` }];
           }
           else if (/^drop\s+sequence/i.test(sql)) {
              const m = sql.match(/^drop\s+sequence\s+(if\s+exists\s+)?([a-zA-Z0-9_]+)$/i);
@@ -1747,10 +2321,10 @@
              delete this.sequences[name];
              resultSet = [{ Result: "Success", Message: `Sequence '${name}' dropped.` }];
           }
-          else if (/^create\s+(?:temporary\s+)?table/i.test(sql)) {
+          else if (/^create\s+(?:(?:global|local)\s+)?(?:temp(?:orary)?\s+)?table/i.test(sql)) {
              // CREATE [TEMPORARY] TABLE。TEMPORARY はセッション限り（IDB保存・SQLエクスポート対象外）
              // CREATE TABLE new LIKE src: スキーマ（型/制約/インデックス）のみ複製（データは含まない）
-             const likeM = sql.match(/^create\s+(temporary\s+)?table\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+like\s+([a-zA-Z0-9_]+)$/i);
+             const likeM = sql.match(/^create\s+(?:(?:global|local)\s+)?(temp(?:orary)?\s+)?table\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+like\s+([a-zA-Z0-9_]+)$/i);
              if (likeM) {
                 const isTempFlag = !!likeM[1];
                 const ifNotExists = !!likeM[2];
@@ -1784,7 +2358,7 @@
              }
 
              // CREATE TABLE ... [AS] SELECT (CTAS): SELECT 結果からテーブルを作成（AS は省略可）
-             const ctasM = sql.match(/^create\s+(temporary\s+)?table\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+(?:as\s+)?(select\s[\s\S]+)$/i);
+             const ctasM = sql.match(/^create\s+(?:(?:global|local)\s+)?(temp(?:orary)?\s+)?table\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+(?:as\s+)?(select\s[\s\S]+?)(\s+with\s+(?:no\s+)?data)?$/i);
              if (ctasM) {
                 const isTempFlag = !!ctasM[1];
                 const ifNotExists = !!ctasM[2];
@@ -1797,9 +2371,13 @@
                 }
                 const subRes = this.executeQuery(ctasM[4], true, strMap);
                 if (subRes.error) throw new Error(subRes.error);
+                // WITH NO DATA: 列構成だけ作って行はコピーしない（SQL標準）
+                const withNoData = !!(ctasM[5] && /no\s+data/i.test(ctasM[5]));
                 this._logCreateTable(tableName);
                 const t = new Table();
-                if (subRes.data && subRes.data.length > 0) {
+                if (withNoData && subRes.data && subRes.data.length > 0) {
+                    Object.keys(subRes.data[0]).forEach(k => t.addColumn(k));
+                } else if (subRes.data && subRes.data.length > 0) {
                     const keys = Object.keys(subRes.data[0]);
                     keys.forEach(k => t.addColumn(k));
                     while (t.capacity < subRes.data.length) t.grow();
@@ -1811,8 +2389,20 @@
                 return { data: [{ Result: "Success", Message: `Table '${tableName}' created (${t.rowCount} rows).` }], affectedRows: t.rowCount };
              }
 
-             const m = sql.match(/create\s+(temporary\s+)?table\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s*\(([\s\S]+)\)/i);
+             const m = sql.match(/create\s+(?:(?:global|local)\s+)?(temp(?:orary)?\s+)?table\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s*\(([\s\S]+)\)([\s\S]*)$/i);
              if (m) {
+                // 列定義の閉じ括弧より後ろ（ENGINE=... / WITH SYSTEM VERSIONING / PARTITION BY ...）は
+                // 実装が無いので黙って捨てていた。受理はするが「効いていない」ことを警告に残す
+                const tailOpts = (m[5] || '').trim().replace(/;$/, '').trim();
+                if (tailOpts !== '') {
+                    if (/^with\s+system\s+versioning$/i.test(tailOpts)) {
+                        this._warn('NO_SYSTEM_VERSIONING', `WITH SYSTEM VERSIONING on '${m[3].toLowerCase()}' is accepted but no row history is kept; FOR SYSTEM_TIME queries are not supported.`);
+                    } else if (/^partition\s+by\b/i.test(tailOpts)) {
+                        this._warn('NO_PARTITIONING', `PARTITION BY on '${m[3].toLowerCase()}' is accepted and ignored; the table is stored as a single partition.`);
+                    } else {
+                        this._warn('TABLE_OPTIONS_IGNORED', `Table options after the column list are ignored: '${tailOpts.slice(0, 60)}'.`);
+                    }
+                }
                 const isTempFlag = !!m[1];
                 const ifNotExists = !!m[2];
                 const tableName = m[3].toLowerCase();
@@ -1843,13 +2433,24 @@
                         checks.push({ name: tlChk[1] ? tlChk[1].toLowerCase() : null, expr: this._restoreStrings(ex.expr, strMap) });
                         return;
                     }
-                    // 複数列の FOREIGN KEY は未対応。以前は正規表現に外れて「foreign という
-                    // 列」を作ってしまっていたので、ここで明示的に拒否する
-                    const fkMulti = d.match(/^(?:constraint\s+[a-zA-Z0-9_]+\s+)?foreign\s+key\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)+)\s*\)/i);
+                    // 複数列の FOREIGN KEY（複合主キーを参照する定番形）。
+                    // 単一列 FK は { col, refCol }、複合は { cols, refCols } で保持する
+                    const fkMulti = d.match(/^(?:constraint\s+([a-zA-Z0-9_]+)\s+)?foreign\s+key\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)+)\s*\)\s*references\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)([\s\S]*)$/i);
                     if (fkMulti) {
-                        throw new Error(`Multi-column FOREIGN KEY (${fkMulti[1]}) is not supported. Define one single-column foreign key per referencing column.`);
+                        const mcols = fkMulti[2].split(',').map(x => x.trim().toLowerCase());
+                        const mrefs = fkMulti[4].split(',').map(x => x.trim().toLowerCase());
+                        if (mcols.length !== mrefs.length) {
+                            throw new Error(`FOREIGN KEY (${mcols.join(', ')}) has ${mcols.length} columns but references ${mrefs.length}.`);
+                        }
+                        const macts = this._parseFkActions(fkMulti[5]);
+                        foreignKeys.push({
+                            cols: mcols, refTable: fkMulti[3].toLowerCase(), refCols: mrefs,
+                            onDelete: macts.onDelete, onUpdate: macts.onUpdate,
+                            name: fkMulti[1] ? fkMulti[1].toLowerCase() : null
+                        });
+                        return;
                     }
-                    const fkMatch = d.match(/^(?:constraint\s+[a-zA-Z0-9_]+\s+)?foreign\s+key\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*references\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+)\s*\)([\s\S]*)$/i);
+                    const fkMatch = d.match(/^(?:constraint\s+([a-zA-Z0-9_]+)\s+)?foreign\s+key\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*references\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+)\s*\)([\s\S]*)$/i);
                     // FOREIGN KEY だが上のどちらの形にも当てはまらない → 列定義として扱わず明示エラー
                     if (!fkMatch && /^(?:constraint\s+[a-zA-Z0-9_]+\s+)?foreign\s+key\b/i.test(d)) {
                         throw new Error(`Syntax Error in FOREIGN KEY definition near '${d.slice(0, 60)}'. Use FOREIGN KEY (col) REFERENCES table (col) [ON DELETE/UPDATE ...].`);
@@ -1858,13 +2459,14 @@
                     const pkMatch = d.match(/^primary\s+key\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)$/i);
                     const uqMatch = d.match(/^(?:constraint\s+[a-zA-Z0-9_]+\s+)?unique\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)$/i);
                     if (fkMatch) {
-                        const acts = this._parseFkActions(fkMatch[4]);
+                        const acts = this._parseFkActions(fkMatch[5]);
                         foreignKeys.push({
-                            col: fkMatch[1].toLowerCase(),
-                            refTable: fkMatch[2].toLowerCase(),
-                            refCol: fkMatch[3].toLowerCase(),
+                            col: fkMatch[2].toLowerCase(),
+                            refTable: fkMatch[3].toLowerCase(),
+                            refCol: fkMatch[4].toLowerCase(),
                             onDelete: acts.onDelete,
-                            onUpdate: acts.onUpdate
+                            onUpdate: acts.onUpdate,
+                            name: fkMatch[1] ? fkMatch[1].toLowerCase() : null
                         });
                     } else if (pkMatch) {
                         const pcols = pkMatch[1].split(',').map(x => x.trim().toLowerCase());
@@ -1913,6 +2515,28 @@
                         // 列レベル CHECK を先に切り出す（式内の括弧・キーワードが後続解析を汚さないように）
                         const cchk = this._extractCheck(def);
                         if (cchk) { checks.push({ name: null, expr: this._restoreStrings(cchk.expr, strMap) }); def = cchk.rest; }
+                        // 列レベルの REFERENCES（`pid INTEGER REFERENCES parent(id) ON DELETE CASCADE`）。
+                        // 商用DBで最も普通の外部キー宣言なので、表レベルの FOREIGN KEY と同じ扱いにする。
+                        // 参照列を省略した形（PostgreSQL）は参照先の主キーへ解決する。
+                        // 他の修飾子より先に消費すること（ON DELETE SET DEFAULT の 'DEFAULT' や
+                        // ON UPDATE CASCADE の 'ON UPDATE' を後続の解析に拾わせないため）
+                        let colRef = null;
+                        const refM = def.match(/\breferences\s+([a-zA-Z0-9_]+)\s*(?:\(\s*([a-zA-Z0-9_]+)\s*\))?((?:\s+on\s+(?:delete|update)\s+(?:cascade|set\s+null|no\s+action|restrict))*)((?:\s+(?:not\s+deferrable|deferrable|initially\s+(?:deferred|immediate)|match\s+(?:full|partial|simple)))*)/i);
+                        if (refM) {
+                            colRef = { refTable: refM[1].toLowerCase(), refCol: refM[2] ? refM[2].toLowerCase() : null, actions: refM[3] || '' };
+                            def = def.replace(refM[0], ' ');
+                        }
+                        // 列レベルの COLLATE。以前は型の後ろの余分な語として捨てられ、
+                        // DDL は通るのに比較・並べ替え・一意性のどれにも効いていなかった
+                        let colCollation = null;
+                        const collM = def.match(/\bcollate\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+                        if (collM) {
+                            colCollation = collM[1].toUpperCase();
+                            if (!this._COLLATIONS.has(colCollation)) {
+                                throw new Error(`Unknown collation '${collM[1]}'. Use NOCASE / BINARY / NOACCENT / NUMERIC.`);
+                            }
+                            def = def.slice(0, collM.index) + ' ' + def.slice(collM.index + collM[0].length);
+                        }
                         let isPK = false, isUnique = false, notNull = false, autoInc = false;
                         let defaultVal; // undefined = DEFAULT 指定なし
                         // ON UPDATE CURRENT_TIMESTAMP (MySQL): UPDATE のたびに現在時刻へ更新する列。
@@ -1926,13 +2550,32 @@
                         if (/\bunique\b/i.test(def)) { isUnique = true; def = def.replace(/\bunique\b/i, ' '); }
                         if (/\bauto_increment\b/i.test(def)) { autoInc = true; def = def.replace(/\bauto_increment\b/i, ' '); }
                         if (/\bnot\s+null\b/i.test(def)) { notNull = true; def = def.replace(/\bnot\s+null\b/i, ' '); }
-                        const dm = def.match(/\bdefault\s+(\S+)/i);
+                        // DEFAULT の値はリテラルのほか関数呼び出し・括弧式も取り得るので、
+                        // 空白で切らず括弧の対応を見て 1 トークン分を切り出す
+                        const dm = this._takeDefaultToken(def);
                         if (dm) {
-                            defaultVal = this._parseDefaultLiteral(dm[1], strMap);
-                            def = def.replace(dm[0], ' ');
+                            defaultVal = this._parseDefaultLiteral(dm.raw, strMap);
+                            def = def.slice(0, dm.start) + ' ' + def.slice(dm.end);
                         }
                         let parts = def.trim().split(/\s+/);
-                        colDefs.push({ name: parts[0].toLowerCase(), type: parts.length > 1 && parts[1] ? parts[1].toUpperCase() : 'ANY', isPK, isUnique, notNull, autoInc, defaultVal, hasDefault: dm !== null, generatedExpr, onUpdateNow });
+                        const colName0 = parts[0].toLowerCase();
+                        let declType = parts.length > 1 && parts[1] ? parts[1].toUpperCase() : 'ANY';
+                        // ユーザー定義ドメイン / 列挙型は基底型へ展開し、付随する制約を列へ移す
+                        const dom = this.domains ? this.domains[declType.toLowerCase()] : null;
+                        if (dom) {
+                            declType = dom.base;
+                            if (dom.notNull) notNull = true;
+                            if (dom.check) checks.push({ name: null, expr: dom.check.replace(/\bVALUE\b/gi, colName0) });
+                            if (dom.values) {
+                                const list = dom.values.map(v => `'${String(v).replace(/'/g, "''")}'`).join(', ');
+                                checks.push({ name: null, expr: `${colName0} IN (${list})` });
+                            }
+                            if (dom.defaultText !== null && dm === null) {
+                                const sm3 = [];
+                                defaultVal = this._parseDefaultLiteral(this._maskStrings(dom.defaultText, sm3), sm3);
+                            }
+                        }
+                        colDefs.push({ name: colName0, type: declType, isPK, isUnique, notNull, autoInc, defaultVal, hasDefault: dm !== null || (dom && dom.defaultText !== null), generatedExpr, onUpdateNow, colRef, collation: colCollation });
                     }
                 });
 
@@ -1945,6 +2588,40 @@
                 const uniqueCols = [...new Set([...colDefs.filter(c => c.isUnique).map(c => c.name), ...tableLevelUniques])].filter(c => c !== primaryKey);
                 [...tableLevelPks, ...tableLevelUniques, ...compositeDefs.flatMap(ck => ck.cols)].forEach(c => {
                     if (!colDefs.some(cd => cd.name === c)) throw new Error(`Column '${c}' not found for PRIMARY KEY/UNIQUE constraint.`);
+                });
+
+                // 列レベル REFERENCES を表レベル FOREIGN KEY と同じ配列へ合流させる。
+                // 参照先の存在は宣言時に検証する（黙って制約を落とすと後で気づけない）
+                // 自己参照（`REFERENCES <この表>`）は作成中でまだ this.tables に無いため、
+                // 参照先の列は colDefs 側で確かめる
+                const selfPk = pkCandidates.length === 1 ? pkCandidates[0] : null;
+                const hasRefCol = (refTable, col) => refTable === tableName
+                    ? colDefs.some(cd => cd.name === col)
+                    : !!(this.tables[refTable] && this.tables[refTable].cols[col]);
+                const refTableExists = (refTable) => refTable === tableName || !!this.tables[refTable];
+                const refPkOf = (refTable) => refTable === tableName ? selfPk : (this.tables[refTable] || {}).primaryKey;
+
+                colDefs.filter(c => c.colRef).forEach(cd => {
+                    const r = cd.colRef;
+                    if (!refTableExists(r.refTable)) throw new Error(`Table '${r.refTable}' not found for REFERENCES on column '${cd.name}'.`);
+                    let refCol = r.refCol;
+                    if (!refCol) {
+                        // 参照列の省略時は参照先の主キー（単一列のみ）
+                        refCol = refPkOf(r.refTable);
+                        if (!refCol) throw new Error(`REFERENCES ${r.refTable} omits the column list but '${r.refTable}' has no single-column PRIMARY KEY.`);
+                    }
+                    if (!hasRefCol(r.refTable, refCol)) throw new Error(`Column '${refCol}' not found in table '${r.refTable}'.`);
+                    if (foreignKeys.some(fk => (fk.cols || [fk.col]).length === 1 && (fk.cols ? fk.cols[0] : fk.col) === cd.name)) throw new Error(`Multiple FOREIGN KEY definitions on column '${cd.name}'.`);
+                    const acts = this._parseFkActions(r.actions);
+                    foreignKeys.push({ col: cd.name, refTable: r.refTable, refCol, onDelete: acts.onDelete, onUpdate: acts.onUpdate });
+                });
+                // 表レベル FOREIGN KEY の参照先も同じ規則で検証する（複合列も同じ経路）
+                foreignKeys.forEach(fk => {
+                    const fkCols = fk.cols || [fk.col];
+                    const refCols = fk.refCols || [fk.refCol];
+                    if (!refTableExists(fk.refTable)) throw new Error(`Table '${fk.refTable}' not found for FOREIGN KEY on column '${fkCols.join(', ')}'.`);
+                    refCols.forEach(rc => { if (!hasRefCol(fk.refTable, rc)) throw new Error(`Column '${rc}' not found in table '${fk.refTable}'.`); });
+                    fkCols.forEach(c => { if (!colDefs.some(cd => cd.name === c)) throw new Error(`Column '${c}' not found for FOREIGN KEY constraint.`); });
                 });
 
                 const aiCols = colDefs.filter(c => c.autoInc);
@@ -1963,6 +2640,8 @@
                 t.compositeKeys = compositeDefs;
                 // ON UPDATE CURRENT_TIMESTAMP 指定列（UPDATE のたびに現在時刻を書き込む）
                 t.onUpdateNowCols = colDefs.filter(c => c.onUpdateNow).map(c => c.name);
+                // 列の照合順序（BINARY は既定なので保持しない）
+                colDefs.forEach(cd => { if (cd.collation && cd.collation !== 'BINARY' && cd.collation !== 'CS') t.collations[cd.name] = cd.collation; });
                 // 生成列 (GENERATED ALWAYS AS): 式を保存し、INSERT/UPDATE 時に評価する
                 colDefs.forEach(cd => {
                     if (cd.generatedExpr != null) {
@@ -2009,6 +2688,24 @@
 
              // --- 制約の追加/削除 (ADD/DROP PRIMARY KEY / UNIQUE / FOREIGN KEY) ---
              // 注意: 汎用の ADD/DROP COLUMN 正規表現より先に判定する必要がある
+
+             // `ADD CONSTRAINT <name> PRIMARY KEY|UNIQUE|FOREIGN KEY ...`（マイグレーションで
+             // 最も一般的な書き方）を、名前を控えたうえで無名形へ正規化する。こうすることで
+             // 以下の各分岐は「CONSTRAINT 付き / 無し」を意識せずに済む。CHECK は元から
+             // 名前を受けているので触らない
+             let constraintName = null;
+             const cnM = sql.match(/^(alter\s+table\s+([a-zA-Z0-9_]+)\s+add\s+)constraint\s+([a-zA-Z0-9_]+)\s+((?:primary\s+key|unique|foreign\s+key)\b[\s\S]*)$/i);
+             if (cnM) {
+                 constraintName = cnM[3].toLowerCase();
+                 // 名前の重複はここで弾く。制約を張ってから名前を登録する順序だと、
+                 // 名前だけ衝突したときに制約本体が付いたまま残ってしまう
+                 const cnTable = this.tables[cnM[2].toLowerCase()];
+                 if (cnTable && cnTable.constraintNames && cnTable.constraintNames[constraintName]) {
+                     throw new Error(`Constraint '${constraintName}' already exists.`);
+                 }
+                 sql = cnM[1] + cnM[4];
+             }
+
              m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+add\s+primary\s+key\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)$/i);
              if (m) {
                  const table = m[1].toLowerCase();
@@ -2032,6 +2729,7 @@
                      t.primaryKey = col;
                      t.uniqueCols = (t.uniqueCols || []).filter(c => c !== col);
                      t.createIndex(col);
+                     this._recordConstraintName(t, constraintName, 'pk', [col]);
                      return { data: [{ Result: "Success", Message: `PRIMARY KEY added on ${table}(${col}).` }], affectedRows: 0 };
                  }
                  // 複合PK: 既存データの NULL / タプル重複を検証してから追加する
@@ -2046,6 +2744,7 @@
                  this._logTableMeta(table);
                  t.compositeKeys = (t.compositeKeys || []).concat([{ cols: pcols, isPK: true }]);
                  pcols.forEach(c => { if (!t.notNullCols.includes(c)) t.notNullCols.push(c); });
+                 this._recordConstraintName(t, constraintName, 'pk', pcols);
                  return { data: [{ Result: "Success", Message: `PRIMARY KEY added on ${table}(${pcols.join(', ')}).` }], affectedRows: 0 };
              }
 
@@ -2092,6 +2791,7 @@
                          t.uniqueCols = (t.uniqueCols || []).concat([col]);
                      }
                      t.createIndex(col);
+                     this._recordConstraintName(t, constraintName, 'unique', [col]);
                      return { data: [{ Result: "Success", Message: `UNIQUE constraint added on ${table}(${col}).` }], affectedRows: 0 };
                  }
                  // 複合UNIQUE: 完全な（NULLを含まない）タプルの重複を検証してから追加する
@@ -2105,6 +2805,7 @@
                  }
                  this._logTableMeta(table);
                  t.compositeKeys = (t.compositeKeys || []).concat([{ cols: ucols, isPK: false }]);
+                 this._recordConstraintName(t, constraintName, 'unique', ucols);
                  return { data: [{ Result: "Success", Message: `UNIQUE constraint added on ${table}(${ucols.join(', ')}).` }], affectedRows: 0 };
              }
 
@@ -2128,31 +2829,41 @@
                  return { data: [{ Result: "Success", Message: `UNIQUE constraint on ${table}(${ucols.join(', ')}) dropped.` }], affectedRows: 0 };
              }
 
-             m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+add\s+foreign\s+key\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*references\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+)\s*\)([\s\S]*)$/i);
+             // ADD FOREIGN KEY (col[, col...]) REFERENCES t (col[, col...]) — 単一列と複合列を同じ経路で扱う
+             m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+add\s+foreign\s+key\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)\s*references\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)([\s\S]*)$/i);
              if (m) {
                  const table = m[1].toLowerCase();
                  if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
                  const t = this.tables[table];
-                 const col = m[2].toLowerCase();
+                 const cols = m[2].split(',').map(x => x.trim().toLowerCase());
                  const refTable = m[3].toLowerCase();
-                 const refCol = m[4].toLowerCase();
+                 const refCols = m[4].split(',').map(x => x.trim().toLowerCase());
                  const acts = this._parseFkActions(m[5]);
-                 if (!t.cols[col]) throw new Error(`Column '${col}' not found.`);
+                 if (cols.length !== refCols.length) {
+                     throw new Error(`FOREIGN KEY (${cols.join(', ')}) has ${cols.length} columns but references ${refCols.length}.`);
+                 }
+                 cols.forEach(c => { if (!t.cols[c]) throw new Error(`Column '${c}' not found.`); });
                  if (!this.tables[refTable]) throw new Error(`Table '${refTable}' not found.`);
-                 if (!this.tables[refTable].cols[refCol]) throw new Error(`Column '${refCol}' not found in table '${refTable}'.`);
-                 if ((t.foreignKeys || []).some(fk => fk.col === col)) throw new Error(`FOREIGN KEY on '${col}' already exists.`);
-                 // 既存データ検証: 非NULL値が参照先に存在すること
                  const refTbl = this.tables[refTable];
+                 refCols.forEach(c => { if (!refTbl.cols[c]) throw new Error(`Column '${c}' not found in table '${refTable}'.`); });
+                 if ((t.foreignKeys || []).some(fk => this._fkCols(fk).join(',') === cols.join(','))) {
+                     throw new Error(`FOREIGN KEY on '${cols.join(', ')}' already exists.`);
+                 }
+                 // 既存データ検証: NULL を含まないタプルが参照先に存在すること
                  for (let i = 0; i < t.rowCount; i++) {
-                     const v = t.getValue(col, i);
-                     if (v === null || v === undefined) continue;
-                     if (refTbl.findValueRows(refCol, v).length === 0) {
-                         throw new Error(`Foreign key constraint failed: Value '${v}' not found in ${refTable}(${refCol})`);
+                     const tuple = this._fkTupleOrNull((c) => t.getValue(c, i), cols);
+                     if (tuple === null) continue;
+                     if (this._fkMatchRows(refTbl, refCols, tuple).length === 0) {
+                         throw new Error(`Foreign key constraint failed: Value '${tuple.join(', ')}' not found in ${refTable}(${refCols.join(', ')})`);
                      }
                  }
                  this._logTableMeta(table);
-                 t.foreignKeys = (t.foreignKeys || []).concat([{ col, refTable, refCol, onDelete: acts.onDelete, onUpdate: acts.onUpdate }]);
-                 return { data: [{ Result: "Success", Message: `FOREIGN KEY added: ${table}(${col}) -> ${refTable}(${refCol}).` }], affectedRows: 0 };
+                 const entry = cols.length === 1
+                     ? { col: cols[0], refTable, refCol: refCols[0], onDelete: acts.onDelete, onUpdate: acts.onUpdate, name: constraintName || null }
+                     : { cols, refTable, refCols, onDelete: acts.onDelete, onUpdate: acts.onUpdate, name: constraintName || null };
+                 t.foreignKeys = (t.foreignKeys || []).concat([entry]);
+                 this._recordConstraintName(t, constraintName, 'fk', cols);
+                 return { data: [{ Result: "Success", Message: `FOREIGN KEY added: ${table}(${cols.join(', ')}) -> ${refTable}(${refCols.join(', ')}).` }], affectedRows: 0 };
              }
 
              // ALTER TABLE ... ADD [CONSTRAINT name] CHECK (expr)
@@ -2177,32 +2888,64 @@
              }
 
              // ALTER TABLE ... DROP {CHECK|CONSTRAINT} name
-             m = sql.match(/^alter\s+table\s+([a-zA-Z0-9_]+)\s+drop\s+(?:check|constraint)\s+([a-zA-Z0-9_]+)$/i);
+             // DROP {CHECK|CONSTRAINT} <name>: CHECK に加えて、名前付きで追加された
+             // PRIMARY KEY / UNIQUE / FOREIGN KEY も名前で外せる（マイグレーションの逆操作）
+             m = sql.match(/^alter\s+table\s+([a-zA-Z0-9_]+)\s+drop\s+(check|constraint)\s+([a-zA-Z0-9_]+)$/i);
              if (m) {
                  const table = m[1].toLowerCase();
                  if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
                  const t = this.tables[table];
-                 const name = m[2].toLowerCase();
-                 if (!(t.checks || []).some(c => c.name === name)) throw new Error(`CHECK constraint '${name}' not found.`);
-                 this._logTableMeta(table);
-                 t.checks = t.checks.filter(c => c.name !== name);
-                 return { data: [{ Result: "Success", Message: `CHECK constraint '${name}' dropped.` }], affectedRows: 0 };
+                 const name = m[3].toLowerCase();
+                 if ((t.checks || []).some(c => c.name === name)) {
+                     this._logTableMeta(table);
+                     t.checks = t.checks.filter(c => c.name !== name);
+                     delete t.constraintNames[name];
+                     return { data: [{ Result: "Success", Message: `CHECK constraint '${name}' dropped.` }], affectedRows: 0 };
+                 }
+                 // DROP CHECK は CHECK 専用（MySQL と同じ）。DROP CONSTRAINT は種別を問わない
+                 const entry = /^constraint$/i.test(m[2]) ? (t.constraintNames || Object.create(null))[name] : undefined;
+                 if (entry) {
+                     this._logTableMeta(table);
+                     this._dropNamedConstraint(t, name, entry);
+                     const label = { pk: 'PRIMARY KEY', unique: 'UNIQUE', fk: 'FOREIGN KEY' }[entry.kind] || entry.kind.toUpperCase();
+                     return { data: [{ Result: "Success", Message: `${label} constraint '${name}' dropped.` }], affectedRows: 0 };
+                 }
+                 throw new Error(`Constraint '${name}' not found on '${table}'.`);
              }
 
-             m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+drop\s+foreign\s+key\s*\(\s*([a-zA-Z0-9_]+)\s*\)$/i);
+             // DROP FOREIGN KEY <name> (MySQL、括弧なし): 制約名または列名で解決する
+             m = sql.match(/^alter\s+table\s+([a-zA-Z0-9_]+)\s+drop\s+foreign\s+key\s+([a-zA-Z0-9_]+)$/i);
              if (m) {
                  const table = m[1].toLowerCase();
                  if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
                  const t = this.tables[table];
-                 const col = m[2].toLowerCase();
-                 if (!(t.foreignKeys || []).some(fk => fk.col === col)) throw new Error(`FOREIGN KEY on '${col}' not found.`);
+                 const key = m[2].toLowerCase();
+                 const fk = (t.foreignKeys || []).find(f => f.name === key) || (t.foreignKeys || []).find(f => f.col === key);
+                 if (!fk) throw new Error(`FOREIGN KEY '${key}' not found on '${table}'.`);
                  this._logTableMeta(table);
-                 t.foreignKeys = t.foreignKeys.filter(fk => fk.col !== col);
-                 return { data: [{ Result: "Success", Message: `FOREIGN KEY on ${table}(${col}) dropped.` }], affectedRows: 0 };
+                 t.foreignKeys = t.foreignKeys.filter(f => f !== fk);
+                 if (fk.name) delete t.constraintNames[fk.name];
+                 return { data: [{ Result: "Success", Message: `FOREIGN KEY on ${table}(${fk.col}) dropped.` }], affectedRows: 0 };
+             }
+
+             m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+drop\s+foreign\s+key\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)$/i);
+             if (m) {
+                 const table = m[1].toLowerCase();
+                 if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
+                 const t = this.tables[table];
+                 const cols = m[2].split(',').map(x => x.trim().toLowerCase());
+                 const key = cols.join(',');
+                 const hit = (t.foreignKeys || []).find(fk => this._fkCols(fk).join(',') === key);
+                 if (!hit) throw new Error(`FOREIGN KEY on '${cols.join(', ')}' not found.`);
+                 this._logTableMeta(table);
+                 t.foreignKeys = t.foreignKeys.filter(fk => fk !== hit);
+                 if (hit.name && t.constraintNames) delete t.constraintNames[hit.name];
+                 return { data: [{ Result: "Success", Message: `FOREIGN KEY on ${table}(${cols.join(', ')}) dropped.` }], affectedRows: 0 };
              }
 
              // --- 列属性の変更 (SET/DROP DEFAULT / SET/DROP NOT NULL) ---
-             m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+(?:alter|modify)\s+(?:column\s+)?([a-zA-Z0-9_]+)\s+set\s+default\s+(\S+)$/i);
+             // 値は空白を含む括弧式もあり得るので '(...)' ごと受けてから解釈する
+             m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+(?:alter|modify)\s+(?:column\s+)?([a-zA-Z0-9_]+)\s+set\s+default\s+([\s\S]+)$/i);
              if (m) {
                  const table = m[1].toLowerCase();
                  if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
@@ -2280,20 +3023,74 @@
                  return { data: [{ Result: "Success", Message: `Column '${oldCol}' changed to '${newCol}' ${newType}.` }], affectedRows: 0 };
              }
 
-             // MODIFY COLUMN / ALTER COLUMN: 既存カラムの型を変更（データは changeColumnType がキャスト）
-             m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+(?:modify|alter)\s+(?:column\s+)?([a-zA-Z0-9_]+)\s+(?:type\s+)?([a-zA-Z]+)$/i);
+             // RENAME CONSTRAINT old TO new（SQL標準）: 制約名だけを付け替える
+             m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+rename\s+constraint\s+([a-zA-Z0-9_]+)\s+to\s+([a-zA-Z0-9_]+)$/i);
              if (m) {
                  const table = m[1].toLowerCase();
                  if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
+                 const t = this.tables[table];
+                 const oldName = m[2].toLowerCase(), newName = m[3].toLowerCase();
+                 const names = t.constraintNames || Object.create(null);
+                 // CHECK は t.checks 側に名前を持つので、両方の台帳を見る
+                 const isCheck = (t.checks || []).some(c => c.name === oldName);
+                 if (!names[oldName] && !isCheck) throw new Error(`Constraint '${m[2]}' not found on table '${table}'.`);
+                 if (oldName !== newName && (names[newName] || (t.checks || []).some(c => c.name === newName))) {
+                     throw new Error(`Constraint '${m[3]}' already exists on table '${table}'.`);
+                 }
+                 this._logTableMeta(table);
+                 t.constraintNames = t.constraintNames || Object.create(null);
+                 if (oldName !== newName) {
+                     if (t.constraintNames[oldName]) {
+                         t.constraintNames[newName] = t.constraintNames[oldName];
+                         delete t.constraintNames[oldName];
+                     }
+                     // 名前を控えている実体（FK / CHECK）側も追従させる
+                     (t.foreignKeys || []).forEach(fk => { if (fk.name === oldName) fk.name = newName; });
+                     (t.checks || []).forEach(ck => { if (ck.name === oldName) ck.name = newName; });
+                 }
+                 return { data: [{ Result: "Success", Message: `Constraint '${oldName}' renamed to '${newName}'.` }], affectedRows: 0 };
+             }
+
+             // MODIFY COLUMN / ALTER COLUMN: 既存カラムの型を変更（データは changeColumnType がキャスト）。
+             // TYPE / SET DATA TYPE（SQL標準）の両綴りを受け、USING <expr> で変換式を与えられる
+             m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+(?:modify|alter)\s+(?:column\s+)?([a-zA-Z0-9_]+)\s+(?:set\s+data\s+type\s+|type\s+)?([a-zA-Z]+)(?:\s+using\s+([\s\S]+))?$/i);
+             if (m) {
+                 const table = m[1].toLowerCase();
+                 if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
+                 const t = this.tables[table];
                  const colName = m[2].toLowerCase();
-                 if (!this.tables[table].cols[colName]) throw new Error(`Column '${colName}' not found.`);
+                 if (!t.cols[colName]) throw new Error(`Column '${colName}' not found.`);
                  const newType = m[3].toUpperCase();
                  const validTypes = ['INTEGER', 'FLOAT', 'BOOLEAN', 'DATE', 'TEXT', 'ANY'];
                  if (!validTypes.includes(newType)) throw new Error(`Unknown type '${newType}'. Use ${validTypes.join('/')}.`);
 
+                 // USING <expr>: 旧行の値で式を評価してから新しい型で格納する（PostgreSQL 互換）
+                 let transform = null;
+                 if (m[4]) {
+                     const uf = this.compileCondition(m[4].trim(), strMap);
+                     transform = new Array(t.rowCount);
+                     for (let i = 0; i < t.rowCount; i++) {
+                         transform[i] = uf({ [table]: i }, this.tables, { [table]: table });
+                     }
+                 }
+
                  // 型変更は文字列プールを作り直すため列 COW では巻き戻せない → 全体スナップショット
                  this._logFullTable(table);
-                 this.tables[table].changeColumnType(colName, newType);
+                 const before = [];
+                 for (let i = 0; i < t.rowCount; i++) before.push(t.getValue(colName, i));
+                 t.changeColumnType(colName, newType, transform);
+                 // 値が変質した行（小数の切り捨て等）は成功メッセージからは分からないので警告に残す
+                 if (!transform) {
+                     let lost = 0;
+                     for (let i = 0; i < t.rowCount; i++) {
+                         const a = before[i], b = t.getValue(colName, i);
+                         if (a === null || a === undefined) continue;
+                         if (String(a) !== String(b)) lost++;
+                     }
+                     if (lost > 0) {
+                         this._warn('TYPE_CONVERSION', `Changing '${table}.${colName}' to ${newType} altered ${lost} value(s) (data was rounded or reformatted).`);
+                     }
+                 }
                  resultSet = [{ Result: "Success", Message: `Column '${colName}' type changed to ${newType}.` }];
                  return { data: resultSet, affectedRows: 0 };
              }
@@ -2301,7 +3098,7 @@
              // 制約キーワードを含む ADD/DROP が上記の専用構文に一致しなかった場合は構文エラー。
              // 汎用 ADD/DROP COLUMN に落ちて 'unique' 等の偽カラムが作られるのを防ぐ
              if (/^alter\s+table\s+[a-zA-Z0-9_]+\s+(?:add|drop)\s+(?:primary|unique|foreign|constraint|check)\b/i.test(sql)) {
-                 throw new Error("Syntax Error in ALTER TABLE constraint clause. Supported: ADD/DROP PRIMARY KEY (col) / UNIQUE (col) / FOREIGN KEY (col) REFERENCES t(col) [ON DELETE/UPDATE ...] / ADD [CONSTRAINT name] CHECK (expr) / DROP CHECK name. Multi-column constraints are not supported.");
+                 throw new Error("Syntax Error in ALTER TABLE constraint clause. Supported: ADD [CONSTRAINT name] {PRIMARY KEY (col...) | UNIQUE (col...) | FOREIGN KEY (col) REFERENCES t(col) [ON DELETE/UPDATE ...] | CHECK (expr)} / DROP {PRIMARY KEY | UNIQUE (col...) | FOREIGN KEY (col) | FOREIGN KEY name | CHECK name | CONSTRAINT name}.");
              }
 
              // ADD COLUMN [IF NOT EXISTS] name [type] [DEFAULT lit] [NOT NULL] [FIRST | AFTER col]（修飾子は順不同）
@@ -2319,13 +3116,23 @@
                  const pm = def.match(/\bafter\s+([a-zA-Z0-9_]+)\s*$/i);
                  if (pm) { position = { after: pm[1].toLowerCase() }; def = def.slice(0, pm.index); }
                  else if (/\bfirst\s*$/i.test(def)) { position = { first: true }; def = def.replace(/\bfirst\s*$/i, ' '); }
+                 // GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]: 生成列を後から足す
+                 let genExpr = null;
+                 {
+                     const gm = def.match(/\s*(?:generated\s+always\s+)as\s*\(([\s\S]+?)\)\s*(?:stored|virtual)?\s*$/i);
+                     if (gm) {
+                         genExpr = this._restoreStrings(gm[1].trim(), strMap);
+                         def = def.slice(0, gm.index);
+                     }
+                 }
                  let notNull = false, hasDefault = false, defaultVal;
                  if (/\bnot\s+null\b/i.test(def)) { notNull = true; def = def.replace(/\bnot\s+null\b/i, ' '); }
-                 const dm = def.match(/\bdefault\s+(\S+)/i);
+                 // CREATE TABLE と同じく、値は括弧の対応で切り出す（`DEFAULT (3 + 4)` 対応）
+                 const dm = this._takeDefaultToken(def);
                  if (dm) {
                      hasDefault = true;
-                     defaultVal = this._parseDefaultLiteral(dm[1], strMap);
-                     def = def.replace(dm[0], ' ');
+                     defaultVal = this._parseDefaultLiteral(dm.raw, strMap);
+                     def = def.slice(0, dm.start) + ' ' + def.slice(dm.end);
                  }
                  const parts = def.trim().split(/\s+/);
                  if (parts.length > 2 || !parts[0]) throw new Error("Syntax Error in ALTER TABLE ADD COLUMN. Use ADD COLUMN name [type] [DEFAULT value] [NOT NULL] [FIRST | AFTER col].");
@@ -2347,7 +3154,7 @@
                  t.addColumn(colName, type);
                  if (hasDefault && defaultVal !== null && defaultVal !== undefined) {
                      // DEFAULT CURRENT_TIMESTAMP は追加時点の時刻で既存行を埋める
-                     const fillVal = this._isNowMarker(defaultVal) ? this._nowString() : defaultVal;
+                     const fillVal = this._resolveDefaultValue(defaultVal);
                      try {
                          for (let i = 0; i < t.rowCount; i++) t.setValue(colName, i, fillVal);
                      } catch (e) {
@@ -2369,6 +3176,20 @@
                      if (position.first) order.unshift(colName);
                      else order.splice(order.indexOf(position.after) + 1, 0, colName);
                      t.reorderColumns(order);
+                 }
+                 // 生成列: 式を記録し、既存行の値もその場で埋める
+                 if (genExpr) {
+                     const sm2 = [];
+                     const gf = this.compileCondition(this._maskStrings(genExpr, sm2), sm2);
+                     const aliases2 = { [table]: table };
+                     try {
+                         for (let i = 0; i < t.rowCount; i++) t.setValue(colName, i, gf({ [table]: i }, this.tables, aliases2));
+                     } catch (e) {
+                         t.dropColumn(colName);
+                         throw new Error(`GENERATED AS expression failed: ${e.message}`);
+                     }
+                     t.generatedCols = t.generatedCols || Object.create(null);
+                     t.generatedCols[colName] = genExpr;
                  }
                  resultSet = [{ Result: "Success", Message: `Column '${colName}' added.` }];
                  return { data: resultSet, affectedRows: 0 };
@@ -2413,23 +3234,60 @@
           else if (/^truncate\b/i.test(sql)) {
              // TABLE キーワードは省略可 (TRUNCATE t / TRUNCATE TABLE t)。
              // RESTART IDENTITY で AUTO_INCREMENT の採番を 1 から振り直す（CONTINUE IDENTITY は既定＝維持）
-             const m = sql.match(/truncate\s+(?:table\s+)?([a-zA-Z0-9_]+)/i);
+             // 表名はカンマ区切りで複数指定できる（SQL標準 / PostgreSQL）。
+             // 以前は先頭の 1 表だけを空にして「成功」を返しており、残りが黙って残っていた
+             const m = sql.match(/^truncate\s+(?:table\s+)?([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)((?:\s+[\s\S]*)?)$/i);
              if (m) {
-                const table = m[1].toLowerCase();
-                if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
-                const restartIdentity = /\brestart\s+identity\b/i.test(sql);
-                this._cowColumns(table, 'ALL');
-                const t = this.tables[table];
-                affectedRows = t.rowCount;
-                t.rowCount = 0;
-                if (Object.keys(t.indices).length > 0) t.rebuildIndices();
-                // 採番は既存行の最大値から続くため、行を消した時点で自然に 1 から再開される。
-                // CONTINUE IDENTITY 指定時に採番を維持するには最終値の保持が要るため未対応と明示する。
-                if (/\bcontinue\s+identity\b/i.test(sql) && t.autoIncrementCol) {
-                    throw new Error("TRUNCATE ... CONTINUE IDENTITY is not supported (identity always restarts after truncation).");
+                const opts = (m[2] || '').trim();
+                if (opts !== '' && !/^(?:restart|continue)\s+identity(?:\s+(?:cascade|restrict))?$|^(?:cascade|restrict)$/i.test(opts)) {
+                    throw new Error("Syntax Error in TRUNCATE TABLE. Use TRUNCATE [TABLE] name[, name...] [RESTART|CONTINUE IDENTITY] [CASCADE|RESTRICT].");
                 }
-                resultSet = [{Result:"Success", Message:`${affectedRows} rows truncated${restartIdentity && t.autoIncrementCol ? ' (identity restarted)' : ''}.`}];
+                const names = m[1].split(',').map(x => x.trim().toLowerCase());
+                const dup = names.find((n, i) => names.indexOf(n) !== i);
+                if (dup) throw new Error(`Table '${dup}' is listed more than once in TRUNCATE.`);
+                names.forEach(n => { if (!this.tables[n]) throw new Error(`Table '${n}' not found.`); });
+                const restartIdentity = /\brestart\s+identity\b/i.test(sql);
+                const continueIdentity = /\bcontinue\s+identity\b/i.test(sql);
+                const notes = [];
+                affectedRows = 0;
+                names.forEach(table => {
+                    this._cowColumns(table, 'ALL');
+                    const t = this.tables[table];
+                    // 採番は既存行の最大値から続く実装なので、行を消すと自然に 1 へ戻る。
+                    // CONTINUE IDENTITY（SQL標準の既定）では消す前の最大値を下限として覚えておく
+                    if (continueIdentity && t.autoIncrementCol) {
+                        let maxId = 0;
+                        for (let i = 0; i < t.rowCount; i++) {
+                            const v = t.getValue(t.autoIncrementCol, i);
+                            if (typeof v === 'number' && v > maxId) maxId = v;
+                        }
+                        t.identityFloor = Math.max(t.identityFloor || 1, maxId + 1);
+                    }
+                    if (restartIdentity) t.identityFloor = 1;
+                    affectedRows += t.rowCount;
+                    t.rowCount = 0;
+                    if (Object.keys(t.indices).length > 0) t.rebuildIndices();
+                    if (t.autoIncrementCol && continueIdentity) notes.push(`${table} identity continues at ${t.identityFloor}`);
+                    else if (t.autoIncrementCol && restartIdentity) notes.push(`${table} identity restarted`);
+                });
+                const idNote = notes.length > 0 ? ` (${notes.join('; ')})` : '';
+                resultSet = [{Result:"Success", Message:`${affectedRows} rows truncated${idNote}.`}];
              } else throw new Error("Syntax Error in TRUNCATE TABLE.");
+          }
+          else if (/^alter\s+index/i.test(sql)) {
+             // ALTER INDEX name RENAME TO new — 索引名はメタデータなので付け替えるだけ
+             const m = sql.match(/^alter\s+index\s+(if\s+exists\s+)?([a-zA-Z0-9_]+)\s+rename\s+to\s+([a-zA-Z0-9_]+)$/i);
+             if (!m) throw new Error("Syntax Error in ALTER INDEX. Use ALTER INDEX [IF EXISTS] name RENAME TO new_name.");
+             const oldName = m[2].toLowerCase(), newName = m[3].toLowerCase();
+             this.indexNames = this.indexNames || Object.create(null);
+             if (!this.indexNames[oldName]) {
+                 if (m[1]) return { data: [{ Result: "Success", Message: `Index '${oldName}' does not exist. Skipped.` }], affectedRows: 0 };
+                 throw new Error(`Index '${oldName}' not found.`);
+             }
+             if (this.indexNames[newName]) throw new Error(`Index '${newName}' already exists.`);
+             this.indexNames[newName] = this.indexNames[oldName];
+             delete this.indexNames[oldName];
+             resultSet = [{ Result: "Success", Message: `Index '${oldName}' renamed to '${newName}'.` }];
           }
           else if (/^drop\s+index/i.test(sql)) {
              // CREATE INDEX と対称の構文。インデックス名は列で管理しているため省略可。
@@ -2483,6 +3341,7 @@
                     }
                     this._logViewState(name);
                     delete this.views[name];
+                    if (this.viewMeta) delete this.viewMeta[name];
                     resultSet = [{Result:"Success", Message:`View '${name}' dropped.`}];
                 } else {
                     const missing = names.filter(n => !this.views[n]);
@@ -2492,6 +3351,7 @@
                         if (!this.views[n]) return;
                         this._logViewState(n);
                         delete this.views[n];
+                        if (this.viewMeta) delete this.viewMeta[n];
                         dropped.push(n);
                     });
                     const skipNote = missing.length > 0 ? ` (${missing.length} skipped)` : '';

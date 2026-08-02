@@ -276,7 +276,7 @@
         { name: "IsNumeric / Chr / Strpos", sql: "SELECT ISNUMERIC('123') AS n1, ISNUMERIC('ab') AS n2, CHR(65) AS c, STRPOS('hello', 'll') AS p" },
         { name: "QuoteName / PatIndex / Replicate", sql: "SELECT QUOTENAME('col name') AS q, PATINDEX('%[0-9]%', 'abc123') AS pos, REPLICATE('ab', 3) AS r" }
       ]},
-      { cat: "Operators & Predicates (v1.14)", cmds: [
+      { cat: "Operators & Predicates", cmds: [
         { name: "String Concat (||)", sql: "SELECT name || ' (' || age || ')' AS label FROM {table}" },
         { name: "Cast Operator (::)", sql: "SELECT '42'::INTEGER + 1 AS n, age::TEXT AS s FROM {table} LIMIT 3" },
         { name: "ILIKE (case-insensitive)", sql: "SELECT * FROM {table} WHERE name ILIKE 'a%'" },
@@ -286,7 +286,7 @@
         { name: "Row Constructor IN", sql: "SELECT * FROM {table} WHERE (id, age) IN ((1, 25), (2, 30))" },
         { name: "System Variables (@@)", sql: "SELECT @@version AS ver, @@identity AS last_id" }
       ]},
-      { cat: "Query Shorthands (v1.14)", cmds: [
+      { cat: "Query Shorthands", cmds: [
         { name: "DISTINCT ON (PostgreSQL)", sql: "SELECT DISTINCT ON (user_id) user_id, amount FROM orders ORDER BY user_id, amount DESC" },
         { name: "SELECT * EXCLUDE", sql: "SELECT * EXCLUDE (age) FROM {table}" },
         { name: "SELECT * REPLACE", sql: "SELECT * REPLACE (age * 2 AS age) FROM {table}" },
@@ -298,14 +298,14 @@
         { name: "STRING_SPLIT (table fn)", sql: "SELECT value FROM STRING_SPLIT('a,b,c', ',')" },
         { name: "UNNEST (table fn)", sql: "SELECT n FROM UNNEST(10, 20, 30) AS u(n)" }
       ]},
-      { cat: "Multi-table DML (v1.14)", cmds: [
+      { cat: "Multi-table DML", cmds: [
         { name: "UPDATE ... FROM (PostgreSQL)", sql: "UPDATE orders SET amount = amount + 1 FROM users WHERE orders.user_id = users.id AND users.age > 30" },
         { name: "UPDATE ... JOIN (MySQL)", sql: "UPDATE orders o JOIN users u ON o.user_id = u.id SET o.amount = 9 WHERE u.age > 30" },
         { name: "DELETE ... USING (PostgreSQL)", sql: "DELETE FROM orders USING users WHERE orders.user_id = users.id AND users.age > 90" },
         { name: "DELETE t FROM t JOIN s (MySQL)", sql: "DELETE o FROM orders o JOIN users u ON o.user_id = u.id WHERE u.age > 90" },
         { name: "INSERT DEFAULT VALUES", sql: "INSERT INTO {table} DEFAULT VALUES" }
       ]},
-      { cat: "Catalog & Functions (v1.14)", cmds: [
+      { cat: "Catalog & Functions", cmds: [
         { name: "Create Function", sql: "CREATE OR REPLACE FUNCTION tax(amount) RETURNS FLOAT AS RETURN ROUND(amount * 1.1, 2)" },
         { name: "Use Function", sql: "SELECT price, tax(price) AS with_tax FROM products" },
         { name: "Drop Function", sql: "DROP FUNCTION IF EXISTS tax" },
@@ -315,7 +315,7 @@
         { name: "Unique / Multi-column Index", sql: "CREATE UNIQUE INDEX idx_name ON {table} (name)" },
         { name: "Drop Index by Name", sql: "DROP INDEX IF EXISTS idx_name" }
       ]},
-      { cat: "Browser DB Operations (v1.14)", cmds: [
+      { cat: "Browser DB Operations", cmds: [
         { name: "Statement Timeout", sql: "SET statement_timeout = 500" },
         { name: "Read-only Mode", sql: "SET read_only = ON" },
         { name: "Deterministic RAND", sql: "SET seed = 0.42; SELECT ROUND(RAND() * 100) AS r" },
@@ -329,7 +329,7 @@
         { name: "JS API (Snapshot / Restore)", sql: "// LuminaDB.snapshot('p1'); LuminaDB.restore('p1')" },
         { name: "JS API (JSON I/O)", sql: "// LuminaDB.importJSON('t', [{ id: 1 }], { create: true }); LuminaDB.exportJSON(['t'])" }
       ]},
-      { cat: "Operators & Search (v1.15)", cmds: [
+      { cat: "Operators & Search", cmds: [
         { name: "Date + INTERVAL", sql: "SELECT DATE '2026-01-31' + INTERVAL 1 MONTH AS next_month, NOW() - INTERVAL 7 DAY AS week_ago" },
         { name: "Interval (string form)", sql: "SELECT DATE '2026-01-01' + INTERVAL '2 weeks' AS d" },
         { name: "COLLATE (case-insensitive)", sql: "SELECT * FROM {table} WHERE name COLLATE NOCASE = 'alice'" },
@@ -341,14 +341,14 @@
         { name: "LIKE ANY / ALL", sql: "SELECT * FROM {table} WHERE name LIKE ANY ('A%', 'B%')" },
         { name: "IGNORE NULLS (window)", sql: "SELECT id, LAG(age) IGNORE NULLS OVER (ORDER BY id) AS prev FROM {table}" }
       ]},
-      { cat: "Tables from JSON & Sampling (v1.15)", cmds: [
+      { cat: "Tables from JSON & Sampling", cmds: [
         { name: "JSON_TABLE (array to rows)", sql: "SELECT * FROM JSON_TABLE('[{\"id\":1,\"nm\":\"a\"},{\"id\":2,\"nm\":\"b\"}]', '$[*]' COLUMNS (id INT PATH '$.id', nm TEXT PATH '$.nm')) t" },
         { name: "JSON_TABLE (nested key)", sql: "SELECT * FROM JSON_TABLE('{\"items\":[{\"v\":1}]}', '$.items[*]' COLUMNS (v INT PATH '$.v')) t" },
         { name: "TABLESAMPLE (percent)", sql: "SELECT * FROM {table} TABLESAMPLE (25 PERCENT)" },
         { name: "TABLESAMPLE (fixed rows)", sql: "SELECT * FROM {table} TABLESAMPLE (100 ROWS)" },
         { name: "TABLESAMPLE (reproducible)", sql: "SELECT * FROM {table} TABLESAMPLE (50 PERCENT) REPEATABLE (42)" }
       ]},
-      { cat: "Stored Procedure Logic (v1.15)", cmds: [
+      { cat: "Stored Procedure Logic", cmds: [
         { name: "IF / ELSEIF / ELSE", sql: "CREATE OR REPLACE PROCEDURE grade(s) AS BEGIN\n  DECLARE g TEXT;\n  IF s >= 90 THEN SET g = 'A';\n  ELSEIF s >= 70 THEN SET g = 'B';\n  ELSE SET g = 'C';\n  END IF;\n  RETURN g;\nEND" },
         { name: "WHILE loop", sql: "CREATE OR REPLACE PROCEDURE total(n) AS BEGIN\n  DECLARE i INT DEFAULT 1;\n  DECLARE s INT DEFAULT 0;\n  WHILE i <= n DO SET s = s + i; SET i = i + 1; END WHILE;\n  RETURN s;\nEND" },
         { name: "LOOP with LEAVE", sql: "CREATE OR REPLACE PROCEDURE countdown(n) AS BEGIN\n  DECLARE i INT DEFAULT 0;\n  lp: LOOP SET i = i + 1; IF i >= n THEN LEAVE lp; END IF; END LOOP;\n  RETURN i;\nEND" },
@@ -356,7 +356,7 @@
         { name: "Call with arguments", sql: "CALL grade(85)" },
         { name: "Procedure that writes rows", sql: "CREATE OR REPLACE PROCEDURE seed(n) AS BEGIN\n  DECLARE i INT DEFAULT 0;\n  WHILE i < n DO INSERT INTO {table} (id) VALUES (1000 + i); SET i = i + 1; END WHILE;\nEND" }
       ]},
-      { cat: "Introspection & Schema Ops (v1.15)", cmds: [
+      { cat: "Introspection & Schema Ops", cmds: [
         { name: "PRAGMA table_info", sql: "PRAGMA table_info({table})" },
         { name: "PRAGMA table_list", sql: "PRAGMA table_list" },
         { name: "PRAGMA foreign_key_list", sql: "PRAGMA foreign_key_list({table})" },
@@ -367,7 +367,7 @@
         { name: "EXPLAIN (FORMAT JSON)", sql: "EXPLAIN (FORMAT JSON) SELECT * FROM {table}" },
         { name: "DROP TABLE ... CASCADE", sql: "DROP TABLE IF EXISTS parent_demo CASCADE" }
       ]},
-      { cat: "Browser DB Essentials (v1.15)", cmds: [
+      { cat: "Browser DB Essentials", cmds: [
         { name: "JS API (run off the UI thread)", sql: "// await LuminaDB.worker.start(); await LuminaDB.worker.sync();\n// const r = await LuminaDB.worker.query('SELECT COUNT(*) FROM big'); await LuminaDB.worker.pull();" },
         { name: "JS API (worker timeout)", sql: "// await LuminaDB.worker.timeout(2000)   // ワーカー側の文単位タイムアウト" },
         { name: "JS API (schema migration)", sql: "// LuminaDB.migrate([\n//   { version: 1, up: 'CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)' },\n//   { version: 2, up: api => api.exec('ALTER TABLE notes ADD COLUMN tag TEXT') }\n// ])" },
@@ -375,7 +375,7 @@
         { name: "JS API (backup to file)", sql: "// LuminaDB.download('mydb.json')          // ダウンロード\n// LuminaDB.restoreBackup(await file.text()) // 復元" },
         { name: "JS API (backup as string)", sql: "// const text = LuminaDB.backup()" }
       ]},
-      { cat: "Cursors & Error Handling (v1.16)", cmds: [
+      { cat: "Cursors & Error Handling", cmds: [
         { name: "Cursor loop (row by row)", sql: "CREATE OR REPLACE PROCEDURE walk() AS BEGIN\n  DECLARE done INT DEFAULT 0;\n  DECLARE v INT;\n  DECLARE c CURSOR FOR SELECT id FROM {table};\n  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;\n  OPEN c;\n  read_loop: LOOP\n    FETCH c INTO v;\n    IF done = 1 THEN LEAVE read_loop; END IF;\n  END LOOP;\n  CLOSE c;\nEND" },
         { name: "Catch errors (CONTINUE HANDLER)", sql: "CREATE OR REPLACE PROCEDURE safe() AS BEGIN\n  DECLARE st TEXT DEFAULT 'ok';\n  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET st = 'failed';\n  SELECT * FROM missing_table;\n  RETURN st;\nEND" },
         { name: "Abort on error (EXIT HANDLER)", sql: "CREATE OR REPLACE PROCEDURE guarded() AS BEGIN\n  DECLARE EXIT HANDLER FOR SQLEXCEPTION SELECT 'aborted' AS status;\n  INSERT INTO {table} (id) VALUES (1);\nEND" },
@@ -383,7 +383,7 @@
         { name: "Handle a specific SQLSTATE", sql: "// DECLARE CONTINUE HANDLER FOR SQLSTATE '45000' SET msg = 'business rule hit';" },
         { name: "CASE statement", sql: "CREATE OR REPLACE PROCEDURE label(n) AS BEGIN\n  CASE n\n    WHEN 1 THEN RETURN 'one';\n    WHEN 2 THEN RETURN 'two';\n    ELSE RETURN 'many';\n  END CASE;\nEND" }
       ]},
-      { cat: "Ranges, JSON & Time Buckets (v1.16)", cmds: [
+      { cat: "Ranges, JSON & Time Buckets", cmds: [
         { name: "OVERLAPS (period intersection)", sql: "SELECT (DATE '2026-01-01', DATE '2026-06-01') OVERLAPS (DATE '2026-03-01', DATE '2026-09-01') AS conflicts" },
         { name: "BETWEEN SYMMETRIC", sql: "SELECT * FROM {table} WHERE age BETWEEN SYMMETRIC 30 AND 25" },
         { name: "IS JSON", sql: "SELECT * FROM {table} WHERE '{\"a\":1}' IS JSON OBJECT" },
@@ -393,7 +393,7 @@
         { name: "AGE (interval between dates)", sql: "SELECT AGE(DATE '2028-03-15', DATE '2026-01-20') AS gap" },
         { name: "EXTRACT EPOCH / DOW / DOY", sql: "SELECT EXTRACT(EPOCH FROM NOW()) AS unix_ts, EXTRACT(DOW FROM NOW()) AS weekday" }
       ]},
-      { cat: "Schema & Planner Compatibility (v1.16)", cmds: [
+      { cat: "Schema & Planner Compatibility", cmds: [
         { name: "Schema-qualified names", sql: "SELECT COUNT(*) FROM main.{table}" },
         { name: "CREATE / DROP SCHEMA", sql: "CREATE SCHEMA app" },
         { name: "Partial index", sql: "CREATE INDEX idx_active ON {table} (age) WHERE age > 25" },
@@ -401,13 +401,13 @@
         { name: "CTE materialization hint", sql: "WITH c AS MATERIALIZED (SELECT id FROM {table}) SELECT COUNT(*) FROM c" },
         { name: "EXPLAIN QUERY PLAN", sql: "EXPLAIN QUERY PLAN SELECT * FROM {table} WHERE id = 1" }
       ]},
-      { cat: "Persistence & Streaming (v1.16)", cmds: [
+      { cat: "Persistence & Streaming", cmds: [
         { name: "JS API (batched read)", sql: "// LuminaDB.eachBatch('SELECT * FROM big ORDER BY id', [], 1000, rows => render(rows))" },
         { name: "JS API (row cursor)", sql: "// for (const row of LuminaDB.cursor('SELECT * FROM big ORDER BY id')) { /* ... */ }" },
         { name: "JS API (incremental save stats)", sql: "// LuminaDB.saveStats()   // { tables, written, skipped, removed } — 差分保存が効いているかの確認" },
         { name: "JS API (follow other tabs)", sql: "// LuminaDB.autoReload(true)   // 他タブの保存を自動で読み直す" }
       ]},
-      { cat: "Arrays & Fuzzy Matching (v1.17)", cmds: [
+      { cat: "Arrays & Fuzzy Matching", cmds: [
         { name: "ARRAY constructor", sql: "SELECT ARRAY_TO_STRING(ARRAY[1, 2, 3], '-') AS joined, ARRAY_LENGTH(ARRAY[1, 2, 3]) AS n" },
         { name: "Array membership", sql: "SELECT * FROM {table} WHERE id = ANY(ARRAY[1, 2, 3])" },
         { name: "String ↔ array", sql: "SELECT ARRAY_TO_STRING(STRING_TO_ARRAY('a,b,c', ','), ' | ') AS s" },
@@ -418,7 +418,7 @@
         { name: "REGEXP_MATCHES / SPLIT", sql: "SELECT ARRAY_TO_STRING(REGEXP_MATCHES('a1b2', '[0-9]', 'g'), ',') AS digits" },
         { name: "DIV / SAFE_DIVIDE", sql: "SELECT DIV(7, 2) AS whole, SAFE_DIVIDE(1, 0) AS no_error" }
       ]},
-      { cat: "Statistics & Time Series (v1.17)", cmds: [
+      { cat: "Statistics & Time Series", cmds: [
         { name: "Linear regression", sql: "SELECT REGR_SLOPE(price, stock) AS slope, REGR_INTERCEPT(price, stock) AS intercept, REGR_R2(price, stock) AS r2 FROM products" },
         { name: "Regression detail", sql: "SELECT REGR_COUNT(price, stock) AS n, REGR_AVGX(price, stock) AS avg_x, REGR_AVGY(price, stock) AS avg_y FROM products" },
         { name: "MODE (most common value)", sql: "SELECT MODE() WITHIN GROUP (ORDER BY age) AS most_common FROM {table}" },
@@ -427,18 +427,189 @@
         { name: "WITH ORDINALITY", sql: "SELECT v, n FROM GENERATE_SERIES(10, 30, 10) WITH ORDINALITY AS t(v, n)" },
         { name: "AT TIME ZONE", sql: "SELECT NOW() AT TIME ZONE '+09:00' AS tokyo, NOW() AT TIME ZONE 'UTC' AS utc" }
       ]},
-      { cat: "Window Extras (v1.17)", cmds: [
+      { cat: "Window Extras", cmds: [
         { name: "Running total excluding self", sql: "SELECT id, SUM(age) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) AS others FROM {table}" },
         { name: "EXCLUDE GROUP / TIES", sql: "SELECT id, COUNT(*) OVER (ORDER BY age RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) AS c FROM {table}" },
         { name: "Window FILTER", sql: "SELECT id, SUM(age) FILTER (WHERE age > 25) OVER () AS adults_total FROM {table}" },
         { name: "Window FILTER by partition", sql: "SELECT id, COUNT(*) FILTER (WHERE age > 25) OVER (PARTITION BY age) AS n FROM {table}" }
       ]},
-      { cat: "CSV, Cache & Coordination (v1.17)", cmds: [
+      { cat: "CSV, Cache & Coordination", cmds: [
         { name: "JS API (import CSV text)", sql: "// LuminaDB.importCSV(await file.text(), 'sales', { create: true })\n// opts: { create, header, delimiter, replace }" },
         { name: "JS API (export a table as CSV)", sql: "// LuminaDB.exportCSV('sales')" },
         { name: "JS API (compile cache stats)", sql: "// LuminaDB.cacheStats()   // { hits, misses, size, hitRate } — 同じ形のクエリの再コンパイルを省けているか" },
         { name: "JS API (leader tab election)", sql: "// const h = LuminaDB.onLeader(() => startBackgroundSync());\n// h.release();   // 別タブが自動的に昇格する" },
         { name: "Maintenance no-ops", sql: "REINDEX" }
+      ]},
+      { cat: "Type Conversion with Precision", cmds: [
+        { name: "CAST AS DECIMAL(p, s)", sql: "SELECT CAST(1.005 AS DECIMAL(10,2)) AS rounded" },
+        { name: "CAST AS VARCHAR(n) (truncates)", sql: "SELECT CAST(12345 AS VARCHAR(3)) AS truncated" },
+        { name: "CAST AS BIGINT / DOUBLE PRECISION", sql: "SELECT CAST(3.7 AS BIGINT) AS i, CAST('1.25' AS DOUBLE PRECISION) AS d" },
+        { name: "CONVERT (SQL Server order)", sql: "SELECT CONVERT(DECIMAL(5,1), 3.14159) AS s" },
+        { name: "CAST AS TIME", sql: "SELECT CAST('2020-05-06 13:14:15' AS TIME) AS t" }
+      ]},
+      { cat: "Updatable Views", cmds: [
+        { name: "CREATE VIEW ... WITH CHECK OPTION", sql: "CREATE VIEW v_upd AS SELECT id, name, age FROM {table} WHERE age >= 30 WITH CHECK OPTION" },
+        { name: "UPDATE through a view", sql: "UPDATE v_upd SET name = 'Bobby' WHERE id = 2" },
+        { name: "INSERT through a view", sql: "INSERT INTO v_upd (id, name, age) VALUES (99, 'New', 40)" },
+        { name: "DELETE through a view", sql: "DELETE FROM v_upd WHERE id = 99" },
+        { name: "INSTEAD OF trigger (writable aggregate view)", sql: "CREATE TRIGGER tg_io INSTEAD OF INSERT ON v_upd FOR EACH ROW INSERT INTO {table} (id, name, age) VALUES (NEW.id, NEW.name, NEW.age)" },
+        { name: "Check updatability", sql: "SELECT table_name, is_updatable, check_option FROM information_schema.views" }
+      ]},
+      { cat: "Constraints & Keys", cmds: [
+        { name: "Column-level REFERENCES", sql: "CREATE TABLE v18_child (id INTEGER, pid INTEGER REFERENCES {table}(id) ON DELETE CASCADE)" },
+        { name: "REFERENCES without a column (uses PK)", sql: "CREATE TABLE v18_child2 (id INTEGER, pid INTEGER REFERENCES {table})" },
+        { name: "ADD CONSTRAINT name FOREIGN KEY", sql: "ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id)" },
+        { name: "ADD CONSTRAINT name UNIQUE", sql: "ALTER TABLE {table} ADD CONSTRAINT uq_name UNIQUE (name)" },
+        { name: "DROP CONSTRAINT by name", sql: "ALTER TABLE orders DROP CONSTRAINT fk_user" },
+        { name: "DROP FOREIGN KEY by name (MySQL)", sql: "ALTER TABLE orders DROP FOREIGN KEY fk_user" },
+        { name: "Referential actions", sql: "SELECT constraint_name, delete_rule, update_rule FROM information_schema.referential_constraints" },
+        { name: "CHECK constraint expressions", sql: "SELECT constraint_name, check_clause FROM information_schema.check_constraints" }
+      ]},
+      { cat: "JSON Operators", cmds: [
+        { name: "-> (keeps JSON)", sql: "SELECT '{\"a\":{\"b\":2}}' -> 'a' AS v" },
+        { name: "->> (as text)", sql: "SELECT '{\"a\":1}' ->> 'a' AS v" },
+        { name: "-> chained", sql: "SELECT '{\"a\":{\"b\":7}}' -> 'a' ->> 'b' AS v" },
+        { name: "#> / #>> (path array)", sql: "SELECT '{\"a\":{\"b\":2}}' #>> '{a,b}' AS v" },
+        { name: "@> / <@ (containment)", sql: "SELECT ('{\"a\":1,\"b\":2}' @> '{\"a\":1}') AS contains" },
+        { name: "JSON_INSERT (missing paths only)", sql: "SELECT JSON_INSERT('{\"a\":1}', '$.b', 2) AS v" },
+        { name: "JSON_REPLACE (existing paths only)", sql: "SELECT JSON_REPLACE('{\"a\":1}', '$.a', 5) AS v" },
+        { name: "JSON_ARRAY_INSERT", sql: "SELECT JSON_ARRAY_INSERT('[1,2]', '$[0]', 9) AS v" },
+        { name: "JSON_CONTAINS_PATH", sql: "SELECT JSON_CONTAINS_PATH('{\"a\":1}', 'one', '$.a', '$.z') AS v" }
+      ]},
+      { cat: "Predicates, Aliases & Indexes", cmds: [
+        { name: "IS [NOT] TRUE / FALSE", sql: "SELECT COUNT(*) AS c FROM {table} WHERE (age > 30) IS NOT TRUE" },
+        { name: "UPDATE with a table alias", sql: "UPDATE {table} t SET t.age = t.age + 1 WHERE t.id = 1" },
+        { name: "DELETE with a table alias", sql: "DELETE FROM {table} t WHERE t.id = 99999" },
+        { name: "Row constructor IN (SELECT ...)", sql: "SELECT COUNT(*) AS c FROM orders WHERE (user_id, product_id) IN (SELECT user_id, product_id FROM orders)" },
+        { name: "CREATE INDEX with ordering", sql: "CREATE INDEX ix_v18 ON products (price DESC, name ASC NULLS LAST)" },
+        { name: "CREATE INDEX on an expression", sql: "CREATE INDEX ix_v18e ON {table} (LOWER(name))" },
+        { name: "SHOW INDEX / SHOW KEYS", sql: "SHOW INDEX FROM {table}" },
+        { name: "Index metadata", sql: "SELECT index_name, seq_in_index, column_name, expression, collation FROM information_schema.statistics" },
+        { name: "UNNEST an array", sql: "SELECT SUM(v) AS s FROM UNNEST(ARRAY[1, 2, 3]) AS t(v)" },
+        { name: "UNNEST WITH ORDINALITY", sql: "SELECT v, n FROM UNNEST(ARRAY['a','b']) WITH ORDINALITY AS t(v, n)" }
+      ]},
+      { cat: "Composite Keys & Sequences", cmds: [
+        { name: "Composite FOREIGN KEY", sql: "CREATE TABLE v19_p (a INTEGER, b INTEGER, PRIMARY KEY (a, b));\nCREATE TABLE v19_c (id INTEGER, pa INTEGER, pb INTEGER, FOREIGN KEY (pa, pb) REFERENCES v19_p(a, b) ON DELETE CASCADE)" },
+        { name: "ALTER ADD composite FOREIGN KEY", sql: "ALTER TABLE v19_c ADD CONSTRAINT fk_pair FOREIGN KEY (pa, pb) REFERENCES v19_p(a, b)" },
+        { name: "DROP composite FOREIGN KEY", sql: "ALTER TABLE v19_c DROP FOREIGN KEY (pa, pb)" },
+        { name: "CREATE SEQUENCE with range", sql: "CREATE SEQUENCE v19_seq START WITH 100 INCREMENT BY 10 MINVALUE 1 MAXVALUE 999 CYCLE" },
+        { name: "ALTER SEQUENCE RESTART", sql: "ALTER SEQUENCE v19_seq RESTART WITH 500" },
+        { name: "Sequence metadata", sql: "SELECT sequence_name, minimum_value, maximum_value, cycle_option FROM information_schema.sequences" },
+        { name: "DEFAULT NEXTVAL", sql: "CREATE TABLE v19_t (id INTEGER DEFAULT NEXTVAL('v19_seq'), v TEXT)" },
+        { name: "DEFAULT with an expression", sql: "CREATE TABLE v19_e (a INTEGER, u TEXT DEFAULT UUID(), n INTEGER DEFAULT (1 + 2))" }
+      ]},
+      { cat: "MERGE & Upsert", cmds: [
+        { name: "MERGE with a condition", sql: "MERGE INTO {table} t USING (SELECT 1 AS id, 'x' AS nm) s ON t.id = s.id\n  WHEN MATCHED AND t.name <> s.nm THEN UPDATE SET name = s.nm\n  WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.nm)" },
+        { name: "MERGE ... WHEN NOT MATCHED BY SOURCE", sql: "MERGE INTO {table} t USING (SELECT 1 AS id) s ON t.id = s.id WHEN NOT MATCHED BY SOURCE THEN DELETE" },
+        { name: "ON DUPLICATE KEY UPDATE with VALUES()", sql: "INSERT INTO {table} (id, name) VALUES (1, 'x') ON DUPLICATE KEY UPDATE name = VALUES(name)" },
+        { name: "ON CONFLICT ... DO UPDATE ... WHERE", sql: "INSERT INTO {table} (id, age) VALUES (1, 40) ON CONFLICT (id) DO UPDATE SET age = EXCLUDED.age WHERE {table}.age < EXCLUDED.age" }
+      ]},
+      { cat: "Views, Indexes & Catalog", cmds: [
+        { name: "CREATE VIEW with a column list", sql: "CREATE VIEW v19_v (uid, uname) AS SELECT id, name FROM {table}" },
+        { name: "ALTER INDEX RENAME", sql: "ALTER INDEX ix_old RENAME TO ix_new" },
+        { name: "SHOW TABLE STATUS", sql: "SHOW TABLE STATUS" },
+        { name: "SHOW TABLE STATUS LIKE", sql: "SHOW TABLE STATUS LIKE 'user%'" },
+        { name: "CREATE TABLE AS ... WITH NO DATA", sql: "CREATE TABLE v19_shape AS SELECT * FROM {table} WITH NO DATA" },
+        { name: "CREATE GLOBAL TEMPORARY TABLE", sql: "CREATE GLOBAL TEMPORARY TABLE v19_scratch (a INTEGER)" }
+      ]},
+      { cat: "Date Arithmetic", cmds: [
+        { name: "日付 + 日数", sql: "SELECT DATE '2026-01-01' + 30 AS due" },
+        { name: "日付 - 日数", sql: "SELECT CURRENT_DATE - 7 AS week_ago" },
+        { name: "日付 - 日付（日数差）", sql: "SELECT DATE '2026-03-01' - DATE '2026-01-01' AS days" },
+        { name: "日付列の演算", sql: "-- 日付型の列にもそのまま効く\n-- SELECT nm, hire + 90 AS probation_end FROM emp" },
+        { name: "INTERVAL 版（従来どおり）", sql: "SELECT DATE '2026-01-31' + INTERVAL 1 MONTH AS d" }
+      ]},
+      { cat: "Hierarchical Queries (Oracle)", cmds: [
+        { name: "START WITH ... CONNECT BY", sql: "-- 組織図をたどる\n-- SELECT nm, LEVEL FROM emp START WITH mgr IS NULL CONNECT BY PRIOR id = mgr" },
+        { name: "SYS_CONNECT_BY_PATH", sql: "-- SELECT SYS_CONNECT_BY_PATH(nm, '/') AS path FROM emp\n--   START WITH mgr IS NULL CONNECT BY PRIOR id = mgr" },
+        { name: "CONNECT_BY_ROOT / ISLEAF", sql: "-- SELECT nm, CONNECT_BY_ROOT nm AS top, CONNECT_BY_ISLEAF AS leaf FROM emp\n--   START WITH mgr IS NULL CONNECT BY PRIOR id = mgr" },
+        { name: "ORDER SIBLINGS BY", sql: "-- 同じ親の子どもの並び順を決める\n-- ... CONNECT BY PRIOR id = mgr ORDER SIBLINGS BY nm" },
+        { name: "CONNECT BY NOCYCLE", sql: "-- データが循環していても止まる\n-- ... CONNECT BY NOCYCLE PRIOR id = mgr" },
+        { name: "ROWNUM で上位 n 件", sql: "SELECT name FROM {table} WHERE ROWNUM <= 3" },
+        { name: "ROWNUM を列として", sql: "SELECT ROWNUM AS rn, name FROM {table}" }
+      ]},
+      { cat: "Analytic Functions", cmds: [
+        { name: "RATIO_TO_REPORT", sql: "-- ウィンドウ関数は選択項目そのものである必要があるので、加工は副問い合わせの外で行う\nSELECT name, ROUND(r * 100, 1) AS pct FROM (SELECT name, RATIO_TO_REPORT(age) OVER () AS r FROM {table}) q" },
+        { name: "PERCENTILE_CONT OVER", sql: "SELECT DISTINCT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY age) OVER () AS median FROM {table}" },
+        { name: "NTH_VALUE ... FROM LAST", sql: "SELECT NTH_VALUE(name, 2) FROM LAST OVER (ORDER BY id) AS v FROM {table}" },
+        { name: "KEEP (DENSE_RANK FIRST)", sql: "SELECT MAX(name) KEEP (DENSE_RANK FIRST ORDER BY age) AS youngest FROM {table}" },
+        { name: "KEEP (DENSE_RANK LAST)", sql: "SELECT MAX(name) KEEP (DENSE_RANK LAST ORDER BY age) AS oldest FROM {table}" }
+      ]},
+      { cat: "Match Operators (PostgreSQL)", cmds: [
+        { name: "~ 正規表現", sql: "SELECT * FROM {table} WHERE name ~ '^A'" },
+        { name: "~* 大小無視の正規表現", sql: "SELECT * FROM {table} WHERE name ~* '^a'" },
+        { name: "!~ 否定", sql: "SELECT COUNT(*) AS c FROM {table} WHERE name !~ 'a'" },
+        { name: "~~ / ~~* (LIKE / ILIKE)", sql: "SELECT * FROM {table} WHERE name ~~* 'a%'" },
+        { name: "CURRENT_CATALOG", sql: "SELECT CURRENT_CATALOG AS db, CURRENT_SCHEMA AS schema" }
+      ]},
+      { cat: "DDL & Upsert Extras", cmds: [
+        { name: "TRUNCATE 複数表", sql: "-- 指定した表をすべて空にする\n-- TRUNCATE TABLE t1, t2" },
+        { name: "ADD COLUMN の生成列", sql: "-- ALTER TABLE t ADD COLUMN len INTEGER GENERATED ALWAYS AS (LENGTH(nm)) STORED" },
+        { name: "CREATE INDEX ... INCLUDE", sql: "-- CREATE INDEX ix ON t (nm) INCLUDE (v)" },
+        { name: "SET CONSTRAINTS", sql: "SET CONSTRAINTS ALL IMMEDIATE" },
+        { name: "SHOW SCHEMAS", sql: "SHOW SCHEMAS" },
+        { name: "SHOW TRANSACTION ISOLATION LEVEL", sql: "SHOW TRANSACTION ISOLATION LEVEL" },
+        { name: "ON CONFLICT ... RETURNING", sql: "-- 実際に書き込んだ行だけが返る\n-- INSERT INTO t (id, nm) VALUES (1, 'a') ON CONFLICT (id) DO NOTHING RETURNING id" }
+      ]},
+      { cat: "Windows over Groups", cmds: [
+        { name: "Percent of total", sql: "SELECT age, COUNT(*) AS n,\n       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct\nFROM {table} GROUP BY age ORDER BY age" },
+        { name: "Rank the groups", sql: "SELECT age, COUNT(*) AS n, RANK() OVER (ORDER BY COUNT(*) DESC) AS rk FROM {table} GROUP BY age" },
+        { name: "Running total over groups", sql: "SELECT age, SUM(COUNT(*)) OVER (ORDER BY age) AS running FROM {table} GROUP BY age" },
+        { name: "Partitioned rank over groups", sql: "SELECT age, COUNT(*) AS n, ROW_NUMBER() OVER (PARTITION BY age % 2 ORDER BY age) AS rn FROM {table} GROUP BY age" }
+      ]},
+      { cat: "Collation, ORDER BY ALL & GROUPING_ID", cmds: [
+        { name: "Column-level COLLATE NOCASE", sql: "CREATE TABLE v21_ci (id INTEGER PRIMARY KEY, nm TEXT COLLATE NOCASE UNIQUE)" },
+        { name: "Case-insensitive lookup", sql: "-- 'Apple' も 'APPLE' も一致する\n-- SELECT * FROM v21_ci WHERE nm = 'APPLE'" },
+        { name: "COLLATE NUMERIC (自然順)", sql: "CREATE TABLE v21_nat (v TEXT COLLATE NUMERIC)" },
+        { name: "ORDER BY ALL", sql: "SELECT name, age FROM {table} ORDER BY ALL" },
+        { name: "ORDER BY ALL DESC", sql: "SELECT name, age FROM {table} ORDER BY ALL DESC" },
+        { name: "GROUPING_ID over CUBE", sql: "SELECT age, id, COUNT(*) AS n, GROUPING_ID(age, id) AS gid FROM {table} GROUP BY CUBE(age, id)" }
+      ]},
+      { cat: "DDL, Identity & LATERAL", cmds: [
+        { name: "ALTER COLUMN ... SET DATA TYPE", sql: "ALTER TABLE {table} ALTER COLUMN age SET DATA TYPE FLOAT" },
+        { name: "ALTER COLUMN ... TYPE ... USING", sql: "ALTER TABLE {table} ALTER COLUMN name TYPE INTEGER USING LENGTH(name)" },
+        { name: "ALTER TABLE RENAME CONSTRAINT", sql: "-- ALTER TABLE {table} RENAME CONSTRAINT uq_old TO uq_new" },
+        { name: "OVERRIDING SYSTEM VALUE", sql: "-- 識別列に与えた値をそのまま使う\n-- INSERT INTO t (id, nm) OVERRIDING SYSTEM VALUE VALUES (99, 'a')" },
+        { name: "OVERRIDING USER VALUE", sql: "-- 与えた値を捨てて自動採番させる\n-- INSERT INTO t (id, nm) OVERRIDING USER VALUE VALUES (99, 'b')" },
+        { name: "JOIN LATERAL ... ON TRUE", sql: "SELECT u.name AS name, x.c AS c FROM users u\nJOIN LATERAL (SELECT COUNT(*) AS c FROM orders o WHERE o.user_id = u.id) x ON TRUE" },
+        { name: "LEFT JOIN LATERAL", sql: "SELECT u.name AS name, x.oid AS oid FROM users u\nLEFT JOIN LATERAL (SELECT order_id AS oid FROM orders o WHERE o.user_id = u.id) x ON TRUE" }
+      ]},
+      { cat: "Subscripts & Warnings", cmds: [
+        { name: "Array subscript (1-based)", sql: "SELECT ARRAY[10, 20, 30, 40][2] AS second" },
+        { name: "Array slice", sql: "SELECT ARRAY_TO_STRING(ARRAY[10, 20, 30, 40][2:3], '-') AS slice" },
+        { name: "String slice", sql: "SELECT ('hello')[2:4] AS sub" },
+        { name: "JSON element by subscript", sql: "SELECT ('[5,6,7]')[2] AS v" },
+        { name: "SHOW WARNINGS", sql: "DROP TABLE IF EXISTS not_here;\nSHOW WARNINGS" },
+        { name: "SHOW COUNT(*) WARNINGS", sql: "DROP TABLE IF EXISTS not_here;\nSHOW COUNT(*) WARNINGS" }
+      ]},
+      { cat: "Ordered Aggregates & Windows", cmds: [
+        { name: "STRING_AGG with ORDER BY", sql: "SELECT STRING_AGG(name, ',' ORDER BY age DESC) AS names FROM {table}" },
+        { name: "ARRAY_AGG with ORDER BY", sql: "SELECT ARRAY_AGG(name ORDER BY id) AS arr FROM {table}" },
+        { name: "LISTAGG with ORDER BY", sql: "SELECT LISTAGG(name, ' / ' ORDER BY name) AS s FROM {table}" },
+        { name: "Window function in ORDER BY", sql: "SELECT name FROM {table} ORDER BY ROW_NUMBER() OVER (ORDER BY age DESC)" },
+        { name: "Integer division (infix)", sql: "SELECT age DIV 10 AS decade FROM {table}" }
+      ]},
+      { cat: "Derived Sources & SRFs", cmds: [
+        { name: "UPDATE ... FROM (VALUES ...)", sql: "UPDATE {table} SET age = v.a FROM (VALUES (1, 41), (2, 42)) AS v(i, a) WHERE {table}.id = v.i" },
+        { name: "DELETE ... USING (VALUES ...)", sql: "DELETE FROM {table} USING (VALUES (99999)) AS d(i) WHERE {table}.id = d.i" },
+        { name: "UNNEST in the SELECT list", sql: "SELECT UNNEST(ARRAY[1, 2, 3]) AS v" },
+        { name: "GENERATE_SERIES in the SELECT list", sql: "SELECT GENERATE_SERIES(1, 12) AS month" },
+        { name: "STRING_SPLIT in the SELECT list", sql: "SELECT STRING_SPLIT('a,b,c', ',') AS part" }
+      ]},
+      { cat: "Domains, Types & Roles", cmds: [
+        { name: "CREATE DOMAIN with a CHECK", sql: "CREATE DOMAIN v20_pos AS INTEGER CHECK (VALUE > 0)" },
+        { name: "CREATE TYPE ... AS ENUM", sql: "CREATE TYPE v20_mood AS ENUM ('sad', 'ok', 'happy')" },
+        { name: "Use a domain as a column type", sql: "CREATE TABLE v20_survey (id INTEGER, score v20_pos, m v20_mood)" },
+        { name: "SHOW DOMAINS", sql: "SHOW DOMAINS" },
+        { name: "CREATE ROLE / USER", sql: "CREATE ROLE v20_reporting" },
+        { name: "SHOW GRANTS", sql: "SHOW GRANTS" },
+        { name: "TRUNCATE ... CONTINUE IDENTITY", sql: "TRUNCATE TABLE v20_survey CONTINUE IDENTITY" }
+      ]},
+      { cat: "Recursive SEARCH & CYCLE", cmds: [
+        { name: "SEARCH DEPTH FIRST", sql: "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 5)\n  SEARCH DEPTH FIRST BY n SET ord\nSELECT n, ord FROM t ORDER BY ord" },
+        { name: "SEARCH BREADTH FIRST", sql: "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 5)\n  SEARCH BREADTH FIRST BY n SET ord\nSELECT n, ord FROM t ORDER BY ord" },
+        { name: "CYCLE (stops on a loop)", sql: "-- 循環するグラフでも上限エラーにならず、印を付けて止まる\n-- WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT g.b FROM g JOIN t ON g.a = t.n)\n--   CYCLE n SET is_cycle USING path\n-- SELECT n, is_cycle, path FROM t" },
+        { name: "Index-backed IN", sql: "EXPLAIN SELECT * FROM {table} WHERE id IN (1, 2, 3)" }
       ]},
       { cat: "External API", cmds: [
         { name: "JS API", sql: "// JSコンソールから: LuminaDB.query('SELECT * FROM users WHERE id = ?', [1])" },

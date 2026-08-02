@@ -594,7 +594,21 @@
         { name: "View: Export SQL includes View", fn: () => db.exportSQL().includes('CREATE VIEW v_adults AS') },
         { name: "Neg View: Duplicate Name", sql: "CREATE VIEW v_adults AS SELECT * FROM users", isErrorExpected: true, check: r => r.error !== undefined },
         { name: "Neg View: Conflicts with Table", sql: "CREATE VIEW users AS SELECT * FROM orders", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg View: Delete From View", sql: "DELETE FROM v_adults WHERE id = 2", isErrorExpected: true, check: r => r.error !== undefined },
+        // v1.18: 単一表ビューは更新可能になった（旧: 明示エラー）。共有テーブルを汚さないよう
+        // 専用のテーブル／ビューを立てて検証する
+        { name: "View: Delete Through View", fn: () => {
+            db.executeQuery("CREATE TABLE vdel_t (id INTEGER, age INTEGER)");
+            db.executeQuery("INSERT INTO vdel_t (id, age) VALUES (1, 20), (2, 40)");
+            db.executeQuery("CREATE VIEW vdel_v AS SELECT id, age FROM vdel_t WHERE age >= 30");
+            const r = db.executeQuery("DELETE FROM vdel_v WHERE id = 2");
+            const left = db.executeQuery("SELECT COUNT(*) AS c FROM vdel_t");
+            // ビュー外の行 (id=1) は消えない
+            const outside = db.executeQuery("DELETE FROM vdel_v WHERE id = 1");
+            const still = db.executeQuery("SELECT COUNT(*) AS c FROM vdel_t");
+            db.executeQuery("DROP VIEW vdel_v");
+            db.executeQuery("DROP TABLE vdel_t");
+            return !r.error && left.data[0].c === 1 && outside.data[0].Message.startsWith('0 rows') && still.data[0].c === 1;
+        }},
         { name: "View: Drop", sql: "DROP VIEW v_adults", check: r => r.data[0].Result === "Success" },
         { name: "Neg View: Select After Drop", sql: "SELECT * FROM v_adults", isErrorExpected: true, check: r => r.error !== undefined },
         { name: "Neg View: Drop Missing", sql: "DROP VIEW v_missing", isErrorExpected: true, check: r => r.error !== undefined },
@@ -2410,6 +2424,59 @@
         //   CSV 取り込み、リーダー選出
         // ============================================================
         ...getV22Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v23.js の getV23Tests()
+        //   v1.18: 桁指定付き CAST/CONVERT、更新可能ビューと WITH CHECK OPTION、
+        //   INSTEAD OF トリガー、列レベル REFERENCES、JSON アクセス演算子、
+        //   IS [NOT] TRUE/FALSE、名前付き制約、DELETE/UPDATE の別名、
+        //   行コンストラクタ IN (SELECT)、索引の並び順/式キー、メタデータビュー、
+        //   UNNEST(配列)、および UI（結果絞り込み・セル詳細・スキーマツリー展開・
+        //   トランザクションバー・カーソル位置の文の実行）
+        // ============================================================
+        ...getV23Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v24.js の getV24Tests()
+        //   v1.19: 複合列 FOREIGN KEY、シーケンスのオプションと ALTER SEQUENCE、
+        //   DEFAULT 式（NEXTVAL / UUID / 算術）、MERGE の条件付き WHEN と
+        //   NOT MATCHED BY SOURCE、VALUES(col) と ON CONFLICT ... WHERE、
+        //   CREATE VIEW の列リスト、ALTER INDEX RENAME / SHOW TABLE STATUS /
+        //   WITH [NO] DATA、集計入れ子の診断、および UI（結果グリッドの直接編集・
+        //   Markdown / INSERT コピー・ショートカット一覧）
+        // ============================================================
+        ...getV24Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v25.js の getV25Tests()
+        //   v1.20: 連結系集計の引数内 ORDER BY、ORDER BY へのウィンドウ関数、
+        //   UPDATE/DELETE の派生表ソース、SELECT 句の集合返し関数、DIV 演算子、
+        //   CREATE DOMAIN / TYPE AS ENUM、USER/ROLE、TRUNCATE CONTINUE IDENTITY、
+        //   再帰CTE の SEARCH / CYCLE、IN のインデックス活用、定数列の命名、
+        //   および UI（結果グリッドの行追加・削除、クエリ履歴パネル）
+        // ============================================================
+        ...getV25Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v26.js の getV26Tests()
+        //   v1.21: GROUP BY 結果へのウィンドウ関数、列レベル COLLATE の実効化、
+        //   ORDER BY ALL / GROUPING_ID、ALTER COLUMN の標準綴りと USING、
+        //   RENAME CONSTRAINT、INSERT ... OVERRIDING VALUE、JOIN LATERAL ... ON TRUE、
+        //   1 始まりの添字とスライス、文単位の警告と SHOW WARNINGS、
+        //   および UI（エディタタブ、警告のコンソール出力）
+        // ============================================================
+        ...getV26Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v27.js の getV27Tests()
+        //   v1.22: 日付演算（日付 ± 数値 / 日付 - 日付）、Oracle の階層問い合わせ
+        //   （CONNECT BY / LEVEL / SYS_CONNECT_BY_PATH）と ROWNUM、分析関数
+        //   （RATIO_TO_REPORT / PERCENTILE_* OVER / NTH_VALUE FROM LAST / KEEP）、
+        //   TRUNCATE の複数表指定、CREATE INDEX の INCLUDE / CONCURRENTLY、
+        //   ADD COLUMN の生成列、SET CONSTRAINTS、upsert の RETURNING、
+        //   PostgreSQL の照合演算子、および UI（列プロファイル・ER 図）
+        // ============================================================
+        ...getV27Tests(),
 
         // Cleanup (New Features)
         { name: "Drop View Stats", sql: "DROP VIEW v_stats", check: r => true },

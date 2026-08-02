@@ -24,8 +24,11 @@
             autoIncrementCol: t.autoIncrementCol,
             checks: t.checks,
             compositeKeys: t.compositeKeys,
+            constraintNames: t.constraintNames,
             generatedCols: t.generatedCols,
             onUpdateNowCols: t.onUpdateNowCols || [],
+            identityFloor: t.identityFloor || 1,
+            collations: t.collations,
             // 差分保存用の指紋。前回保存時と同じなら中身は書き直さない
             // （変更世代・行数・容量の3点。値の上書きは version、行の増減は rowCount が拾う）
             fp: `${t.version || 0}:${t.rowCount}:${t.capacity}`,
@@ -39,6 +42,8 @@
           }
         }
         dump.__views__ = Object.assign(Object.create(null), this.views);
+        dump.__viewmeta__ = JSON.parse(JSON.stringify(this.viewMeta || {}));
+        dump.__domains__ = JSON.parse(JSON.stringify(this.domains || {}));
         dump.__procedures__ = JSON.parse(JSON.stringify(this.procedures));
         dump.__triggers__ = JSON.parse(JSON.stringify(this.triggers));
         dump.__sequences__ = JSON.parse(JSON.stringify(this.sequences));
@@ -55,6 +60,8 @@
         this.tables = Object.create(null);
         this._attachEngineRef(); // 相関サブクエリ用のエンジン参照を張り直す
         this.views = Object.assign(Object.create(null), (dump && dump.__views__) || {});
+        this.viewMeta = Object.assign(Object.create(null), (dump && dump.__viewmeta__) ? JSON.parse(JSON.stringify(dump.__viewmeta__)) : {});
+        this.domains = Object.assign(Object.create(null), (dump && dump.__domains__) ? JSON.parse(JSON.stringify(dump.__domains__)) : {});
         this.procedures = Object.assign(Object.create(null), (dump && dump.__procedures__) ? JSON.parse(JSON.stringify(dump.__procedures__)) : {});
         this.triggers = Object.assign(Object.create(null), (dump && dump.__triggers__) ? JSON.parse(JSON.stringify(dump.__triggers__)) : {});
         this.sequences = Object.assign(Object.create(null), (dump && dump.__sequences__) ? JSON.parse(JSON.stringify(dump.__sequences__)) : {});
@@ -94,6 +101,9 @@
           t.compositeKeys = Array.isArray(dt.compositeKeys) ? dt.compositeKeys.map(ck => ({ cols: [...ck.cols], isPK: !!ck.isPK })) : [];
           t.generatedCols = Object.assign(Object.create(null), dt.generatedCols || {});
           t.onUpdateNowCols = Array.isArray(dt.onUpdateNowCols) ? [...dt.onUpdateNowCols] : [];
+          t.constraintNames = Object.assign(Object.create(null), dt.constraintNames || {});
+          t.identityFloor = dt.identityFloor || 1;
+          t.collations = Object.assign(Object.create(null), dt.collations || {});
           t.rebuildIndices();
           // PK / UNIQUE の自動インデックスに加え、ユーザー作成インデックスも復元する
           [...(t.primaryKey ? [t.primaryKey] : []), ...t.uniqueCols, ...(dt.indexCols || [])].forEach(c => { if (t.cols[c]) t.createIndex(c); });
@@ -206,20 +216,26 @@
               if (t.generatedCols && c in t.generatedCols) {
                   return def + ` GENERATED ALWAYS AS (${t.generatedCols[c]}) STORED`;
               }
+              if (t.collations && t.collations[c]) def += ` COLLATE ${t.collations[c]}`;
               if (t.primaryKey === c) def += ' PRIMARY KEY';
               else if (t.uniqueCols && t.uniqueCols.includes(c)) def += ' UNIQUE';
               if (t.autoIncrementCol === c) def += ' AUTO_INCREMENT';
               if (t.notNullCols && t.notNullCols.includes(c)) def += ' NOT NULL';
               if (t.defaults && c in t.defaults) {
                   const dv = t.defaults[c];
-                  def += ` DEFAULT ${this._isNowMarker(dv) ? 'CURRENT_TIMESTAMP' : (typeof dv === 'string' ? this._quoteLiteral(dv) : dv)}`;
+                  // 式 DEFAULT はテキストのまま、文字列リテラルは引用して出す
+                  def += ` DEFAULT ${this._isNowMarker(dv) ? 'CURRENT_TIMESTAMP'
+                      : (this._isExprDefault(dv) ? dv.__expr : (typeof dv === 'string' ? this._quoteLiteral(dv) : dv))}`;
               }
               return def;
           });
 
           if (t.foreignKeys && t.foreignKeys.length > 0) {
               t.foreignKeys.forEach(fk => {
-                  let def = `FOREIGN KEY (${fk.col}) REFERENCES ${fk.refTable}(${fk.refCol})`;
+                  // 複合 FK は { cols, refCols }、単一列は { col, refCol }
+                  const fkCols = (fk.cols || [fk.col]).join(', ');
+                  const refCols = (fk.refCols || [fk.refCol]).join(', ');
+                  let def = `${fk.name ? `CONSTRAINT ${fk.name} ` : ''}FOREIGN KEY (${fkCols}) REFERENCES ${fk.refTable}(${refCols})`;
                   // 既定(RESTRICT)以外の参照アクションのみ明示的に出力する
                   if (fk.onDelete && fk.onDelete !== 'RESTRICT') def += ` ON DELETE ${fk.onDelete}`;
                   if (fk.onUpdate && fk.onUpdate !== 'RESTRICT') def += ` ON UPDATE ${fk.onUpdate}`;
@@ -278,7 +294,8 @@
           }
           // ビュー定義を出力（プロシージャは本体に';'を含むためSQLエクスポート対象外）
           for (let vName in this.views) {
-              sqlLines.push(`CREATE VIEW ${vName} AS ${this.views[vName]};`);
+              const vm = (this.viewMeta && this.viewMeta[vName]) ? ` WITH ${this.viewMeta[vName].checkOption} CHECK OPTION` : '';
+              sqlLines.push(`CREATE VIEW ${vName} AS ${this.views[vName]}${vm};`);
           }
           // シーケンス定義と現在値（SETVAL で再インポート時に採番位置を復元する）
           for (const sn in this.sequences) {
