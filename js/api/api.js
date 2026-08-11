@@ -239,7 +239,15 @@
             if (list.length === 0 || list.some(r => !r || typeof r !== 'object' || Array.isArray(r))) {
                 return { error: `${verb === 'INSERT INTO' ? 'insert' : 'upsert'}() requires a row object or a non-empty array of row objects.` };
             }
-            const cols = Object.keys(list[0]);
+            // 列は全行のキーの和集合。先頭行のキーだけを見ると、後続行にしか無い
+            // 項目が無警告で捨てられていた（行ごとに項目が違う JSON の取り込みで実害）
+            const cols = [];
+            const seenCol = new Set();
+            for (const r of list) {
+                for (const k of Object.keys(r)) {
+                    if (!seenCol.has(k)) { seenCol.add(k); cols.push(k); }
+                }
+            }
             if (cols.length === 0) return { error: 'Row object has no columns.' };
             if (!cols.every(_validIdent)) return { error: 'Invalid column name.' };
             const params = [];
@@ -302,6 +310,15 @@
             this._ownsTx = true;
             try {
                 const value = fn(this);
+                // async 関数を渡されると fn() は Promise を返すだけで、中の書き込みは
+                // まだ走っていない。そのまま COMMIT すると「空のトランザクション」を
+                // 確定し、以降の書き込みは保護されない（原子性が無い・例外も失われる）。
+                // 同期実行しかできない設計なので、黙って壊れるより明示的に拒否する
+                if (value && typeof value.then === 'function') {
+                    db.executeQuery('ROLLBACK');
+                    this._ownsTx = false;
+                    return { error: 'transaction() requires a synchronous callback. An async function returns before its writes run, so the transaction cannot be atomic. Await your work first, then call transaction() with a synchronous function.' };
+                }
                 const c = db.executeQuery('COMMIT');
                 if (c.error) return { error: c.error };
                 if (typeof renderTree === 'function') renderTree();

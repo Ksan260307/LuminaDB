@@ -129,6 +129,12 @@
                           strMap.push(this._quoteLiteral(v));
                           return `__STR_${strMap.length - 1}__`;
                       }
+                      // NULL は必ず 'NULL' という綴りへ落とす。素の null を返すと
+                      // Array#join が空文字へ変えてしまい、値リストから NULL が
+                      // 「消える」＝`x NOT IN (SELECT ...)` が SQL 標準と違って行を返す
+                      // （リテラルの `NOT IN (2, NULL)` は正しく空を返していたので
+                      //   サブクエリ形だけが黙って誤っていた）
+                      if (v === null || v === undefined) return 'NULL';
                       return v;
                   };
                   // 左辺が行コンストラクタ `(a, b) IN (SELECT a, b FROM ...)` の場合は
@@ -145,6 +151,12 @@
                           return '(' + cells.map(lit).join(', ') + ')';
                       }).join(', ');
                   } else {
+                      // 単一オペランドの IN / 量化比較に 2 列以上返すサブクエリを渡すのは
+                      // 誤り。従来は 1 列目だけを使って残りを黙って捨てていた
+                      const ncols = subResult.data.length > 0 ? Object.keys(subResult.data[0]).length : 1;
+                      if (ncols !== 1) {
+                          throw new Error(`Operand should contain 1 column(s), but the subquery returns ${ncols}.`);
+                      }
                       valsStr = subResult.data.map(r => lit(Object.values(r)[0])).join(', ');
                   }
                   expandedSql = expandedSql.slice(0, match.start) + `(${valsStr})` + expandedSql.slice(match.end + 1);
@@ -161,6 +173,16 @@
                   this._materializeRows(tmpName, subResult.data, colNames);
                   expandedSql = expandedSql.slice(0, match.start) + tmpName + after;
               } else {
+                  // スカラーサブクエリ: 2 行以上返したら黙って先頭行を使うのではなくエラーにする。
+                  // 実DB（MySQL 1242 / PostgreSQL / SQL Server）はいずれもエラーで、
+                  // 「先頭行を採用」は書き手が気づけない誤答になる
+                  if (subResult.data.length > 1) {
+                      throw new Error(`Subquery returned more than 1 row (${subResult.data.length} rows). A scalar subquery must return at most one row — add a WHERE, LIMIT 1, or an aggregate.`);
+                  }
+                  const scols = subResult.data.length > 0 ? Object.keys(subResult.data[0]).length : 1;
+                  if (scols !== 1) {
+                      throw new Error(`Operand should contain 1 column(s), but the subquery returns ${scols}.`);
+                  }
                   let val = subResult.data.length > 0 ? Object.values(subResult.data[0])[0] : null;
                   if (typeof val === 'string') {
                       strMap.push(this._quoteLiteral(val));
@@ -1302,6 +1324,25 @@
 
       // トップレベル（括弧の外）の UNION [ALL] / INTERSECT / EXCEPT でクエリを分割する
       // 各セグメントの op は「直前のセグメントとの結合方法」を表す（先頭は null）
+      // 集合演算の各枝を括弧で囲む書き方 `(SELECT ...) UNION (SELECT ...)` を受け付けるため、
+      // 枝全体を包む冗長な括弧だけを外す（従来は構文エラーになっていた）。
+      // 括弧が全体を包んでいない場合や中身が SELECT 系でない場合は触らない
+      _stripSetOpParens(s) {
+          let t = String(s).trim();
+          for (;;) {
+              if (!t.startsWith('(')) return t;
+              let depth = 0, close = -1;
+              for (let i = 0; i < t.length; i++) {
+                  if (t[i] === '(') depth++;
+                  else if (t[i] === ')') { depth--; if (depth === 0) { close = i; break; } }
+              }
+              if (close === -1) return t;
+              const inner = t.slice(1, close).trim();
+              if (!/^(select|with|values|table)\b/i.test(inner)) return t;
+              t = (inner + t.slice(close + 1)).trim();
+          }
+      },
+
       _splitUnion(sql) {
           const parts = [];
           let depth = 0, segStart = 0, i = 0;
@@ -1314,7 +1355,7 @@
                   // MINUS / MINUS ALL は Oracle における EXCEPT の別名
                   const m = sql.slice(i).match(/^(UNION\s+ALL|UNION\s+DISTINCT|UNION|INTERSECT\s+ALL|INTERSECT|EXCEPT\s+ALL|EXCEPT|MINUS\s+ALL|MINUS)\b/i);
                   if (m) {
-                      parts.push({ sql: sql.slice(segStart, i).trim(), op: pendingOp });
+                      parts.push({ sql: this._stripSetOpParens(sql.slice(segStart, i)), op: pendingOp });
                       pendingOp = m[1].toUpperCase().replace(/\s+/g, ' ').replace(/^MINUS/, 'EXCEPT');
                       i += m[0].length;
                       segStart = i;
@@ -1323,7 +1364,7 @@
               }
               i++;
           }
-          parts.push({ sql: sql.slice(segStart).trim(), op: pendingOp });
+          parts.push({ sql: this._stripSetOpParens(sql.slice(segStart)), op: pendingOp });
           return parts;
       },
 
@@ -1360,7 +1401,7 @@
           const oMatch = lastSql.match(/\s+order\s+by\s+([\s\S]+)$/i);
           if (oMatch) { orderByStr = oMatch[1]; lastSql = lastSql.substring(0, oMatch.index); }
           const restoreOver = (s) => s === null ? null : s.replace(/__OVER_(\d+)__/g, (mm, i) => overMap[i]).replace(/__AGGFN_(\d+)__/g, (mm, i) => aggMapU[i]);
-          segments[segments.length - 1].sql = restoreOver(lastSql).trim();
+          segments[segments.length - 1].sql = this._stripSetOpParens(restoreOver(lastSql));
           orderByStr = restoreOver(orderByStr);
 
           if (isExplain) {

@@ -69,7 +69,7 @@
         ["REPLACE('a-b-c', '-', '+')", 'a+b+c'], ["REPLACE('aaa', 'a', 'bb')", 'bbbbbb'],
         ["SUBSTRING('abcdef', 2, 3)", 'bcd'], ["SUBSTRING('abcdef', 4)", 'def'],
         ["SUBSTR('hello', 2, 2)", 'el'],
-        ["LPAD('5', 3, '0')", '005'], ["RPAD('5', 3, '0')", '500'], ["LPAD('abc', 2, 'x')", 'abc'],
+        ["LPAD('5', 3, '0')", '005'], ["RPAD('5', 3, '0')", '500'], ["LPAD('abc', 2, 'x')", 'ab'],
         ["REPEAT('ab', 3)", 'ababab'], ["REPEAT('x', 0)", ''],
         ["INSTR('hello', 'll')", 3], ["INSTR('hello', 'z')", 0],
         ["LOCATE('lo', 'hello')", 4], ["LOCATE('z', 'hello')", 0],
@@ -337,8 +337,8 @@
       // AVG/MIN/MAX を各しきい値のフィルタで
       [22, 25, 28, 31].forEach(t => {
         const f = U_ages.filter(a => a >= t);
-        // AVG はエンジン側で小数2桁へ丸められる（Number((sum/cnt).toFixed(2))）ので参照も合わせる
-        push(`V13Aggf avg ge ${t}`, `SELECT AVG(age) AS a FROM users WHERE age >= ${t}`, r => approx(r.data[0].a, f.length ? Number((f.reduce((x, y) => x + y, 0) / f.length).toFixed(2)) : 0));
+        // v1.27 から AVG は倍精度のまま返す（以前は小数2桁へ丸めていた）
+        push(`V13Aggf avg ge ${t}`, `SELECT AVG(age) AS a FROM users WHERE age >= ${t}`, r => approx(r.data[0].a, f.length ? (f.reduce((x, y) => x + y, 0) / f.length) : 0));
         push(`V13Aggf max ge ${t}`, `SELECT MAX(age) AS a FROM users WHERE age >= ${t}`, r => r.data[0].a === (f.length ? Math.max(...f) : null));
         push(`V13Aggf min ge ${t}`, `SELECT MIN(age) AS a FROM users WHERE age >= ${t}`, r => r.data[0].a === (f.length ? Math.min(...f) : null));
         push(`V13Aggf cnt ge ${t}`, `SELECT COUNT(*) AS c FROM users WHERE age >= ${t}`, r => r.data[0].c === f.length);

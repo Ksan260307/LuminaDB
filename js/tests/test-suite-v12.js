@@ -37,7 +37,10 @@
 
         // ---- 数値・ビット (V12Num) ----
         { name: "V12Num: Nanvl Number", sql: "SELECT NANVL(5, 0) AS a", check: r => r.data[0].a === 5 },
-        { name: "V12Num: Nanvl NaN", sql: "SELECT NANVL(0/0, -1) AS a", check: r => r.data[0].a === -1 },
+        // v1.25 で 0 除算が NULL になったため NaN の出どころを CAST に変えた
+        // （NANVL は NaN と NULL の両方を第2引数へ倒す Oracle 互換関数）
+        { name: "V12Num: Nanvl NaN", sql: "SELECT NANVL(SQRT(-1), -1) AS a", check: r => r.data[0].a === -1 },
+        { name: "V12Num: Nanvl Null Passes Through", sql: "SELECT NANVL(0/0, -1) AS a", check: r => r.data[0].a === null },
         { name: "V12Num: Remainder 11/4", sql: "SELECT REMAINDER(11, 4) AS a", check: r => r.data[0].a === -1 },
         { name: "V12Num: Remainder 10/3", sql: "SELECT REMAINDER(10, 3) AS a", check: r => r.data[0].a === 1 },
         { name: "V12Num: ShiftLeft", sql: "SELECT SHIFTLEFT(1, 4) AS a", check: r => r.data[0].a === 16 },

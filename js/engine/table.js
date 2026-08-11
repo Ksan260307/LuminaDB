@@ -42,6 +42,11 @@
             // 列の照合順序: col -> 'NOCASE' | 'NOACCENT' | 'NUMERIC' 等。
             // 指定された列は比較・並べ替え・一意性判定で正規化した値を使う
             this.collations = Object.create(null);
+            // 宣言された桁・長さ: col -> {kind:'DECIMAL', p, s} | {kind:'TEXT', len}
+            // 従来は DECIMAL(10,2) / VARCHAR(3) の指定を捨てていたため、
+            // 宣言が単なる飾りになっていた（CAST は正しく丸める / 切り詰めるのに、
+            // 格納時は素通し）。IDB 保存・cloneFull・列の改名 / 削除に追随させる
+            this.colTypeSpec = Object.create(null);
         }
 
         addColumn(col, type = 'ANY') {
@@ -60,27 +65,70 @@
             this.strMaps[col] = Object.create(null);
         }
 
+        // 式テキスト中の列参照だけを置換する（文字列リテラルの中身は触らない）。
+        // CHECK 制約・生成列の式は復元済みの SQL テキストなので、改名に追随させないと
+        // 「存在しない列」を参照し続けて、その表が挿入不能になる
+        static renameColRefs(text, oldCol, newCol) {
+            if (text == null) return text;
+            return String(text).replace(
+                /'(?:[^']|'')*'|"(?:[^"]|"")*"|\b[a-zA-Z_][a-zA-Z0-9_]*\b/g,
+                (m) => (m[0] === "'" || m[0] === '"') ? m : (m.toLowerCase() === oldCol ? newCol : m)
+            );
+        }
+
+        // 式テキストがその列を参照しているか（改名・削除の依存判定用）
+        static exprRefsCol(text, col) {
+            if (text == null) return false;
+            let hit = false;
+            String(text).replace(
+                /'(?:[^']|'')*'|"(?:[^"]|"")*"|\b[a-zA-Z_][a-zA-Z0-9_]*\b/g,
+                (m) => { if (m[0] !== "'" && m[0] !== '"' && m.toLowerCase() === col) hit = true; return m; }
+            );
+            return hit;
+        }
+
+        // キーの挿入順を保ったまま 1 つのキーだけ改名する。
+        // `delete` してから代入すると末尾へ移動し、`SELECT *` や DESCRIBE の
+        // 列順が変わってしまう（従来はこれで列順が壊れていた）
+        // 指定位取りへゼロから遠い方向で丸める。DECIMAL(p,s) 列の格納時に使う。
+        // 10^sc の乗算だと 1.005*100 が 100.49999... になる（1.005 が二進で表せない）ため、
+        // 指数表記の文字列を経由して小数点を移す — engine-expression の __round_scale と
+        // 同じ手順で、CAST と格納で結果が食い違わないようにしている
+        static _roundScale(n, sc) {
+            const str = String(n);
+            if (str.indexOf('e') !== -1 || str.indexOf('E') !== -1) {
+                const f = Math.pow(10, sc);
+                return Math.sign(n) * Math.round(Math.abs(n) * f) / f;
+            }
+            const shifted = Number(str + 'e' + sc);
+            if (!isFinite(shifted)) return n;
+            const rounded = Math.sign(shifted) * Math.round(Math.abs(shifted));
+            const back = Number(rounded + 'e' + (-sc));
+            return isFinite(back) ? back : n;
+        }
+
+        static _renameKeyInPlace(dict, oldKey, newKey) {
+            const out = Object.create(null);
+            for (const k in dict) out[k === oldKey ? newKey : k] = dict[k];
+            return out;
+        }
+
         renameColumn(oldCol, newCol) {
             this.version++;
             oldCol = oldCol.toLowerCase();
             newCol = newCol.toLowerCase();
             if (!this.cols[oldCol] || this.cols[newCol] || oldCol === newCol) return;
 
-            this.cols[newCol] = this.cols[oldCol];
-            delete this.cols[oldCol];
-
-            this.colTypes[newCol] = this.colTypes[oldCol];
-            delete this.colTypes[oldCol];
-
-            this.strPools[newCol] = this.strPools[oldCol];
-            delete this.strPools[oldCol];
-
-            this.strMaps[newCol] = this.strMaps[oldCol];
-            delete this.strMaps[oldCol];
+            this.cols = Table._renameKeyInPlace(this.cols, oldCol, newCol);
+            this.colTypes = Table._renameKeyInPlace(this.colTypes, oldCol, newCol);
+            if (this.colTypeSpec && oldCol in this.colTypeSpec) {
+                this.colTypeSpec = Table._renameKeyInPlace(this.colTypeSpec, oldCol, newCol);
+            }
+            this.strPools = Table._renameKeyInPlace(this.strPools, oldCol, newCol);
+            this.strMaps = Table._renameKeyInPlace(this.strMaps, oldCol, newCol);
 
             if (this.indices[oldCol]) {
-                this.indices[newCol] = this.indices[oldCol];
-                delete this.indices[oldCol];
+                this.indices = Table._renameKeyInPlace(this.indices, oldCol, newCol);
             }
 
             if (this.primaryKey === oldCol) this.primaryKey = newCol;
@@ -96,12 +144,26 @@
                 delete this.collations[oldCol];
             }
             if (this.generatedCols && oldCol in this.generatedCols) {
-                this.generatedCols[newCol] = this.generatedCols[oldCol];
-                delete this.generatedCols[oldCol];
+                this.generatedCols = Table._renameKeyInPlace(this.generatedCols, oldCol, newCol);
             }
+            // 生成列の「式」と CHECK 制約の「式」に出てくる旧列名も書き換える。
+            // ここを追随させないと `GENERATED ALWAYS AS (b*2)` / `CHECK (b > 0)` が
+            // 改名後に解決できず、正しい値の INSERT まで必ず失敗するようになる
+            if (this.generatedCols) {
+                for (const c in this.generatedCols) {
+                    this.generatedCols[c] = Table.renameColRefs(this.generatedCols[c], oldCol, newCol);
+                }
+            }
+            this.checks = (this.checks || []).map(ck => ({ ...ck, expr: Table.renameColRefs(ck.expr, oldCol, newCol) }));
             (this.compositeKeys || []).forEach(ck => {
                 ck.cols = ck.cols.map(c => c === oldCol ? newCol : c);
             });
+            // 名前付き制約の台帳（DROP CONSTRAINT の逆引きに使う）の列名も追随させる
+            for (const nm in (this.constraintNames || {})) {
+                const rec = this.constraintNames[nm];
+                if (rec && Array.isArray(rec.cols)) rec.cols = rec.cols.map(c => c === oldCol ? newCol : c);
+            }
+            this.onUpdateNowCols = (this.onUpdateNowCols || []).map(c => c === oldCol ? newCol : c);
             // 外部キーの参照元列名も追随させる（従来は取り残されて制約が効かなくなっていた）。
             // 単一列は { col }、複合列は { cols: [...] } の両形を持つ
             (this.foreignKeys || []).forEach(fk => {
@@ -115,6 +177,7 @@
             if (!this.cols[col]) return;
             delete this.cols[col];
             delete this.colTypes[col];
+            if (this.colTypeSpec) delete this.colTypeSpec[col];
             delete this.strPools[col];
             delete this.strMaps[col];
             delete this.indices[col];
@@ -129,6 +192,10 @@
             this.compositeKeys = (this.compositeKeys || []).filter(ck => !ck.cols.includes(col));
             // 同じ理由で、その列を含む外部キーも落とす（残すと存在しない列を参照し続ける）
             this.foreignKeys = (this.foreignKeys || []).filter(fk => !(fk.cols || [fk.col]).includes(col));
+            // その列を参照する CHECK 制約も落とす。残すと存在しない列を参照し続け、
+            // 以後この表への INSERT / UPDATE が必ず失敗するようになる（孤児制約）
+            this.checks = (this.checks || []).filter(ck => !Table.exprRefsCol(ck.expr, col));
+            this.onUpdateNowCols = (this.onUpdateNowCols || []).filter(c => c !== col);
         }
 
         // transform: 行ごとの新しい値の配列（ALTER COLUMN ... USING <expr> 用）。
@@ -253,6 +320,21 @@
                 }
             } else if (expectedType === 'TEXT') {
                 val = typeof val === 'object' ? JSON.stringify(val) : String(val);
+            }
+
+            // 宣言された桁・長さを適用する。CAST は以前から正しく丸め／切り詰めていたのに
+            // 格納時は素通しだったため、DECIMAL(10,2) の列に 123.4567 がそのまま入り、
+            // VARCHAR(3) に 8 文字が入っていた（宣言が飾りになっていた）
+            const spec = this.colTypeSpec && this.colTypeSpec[col];
+            if (spec && val !== null && val !== undefined) {
+                if (spec.kind === 'DECIMAL' && typeof val === 'number') {
+                    if (spec.s !== null) val = Table._roundScale(val, spec.s);
+                    if (spec.p !== null && spec.s !== null && Math.abs(val) >= Math.pow(10, spec.p - spec.s)) {
+                        throw new Error(`Out of range value ${val} for column '${col}' DECIMAL(${spec.p},${spec.s})`);
+                    }
+                } else if (spec.kind === 'TEXT' && typeof val === 'string' && spec.len !== null && val.length > spec.len) {
+                    throw new Error(`Data too long for column '${col}' (declared length ${spec.len}, got ${val.length})`);
+                }
             }
 
             // rowCount 以降は未使用領域（行削除後の残留データを含む）であり、
@@ -408,6 +490,7 @@
             t.autoIncrementCol = this.autoIncrementCol;
             t.checks = JSON.parse(JSON.stringify(this.checks || []));
             t.onUpdateNowCols = [...(this.onUpdateNowCols || [])];
+            t.colTypeSpec = JSON.parse(JSON.stringify(this.colTypeSpec || {}));
             t.version = this.version;
             t.compositeKeys = JSON.parse(JSON.stringify(this.compositeKeys || []));
             t.constraintNames = Object.assign(Object.create(null), JSON.parse(JSON.stringify(this.constraintNames || {})));

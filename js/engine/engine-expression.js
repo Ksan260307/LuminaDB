@@ -10,6 +10,81 @@
     // 引数で受け取り、シーケンス等は dbTables.__engine__ 経由でエンジンへ到達する）
     // ------------------------------------------------------------------------
 
+    // ------------------------------------------------------------------------
+    // 組み込み関数の引数個数（[最小, 最大]。最大 null は可変長）。
+    //
+    // ここに載せるのは「カンマ区切りの引数しか取らない」関数だけ。
+    // EXTRACT / CAST / TRIM / SUBSTRING / POSITION / OVERLAY のように
+    // キーワードで引数を区切る綴りを持つ関数は、1 引数と数えてしまうため載せない。
+    // 集計・ウィンドウ・ユーザー定義関数も対象外（_checkBuiltinArity 側で除外）。
+    // 表に無い名前は従来どおり寛容なままなので、この表は「増やすほど厳しくなる」だけで
+    // 既存の動作を狭めることはない
+    // ------------------------------------------------------------------------
+    const LUMINA_FN_ARITY = {
+        // 数値
+        ABS: [1, 1], SIGN: [1, 1], CEIL: [1, 1], CEILING: [1, 1], FLOOR: [1, 1],
+        SQRT: [1, 1], EXP: [1, 1], LN: [1, 1], LOG2: [1, 1], LOG10: [1, 1], LOG: [1, 2],
+        POWER: [2, 2], POW: [2, 2], MOD: [2, 2], ROUND: [1, 2], SQUARE: [1, 1],
+        GCD: [2, 2], LCM: [2, 2], FACTORIAL: [1, 1], CBRT: [1, 1],
+        SIN: [1, 1], COS: [1, 1], TAN: [1, 1], ASIN: [1, 1], ACOS: [1, 1], ATAN: [1, 1],
+        ATAN2: [2, 2], DEGREES: [1, 1], RADIANS: [1, 1], PI: [0, 0],
+        // 文字列
+        LOWER: [1, 1], UPPER: [1, 1], LCASE: [1, 1], UCASE: [1, 1],
+        LENGTH: [1, 1], CHAR_LENGTH: [1, 1], CHARACTER_LENGTH: [1, 1], OCTET_LENGTH: [1, 1],
+        LEFT: [2, 2], RIGHT: [2, 2], REVERSE: [1, 1], REPEAT: [2, 2], SPACE: [1, 1],
+        REPLACE: [3, 3], LPAD: [2, 3], RPAD: [2, 3], CONCAT_WS: [2, null],
+        INSTR: [2, 2], STRCMP: [2, 2], INITCAP: [1, 1], ASCII: [1, 1],
+        STARTS_WITH: [2, 2], ENDS_WITH: [2, 2], CHARINDEX: [2, 3], SPLIT_PART: [3, 3],
+        LEVENSHTEIN: [2, 2], TRANSLATE: [3, 3],
+        // 条件・NULL
+        NULLIF: [2, 2], IFNULL: [2, 2], ISNULL: [2, 2], NVL: [2, 2], NVL2: [3, 3],
+        COALESCE: [1, null], GREATEST: [1, null], LEAST: [1, null],
+        ZEROIFNULL: [1, 1], NULLIFZERO: [1, 1],
+        // 日付
+        YEAR: [1, 1], MONTH: [1, 1], DAY: [1, 1], HOUR: [1, 1], MINUTE: [1, 1], SECOND: [1, 1],
+        QUARTER: [1, 1], DAYOFWEEK: [1, 1], DAYOFYEAR: [1, 1], WEEKOFYEAR: [1, 1],
+        LAST_DAY: [1, 1], MONTHNAME: [1, 1], DAYNAME: [1, 1], DATEDIFF: [2, 3],
+        ADD_MONTHS: [2, 2], MONTHS_BETWEEN: [2, 2], DATE_FORMAT: [2, 2],
+        SEC_TO_TIME: [1, 1], TIME_TO_SEC: [1, 1], FROM_UNIXTIME: [1, 2],
+        // ハッシュ・符号化
+        MD5: [1, 1], SHA1: [1, 1], SHA256: [1, 1], SHA224: [1, 1], CRC32: [1, 1],
+        HEX: [1, 1], UNHEX: [1, 1], TO_BASE64: [1, 1], FROM_BASE64: [1, 1],
+        BIN: [1, 1], OCT: [1, 1], CONV: [3, 3],
+        // JSON
+        // JSON_TYPE は省略可能なパスを取る 2 引数形も受ける（実装に合わせる）
+        JSON_VALID: [1, 1], JSON_TYPE: [1, 2], JSON_DEPTH: [1, 1], JSON_LENGTH: [1, 2],
+        JSON_KEYS: [1, 2], JSON_PRETTY: [1, 1], JSON_QUOTE: [1, 1], JSON_UNQUOTE: [1, 1],
+        JSON_EXTRACT: [2, null], JSON_CONTAINS: [2, 3], JSON_SET: [3, null],
+        JSON_REMOVE: [2, null], JSON_ARRAY: [0, null], JSON_OBJECT: [0, null]
+    };
+
+    // 「AS を省いた後置別名」の判定に使う語彙（_trailingAlias）。
+    // ここに載る語が SELECT 項目の末尾に来ても別名とは見なさない。
+    // 例: `a IS NULL` の NULL / `INTERVAL 1 DAY` の DAY / `x COLLATE NOCASE` の NOCASE は
+    // 直前語判定で弾かれるが、`... IGNORE NULLS` の NULLS のように語自体で弾く必要もある
+    const LUMINA_NON_ALIAS_WORDS = new Set([
+        'null', 'true', 'false', 'unknown', 'not', 'and', 'or', 'is', 'in', 'like', 'ilike', 'rlike',
+        'regexp', 'similar', 'to', 'escape', 'collate', 'between', 'from', 'over', 'filter', 'within',
+        'group', 'by', 'keep', 'respect', 'ignore', 'nulls', 'first', 'last', 'desc', 'asc', 'distinct',
+        'all', 'any', 'some', 'end', 'then', 'else', 'when', 'case', 'zone', 'time', 'at', 'using',
+        'prior', 'interval', 'exists', 'unbounded', 'preceding', 'following', 'current', 'row', 'rows',
+        'range', 'groups', 'exclude', 'replace', 'ties', 'only', 'partition', 'separator', 'on', 'as',
+        'into', 'where', 'having', 'qualify', 'order', 'limit', 'offset', 'fetch', 'join', 'inner',
+        'left', 'right', 'full', 'cross', 'natural', 'outer', 'union', 'intersect', 'except', 'window',
+        'day', 'days', 'month', 'months', 'year', 'years', 'hour', 'hours', 'minute', 'minutes',
+        'second', 'seconds', 'week', 'weeks', 'quarter', 'quarters', 'microsecond', 'microseconds',
+        'millisecond', 'milliseconds', 'decade', 'century', 'millennium', 'epoch', 'dow', 'doy',
+        'timezone_hour', 'timezone_minute', 'isoyear', 'isodow', 'value', 'siblings', 'connect', 'start'
+    ]);
+    // 直後に被演算子が来る語。これが直前にあれば末尾の語は別名ではない
+    const LUMINA_OPERAND_EXPECTING_WORDS = new Set([
+        'not', 'and', 'or', 'is', 'in', 'like', 'ilike', 'rlike', 'regexp', 'similar', 'to', 'escape',
+        'collate', 'between', 'when', 'then', 'else', 'case', 'by', 'separator', 'from', 'at', 'zone',
+        'all', 'any', 'some', 'exists', 'prior', 'interval', 'distinct', 'over', 'filter', 'within',
+        'using', 'on', 'as', 'partition', 'order', 'group', 'where', 'having', 'select', 'preceding',
+        'following', 'unbounded', 'row', 'rows', 'range', 'groups', 'exclude', 'keep', 'respect', 'ignore'
+    ]);
+
     // CAST / CONVERT / '::' が受け付ける型名 -> __cast の正準名。
     // 商用DBの型名は方言ごとに別名が多い（INT4/INT8/NUMBER/VARCHAR2/NVARCHAR ...）ため
     // ここへ寄せる。ここに無い型名は「変換せず素通し」になる
@@ -26,7 +101,10 @@
         'STRING': 'TEXT', 'CLOB': 'TEXT', 'NCLOB': 'TEXT',
         'LONGTEXT': 'TEXT', 'MEDIUMTEXT': 'TEXT', 'TINYTEXT': 'TEXT',
         'BOOL': 'BOOLEAN', 'BOOLEAN': 'BOOLEAN',
-        'DATE': 'DATE', 'DATETIME': 'DATE', 'DATETIME2': 'DATE', 'SMALLDATETIME': 'DATE', 'TIMESTAMP': 'DATE',
+        // DATE は「日付だけ」、DATETIME / TIMESTAMP は「日付＋時刻」。同じ正準名にすると
+        // CAST(x AS DATE) が時刻を残してしまい、日次 GROUP BY が 1 日を時刻ごとに割ってしまう
+        'DATE': 'DATEONLY',
+        'DATETIME': 'DATE', 'DATETIME2': 'DATE', 'SMALLDATETIME': 'DATE', 'TIMESTAMP': 'DATE',
         'TIME': 'TIME'
     };
 
@@ -81,10 +159,85 @@
                   if (idx === undefined || idx === null || idx === -1) return null;
                   return dbs[actualTbl].getValue(cName, idx);
               };
+              // 3値論理の NOT。UNKNOWN(null) の否定は UNKNOWN のまま。
+              // `NOT LIKE` などで `!null === true` になると、値が NULL の行まで
+              // 拾ってしまう（実DBは NULL 行を返さない）
+              const __not3 = (v) => (v === null || v === undefined) ? null : !v;
+              // 3値論理の比較。どちらかが NULL / undefined なら UNKNOWN(null)。
+              // WHERE / ON / HAVING / CHECK はいずれも「真のときだけ通す」ので、
+              // null が返れば自然に「その行は対象外」になる
+              const __nul = (v) => v === null || v === undefined;
+              // IN の 3 値論理: 左辺が NULL なら UNKNOWN。一致が無くてもリストに
+              // NULL が含まれていれば UNKNOWN（NOT IN が真にならない＝実DBと同じ）
+              const __in = (v, list) => {
+                  if (v === null || v === undefined) return null;
+                  let sawNull = false;
+                  for (const x of list) {
+                      if (x === null || x === undefined) { sawNull = true; continue; }
+                      if (x === v) return true;
+                  }
+                  return sawNull ? null : false;
+              };
+              // 算術の NULL 伝播。SQL では被演算子に NULL があれば結果は NULL
+              const __num = (v) => (typeof v === 'number') ? v : Number(v);
+              const __add = (a, b) => (__nul(a) || __nul(b)) ? null : __num(a) + __num(b);
+              const __sub = (a, b) => (__nul(a) || __nul(b)) ? null : __num(a) - __num(b);
+              const __mul = (a, b) => (__nul(a) || __nul(b)) ? null : __num(a) * __num(b);
+              // 0 除算は MySQL 同様 NULL（例外にすると行評価の catch に飲まれて判らなくなる）
+              const __divf = (a, b) => (__nul(a) || __nul(b) || __num(b) === 0) ? null : __num(a) / __num(b);
+              const __modf = (a, b) => (__nul(a) || __nul(b) || __num(b) === 0) ? null : __num(a) % __num(b);
+              const __neg = (a) => __nul(a) ? null : -__num(a);
+              const __isnull = (v) => v === null || v === undefined;
+              const __notnull = (v) => !(v === null || v === undefined);
+              // 日付・日時の比較は「文字列としての並び」ではなく時刻で行う。
+              // '2026-01-02'（DATE 列 / CAST(x AS DATE)）と '2026-01-02 00:00:00'
+              // （DATETIME 列 / TIMESTAMP リテラル）は同じ瞬間を指すが、素の文字列比較では
+              // 長さの違いで不一致になってしまう
+              const __DATEISH = /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?)?$/;
+              const __dnum = (v) => {
+                  if (v instanceof Date) return v.getTime();
+                  if (typeof v === 'string' && __DATEISH.test(v)) {
+                      const d = __date_parse(v);
+                      return (d && !isNaN(d.getTime())) ? d.getTime() : NaN;
+                  }
+                  return NaN;
+              };
+              // 両辺が日付らしければ時刻へ寄せた組を返す。そうでなければ型の混在を揃える。
+              //
+              // `=` / `<>` は `===` / `!==` を使うため型が違うと必ず不一致になる一方、
+              // `<` `<=` `>` `>=` は JS の関係演算子が暗黙変換するので、同じ 2 値に対して
+              // 6 つの比較演算子が食い違っていた（`ok = 1` が 0 件なのに `ok > 0` は真、
+              // `'10' = 10` が偽なのに `'10' >= 10` は真）。MySQL に合わせて数値へ寄せる。
+              // 空文字は数値化しない（`'' = 0` は偽のまま）
+              const __cpair = (a, b) => {
+                  const x = __dnum(a), y = __dnum(b);
+                  if (!isNaN(x) && !isNaN(y)) return [x, y];
+                  if (typeof a === typeof b) return [a, b];
+                  const numOf = (v) => {
+                      if (typeof v === 'number') return v;
+                      if (typeof v === 'boolean') return v ? 1 : 0;
+                      if (typeof v === 'string') {
+                          const t = v.trim();
+                          if (t === '') return NaN;
+                          const n = Number(t);
+                          return isFinite(n) ? n : NaN;
+                      }
+                      return NaN;
+                  };
+                  const na = numOf(a), nb = numOf(b);
+                  return (isNaN(na) || isNaN(nb)) ? [a, b] : [na, nb];
+              };
+              const __eq = (a, b) => { if (__nul(a) || __nul(b)) return null; const p = __cpair(a, b); return p[0] === p[1]; };
+              const __ne = (a, b) => { if (__nul(a) || __nul(b)) return null; const p = __cpair(a, b); return p[0] !== p[1]; };
+              const __lt = (a, b) => { if (__nul(a) || __nul(b)) return null; const p = __cpair(a, b); return p[0] < p[1]; };
+              const __le = (a, b) => { if (__nul(a) || __nul(b)) return null; const p = __cpair(a, b); return p[0] <= p[1]; };
+              const __gt = (a, b) => { if (__nul(a) || __nul(b)) return null; const p = __cpair(a, b); return p[0] > p[1]; };
+              const __ge = (a, b) => { if (__nul(a) || __nul(b)) return null; const p = __cpair(a, b); return p[0] >= p[1]; };
               const __like = (val, pattern, esc) => {
                  // LIKE パターン照合。esc 指定時（LIKE ... ESCAPE 'c'）はエスケープ文字の
                  // 直後の1文字（% _ エスケープ文字自身など）をリテラルとして扱う
-                 if (val === null || val === undefined || pattern == null) return false;
+                 // 値かパターンが NULL なら結果は UNKNOWN(null)。WHERE では偽として扱う
+                 if (val === null || val === undefined || pattern == null) return null;
                  const p = String(pattern);
                  const e = esc != null ? String(esc) : null;
                  const quote = (c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -114,7 +267,8 @@
               const __op_nregex = (a, b) => { const r = __op_regex(a, b); return r === null ? null : !r; };
               const __op_niregex = (a, b) => { const r = __op_iregex(a, b); return r === null ? null : !r; };
               const __ilike = (val, pattern, esc) => {
-                 if (val === null || val === undefined || pattern == null) return false;
+                 // NULL は UNKNOWN(null)。__like と揃える（NOT ILIKE が NULL 行を拾わないように）
+                 if (val === null || val === undefined || pattern == null) return null;
                  const p = String(pattern);
                  const e = esc != null ? String(esc) : null;
                  const quote = (c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -132,7 +286,7 @@
               // (| * + ? {} () []) を併用するパターン。全体一致で判定する。
               // '.' や '^' '$' はリテラル扱い（標準では正規表現メタ文字ではない）
               const __similar = (val, pattern) => {
-                  if (val === null || val === undefined || pattern == null) return false;
+                  if (val === null || val === undefined || pattern == null) return null;
                   const p = String(pattern);
                   if (p.length > 1000) throw new Error("SIMILAR TO pattern too long (max 1000 characters).");
                   let re = '', i = 0;
@@ -156,7 +310,18 @@
               };
               const __upper = (val) => val != null ? String(val).toUpperCase() : null;
               const __lower = (val) => val != null ? String(val).toLowerCase() : null;
+              // サロゲートペア（絵文字など BMP 外の文字）を含むか。
+              // 含まない文字列（ASCII / 日本語などの BMP）は従来どおり符号単位の
+              // 高速経路を通すので、性能は変わらない
+              const __HAS_SURROGATE = /[\uD800-\uDBFF]/;
               const __length = (val) => val != null ? String(val).length : null;
+              // CHAR_LENGTH / CHARACTER_LENGTH は「文字数」。符号単位で数えると
+              // 絵文字 1 個が 2 と数えられていた（MySQL utf8mb4 は 1 と数える）
+              const __char_length = (val) => {
+                  if (val == null) return null;
+                  const cs = String(val);
+                  return __HAS_SURROGATE.test(cs) ? Array.from(cs).length : cs.length;
+              };
               // ROUND(x [, d]): 精度指定付き・ゼロから遠い方向への丸め（MySQL互換。JSのMath.roundは負数で挙動が異なる）
               const __round = (val, d) => {
                   if (val == null) return null;
@@ -173,9 +338,24 @@
               const __substring = (val, start, len) => {
                   if (val == null) return null;
                   let str = String(val);
-                  let s = start > 0 ? start - 1 : 0;
-                  if (len !== undefined) return str.substr(s, len);
-                  return str.substr(s);
+                  // 位置・長さはコードポイントで数える（符号単位で切るとサロゲートペアが
+                  // 半分に割れ、絵文字が単独のサロゲート＝文字化けとして出ていた）
+                  const cps = __HAS_SURROGATE.test(str) ? Array.from(str) : null;
+                  const total = cps ? cps.length : str.length;
+                  // 開始位置は 1 始まり。負値は末尾から数える（MySQL / Oracle / SQLite 互換）。
+                  // 従来は負値を 0 に丸めていたため `SUBSTRING('abcdef', -3)` が全文を返していた
+                  let n = Math.trunc(Number(start));
+                  if (!isFinite(n)) n = 1;
+                  let s;
+                  if (n > 0) s = n - 1;
+                  else if (n < 0) s = Math.max(0, total + n);
+                  else s = 0;   // 0 は 1 と同じ扱い
+                  if (len !== undefined && len !== null) {
+                      const L = Math.trunc(Number(len));
+                      if (!isFinite(L) || L <= 0) return '';
+                      return cps ? cps.slice(s, s + L).join('') : str.substr(s, L);
+                  }
+                  return cps ? cps.slice(s).join('') : str.substr(s);
               };
               const __concat = (...args) => args.map(a => a != null ? String(a) : '').join('');
               const __concat_ws = (sep, ...args) => sep == null ? null : args.filter(a => a !== null && a !== undefined).map(String).join(String(sep));
@@ -197,7 +377,7 @@
                   return Math.trunc(Number(v) * f) / f;
               };
               const __regexp = (val, pattern) => {
-                  if (val === null || val === undefined || pattern == null) return false;
+                  if (val === null || val === undefined || pattern == null) return null;
                   try { return new RegExp(pattern).test(String(val)); } catch(e) { return false; }
               };
               const __replace = (val, search, replace) => val != null ? String(val).split(search).join(replace) : null;
@@ -206,14 +386,46 @@
               const __ceil = (val) => val != null ? Math.ceil(Number(val)) : null;
               const __floor = (val) => val != null ? Math.floor(Number(val)) : null;
               const __now = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
-              const __lpad = (str, len, pad) => str != null ? String(str).padStart(Number(len), pad != null ? String(pad) : ' ') : null;
-              const __rpad = (str, len, pad) => str != null ? String(str).padEnd(Number(len), pad != null ? String(pad) : ' ') : null;
+              // LPAD / RPAD は「目的の長さちょうど」にする関数なので、元が長ければ切り詰める
+              // （MySQL / PostgreSQL / Oracle いずれも切り詰める。padStart/padEnd だけでは
+              //   長い文字列がそのまま返り、桁揃えが崩れていた）
+              const __lpad = (str, len, pad) => {
+                  if (str == null) return null;
+                  const n = Math.trunc(Number(len));
+                  if (!isFinite(n) || n < 0) return null;
+                  const s0 = String(str);
+                  if (s0.length >= n) return s0.slice(0, n);
+                  const p0 = pad != null ? String(pad) : ' ';
+                  return p0 === '' ? s0 : s0.padStart(n, p0);
+              };
+              const __rpad = (str, len, pad) => {
+                  if (str == null) return null;
+                  const n = Math.trunc(Number(len));
+                  if (!isFinite(n) || n < 0) return null;
+                  const s0 = String(str);
+                  if (s0.length >= n) return s0.slice(0, n);
+                  const p0 = pad != null ? String(pad) : ' ';
+                  return p0 === '' ? s0 : s0.padEnd(n, p0);
+              };
               const __power = (base, exp) => (base != null && exp != null) ? Math.pow(Number(base), Number(exp)) : null;
               const __sqrt = (val) => val != null ? Math.sqrt(Number(val)) : null;
 
               const __date_parse = (val) => {
                   if (val == null) return null;
                   if (typeof val === 'string') {
+                      // 時刻だけの値 'HH:MM[:SS[.mmm]]'（TIME 列 / SEC_TO_TIME の出力）。
+                      // new Date('12:34:56') は Invalid Date なので、以前は
+                      // HOUR/MINUTE/SECOND/EXTRACT がすべて NULL を返していた
+                      // （TIME は列型として受理され TIME_TO_SEC も解釈できるのに、
+                      //   自分が作った TIME 値を自分で読めない状態だった）。
+                      // 1970-01-01 を土台に UTC で組む＝タイムゾーンに依らない
+                      const tm = /^(\d{1,2}):([0-5]\d)(?::([0-5]\d)(?:\.(\d{1,3}))?)?$/.exec(val.trim());
+                      if (tm) {
+                          const d0 = new Date(Date.UTC(1970, 0, 1, +tm[1], +tm[2], +(tm[3] || 0), +((tm[4] || '0') + '00').slice(0, 3)));
+                          // YEAR/MONTH/DAY は時刻値に対して NULL を返すべきなので目印を付ける
+                          d0.__timeOnly = true;
+                          return d0;
+                      }
                       let s = val.replace(' ', 'T');
                       if (s.indexOf('T') !== -1 && !s.endsWith('Z')) s += 'Z';
                       let d = new Date(s);
@@ -221,9 +433,16 @@
                   }
                   return new Date(val);
               };
-              const __year = (val) => val != null ? __date_parse(val).getUTCFullYear() : null;
-              const __month = (val) => val != null ? __date_parse(val).getUTCMonth() + 1 : null;
-              const __day = (val) => val != null ? __date_parse(val).getUTCDate() : null;
+              // 時刻のみの値に対する日付フィールドは NULL（MySQL と同じ）
+              const __dateFieldOf = (val, get) => {
+                  if (val == null) return null;
+                  const d = __date_parse(val);
+                  if (!d || isNaN(d.getTime()) || d.__timeOnly) return null;
+                  return get(d);
+              };
+              const __year = (val) => __dateFieldOf(val, d => d.getUTCFullYear());
+              const __month = (val) => __dateFieldOf(val, d => d.getUTCMonth() + 1);
+              const __day = (val) => __dateFieldOf(val, d => d.getUTCDate());
               const __hour = (val) => val != null ? __date_parse(val).getUTCHours() : null;
               const __minute = (val) => val != null ? __date_parse(val).getUTCMinutes() : null;
               const __second = (val) => val != null ? __date_parse(val).getUTCSeconds() : null;
@@ -307,8 +526,10 @@
               // AGE(a, b): 2 つの日時の差を 'Y years M mons D days' 形式で返す（PostgreSQL）
               const __age = (a, b) => {
                   if (a == null) return null;
-                  const d1 = __date_parse(a);
-                  const d2 = b == null ? new Date() : __date_parse(b);
+                  // 1 引数形 AGE(x) は PostgreSQL では current_date - x（過去日なら正）。
+                  // 従来は x - now として計算していたため符号が逆になっていた
+                  const d1 = b == null ? new Date() : __date_parse(a);
+                  const d2 = b == null ? __date_parse(a) : __date_parse(b);
                   if (!d1 || !d2 || isNaN(d1.getTime()) || isNaN(d2.getTime())) return null;
                   let hi = d1, lo = d2, sign = '';
                   if (d1.getTime() < d2.getTime()) { hi = d2; lo = d1; sign = '-'; }
@@ -542,8 +763,19 @@
               const __quarter = (v) => v != null ? Math.floor(__date_parse(v).getUTCMonth() / 3) + 1 : null;
               const __last_day = (v) => { if (v == null) return null; const d = __date_parse(v); const e = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)); return e.toISOString().slice(0, 10); };
 
-              const __ltrim = (v) => v != null ? String(v).replace(/^\s+/, '') : null;
-              const __rtrim = (v) => v != null ? String(v).replace(/\s+$/, '') : null;
+              // LTRIM/RTRIM は第2引数で「取り除く文字の集合」を受け取る（Oracle / PostgreSQL）。
+              // 従来は第2引数が黙って捨てられ、空白しか落とさずに誤った文字列を返していた
+              const __trim_set = (s0, chars, left, right) => {
+                  const set = new Set(String(chars));
+                  let a = 0, b = s0.length;
+                  if (left) while (a < b && set.has(s0[a])) a++;
+                  if (right) while (b > a && set.has(s0[b - 1])) b--;
+                  return s0.slice(a, b);
+              };
+              const __ltrim = (v, chars) => v == null ? null
+                  : (chars == null ? String(v).replace(/^\s+/, '') : __trim_set(String(v), chars, true, false));
+              const __rtrim = (v, chars) => v == null ? null
+                  : (chars == null ? String(v).replace(/\s+$/, '') : __trim_set(String(v), chars, false, true));
               const __ascii = (v) => v != null ? (String(v).length > 0 ? String(v).charCodeAt(0) : 0) : null;
               const __char = (...vs) => (vs.length === 0 || vs.some(v => v == null)) ? null : vs.map(v => String.fromCharCode(Math.trunc(Number(v)))).join('');
               const __sin = (v) => v != null ? Math.sin(Number(v)) : null;
@@ -569,10 +801,23 @@
                   return a !== b;
               };
               const __if = (c, a, b) => c ? a : b;
-              const __left = (s, n) => s != null ? String(s).slice(0, Math.max(0, Number(n))) : null;
-              const __right = (s, n) => { if (s == null) return null; const str = String(s); const k = Math.max(0, Number(n)); return k === 0 ? '' : str.slice(-k); };
+              // LEFT / RIGHT もコードポイント単位で切る（符号単位で切ると
+              // サロゲートペアが半分に割れて文字化けする）
+              const __left = (s, n) => {
+                  if (s == null) return null;
+                  const str = String(s), k = Math.max(0, Number(n));
+                  return __HAS_SURROGATE.test(str) ? Array.from(str).slice(0, k).join('') : str.slice(0, k);
+              };
+              const __right = (s, n) => {
+                  if (s == null) return null;
+                  const str = String(s); const k = Math.max(0, Number(n));
+                  if (k === 0) return '';
+                  return __HAS_SURROGATE.test(str) ? Array.from(str).slice(-k).join('') : str.slice(-k);
+              };
               const __instr = (s, sub) => (s != null && sub != null) ? String(s).indexOf(String(sub)) + 1 : null;
-              const __reverse = (s) => s != null ? String(s).split('').reverse().join('') : null;
+              // split('') は符号単位で割るのでサロゲートペアが壊れる（絵文字が文字化けする）。
+              // Array.from はコードポイント単位
+              const __reverse = (s) => s != null ? Array.from(String(s)).reverse().join('') : null;
               const __repeat = (s, n) => (s != null && n != null && Number(n) >= 0) ? String(s).repeat(Math.floor(Number(n))) : null;
               const __greatest = (...args) => args.some(v => v === null || v === undefined) ? null : args.reduce((x, y) => y > x ? y : x);
               const __least = (...args) => args.some(v => v === null || v === undefined) ? null : args.reduce((x, y) => y < x ? y : x);
@@ -644,6 +889,11 @@
                       const d = v instanceof Date ? v : __date_parse(v);
                       return (!d || isNaN(d.getTime())) ? null : d.toISOString().replace('T', ' ').slice(0, 19);
                   }
+                  if (t === 'DATEONLY') {
+                      // CAST(x AS DATE) は時刻を切り捨てる（DATETIME / TIMESTAMP は残す）
+                      const d = v instanceof Date ? v : __date_parse(v);
+                      return (!d || isNaN(d.getTime())) ? null : d.toISOString().slice(0, 10);
+                  }
                   if (t === 'TIME') {
                       const d = v instanceof Date ? v : __date_parse(v);
                       if (d && !isNaN(d.getTime())) return d.toISOString().slice(11, 19);
@@ -672,7 +922,16 @@
                   __seedState = (__seedState * 48271) % 2147483647;
                   return (__seedState - 1) / 2147483646;
               };
-              const __date = (val) => val != null ? new Date(val) : null;
+              // DATE(x) は「日付部分だけを取り出す」関数（MySQL）。
+              // 以前は new Date(val) をそのまま返していたため、(1) 時刻が切り落とされず、
+              // (2) 'YYYY-MM-DD HH:MM:SS' がローカル時刻として解釈されて JST では
+              // 9 時間ずれ、`GROUP BY DATE(ts)` の日付境界が 1 日手前へ寄っていた。
+              // __date_parse は 'Z' を補うのでタイムゾーンに依らない
+              const __date = (val) => {
+                  if (val == null) return null;
+                  const d = __date_parse(val);
+                  return (d && !isNaN(d.getTime())) ? d.toISOString().slice(0, 10) : null;
+              };
 
               // --- v1.1 追加関数群: 数値 / 文字列 ---
               const __log2 = (v) => (v != null && Number(v) > 0) ? Math.log2(Number(v)) : null;
@@ -685,8 +944,11 @@
               const __hex = (v) => {
                   if (v == null) return null;
                   if (typeof v === 'number') return (v < 0 ? BigInt.asUintN(64, BigInt(Math.trunc(v))).toString(16) : Math.trunc(v).toString(16)).toUpperCase();
+                  // 文字列は UTF-8 バイト列を 16 進化する（MySQL 互換）。
+                  // 従来は UTF-16 コードポイントを 2 桁で書いていたため、非 ASCII が
+                  // 1 バイトに潰れて UNHEX(HEX(x)) が元へ戻らなかった
                   let out = '';
-                  for (const ch of String(v)) out += ch.codePointAt(0).toString(16).toUpperCase().padStart(2, '0');
+                  for (const b of __utf8_bytes(String(v))) out += b.toString(16).toUpperCase().padStart(2, '0');
                   return out;
               };
               const __bin = (v) => {
@@ -1114,20 +1376,65 @@
                   if (p != null && String(p).length > 1000) throw new Error("REGEXP pattern too long (max 1000 characters).");
                   return p;
               };
-              const __regexp_replace = (s0, pat, rep) => {
+              // match_type（'i' 大小無視 / 'c' 区別 / 'm' 複数行 / 'n' ドットが改行に一致）を
+              // JS の正規表現フラグへ写す。MySQL / Oracle の第5引数に相当する
+              const __regexp_flags = (mt, base) => {
+                  let f = base || '';
+                  if (mt == null) return f;
+                  const t = String(mt);
+                  if (t.includes('i') && !f.includes('i')) f += 'i';
+                  if (t.includes('m') && !f.includes('m')) f += 'm';
+                  if (t.includes('n') && !f.includes('s')) f += 's';
+                  if (t.includes('c')) f = f.replace('i', '');
+                  return f;
+              };
+              // 第4引数 position（1 始まりの開始位置）と第5引数 occurrence（何個目）は
+              // 従来まったく解釈されず、指定しても常に「最初の一致」を返していた
+              const __regexp_nth = (str, re, occ) => {
+                  let m2, n = 0;
+                  const rg = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+                  while ((m2 = rg.exec(str)) !== null) {
+                      n++;
+                      if (n === occ) return m2;
+                      if (m2.index === rg.lastIndex) rg.lastIndex++;
+                  }
+                  return null;
+              };
+              const __regexp_replace = (s0, pat, rep, pos, occ, mt) => {
                   if (s0 == null || pat == null || rep == null) return null;
                   __regexp_guard(pat);
-                  try { return String(s0).replace(new RegExp(String(pat), 'g'), String(rep)); } catch (e) { return null; }
+                  try {
+                      const str = String(s0);
+                      const p = pos == null ? 1 : Math.trunc(Number(pos));
+                      if (!isFinite(p) || p < 1) return null;
+                      const head = str.slice(0, p - 1), tail = str.slice(p - 1);
+                      const o = occ == null ? 0 : Math.trunc(Number(occ));
+                      if (o === 0) return head + tail.replace(new RegExp(String(pat), __regexp_flags(mt, 'g')), String(rep));
+                      const re = new RegExp(String(pat), __regexp_flags(mt, ''));
+                      const m2 = __regexp_nth(tail, re, o);
+                      if (!m2) return str;
+                      return head + tail.slice(0, m2.index) + String(rep) + tail.slice(m2.index + m2[0].length);
+                  } catch (e) { return null; }
               };
-              const __regexp_substr = (s0, pat) => {
+              const __regexp_substr = (s0, pat, pos, occ, mt) => {
                   if (s0 == null || pat == null) return null;
                   __regexp_guard(pat);
-                  try { const m2 = String(s0).match(new RegExp(String(pat))); return m2 ? m2[0] : null; } catch (e) { return null; }
+                  try {
+                      const str = String(s0);
+                      const p = pos == null ? 1 : Math.trunc(Number(pos));
+                      if (!isFinite(p) || p < 1) return null;
+                      const tail = str.slice(p - 1);
+                      const re = new RegExp(String(pat), __regexp_flags(mt, ''));
+                      const o = occ == null ? 1 : Math.trunc(Number(occ));
+                      if (o < 1) return null;
+                      const m2 = __regexp_nth(tail, re, o);
+                      return m2 ? m2[0] : null;
+                  } catch (e) { return null; }
               };
-              const __regexp_like = (s0, pat) => {
+              const __regexp_like = (s0, pat, mt) => {
                   if (s0 == null || pat == null) return null;
                   __regexp_guard(pat);
-                  try { return new RegExp(String(pat)).test(String(s0)) ? 1 : 0; } catch (e) { return 0; }
+                  try { return new RegExp(String(pat), __regexp_flags(mt, '')).test(String(s0)) ? 1 : 0; } catch (e) { return 0; }
               };
               const __split_part = (s0, d, n) => {
                   if (s0 == null || d == null || n == null) return null;
@@ -1499,15 +1806,87 @@
                   }
                   return [h0, h1, h2, h3, h4].map(x => x.toString(16).padStart(8, '0')).join('');
               };
+              // SHA-2 系（SHA-256 / SHA-224）。crypto.subtle は非同期なので式評価では使えず、
+              // 同期実装を持つ。MySQL の SHA2(str, 224|256|0) と PostgreSQL/一般の SHA256() 相当。
+              // 384/512 は 64bit 演算が必要なため対応せず、明示的に NULL を返す
+              const __SHA256_K = [
+                  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+                  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+                  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+                  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+                  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+                  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+                  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+                  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+              ];
+              const __sha2_core = (input, h) => {
+                  const bytes = __utf8_bytes(String(input));
+                  const ml = bytes.length;
+                  bytes.push(0x80);
+                  while (bytes.length % 64 !== 56) bytes.push(0);
+                  const bitLen = ml * 8;
+                  for (let i = 7; i >= 0; i--) bytes.push(Math.floor(bitLen / Math.pow(2, 8 * i)) & 0xFF);
+                  const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;
+                  const H = h.slice();
+                  const w = new Array(64);
+                  for (let ch = 0; ch < bytes.length; ch += 64) {
+                      for (let i = 0; i < 16; i++) {
+                          w[i] = ((bytes[ch + 4 * i] << 24) | (bytes[ch + 4 * i + 1] << 16) | (bytes[ch + 4 * i + 2] << 8) | bytes[ch + 4 * i + 3]) >>> 0;
+                      }
+                      for (let i = 16; i < 64; i++) {
+                          const s0 = (rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3)) >>> 0;
+                          const s1 = (rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10)) >>> 0;
+                          w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+                      }
+                      let [a, b, c, d, e, f, g, hh] = H;
+                      for (let i = 0; i < 64; i++) {
+                          const S1 = (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) >>> 0;
+                          const chx = ((e & f) ^ (~e & g)) >>> 0;
+                          const t1 = (hh + S1 + chx + __SHA256_K[i] + w[i]) >>> 0;
+                          const S0 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) >>> 0;
+                          const maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+                          const t2 = (S0 + maj) >>> 0;
+                          hh = g; g = f; f = e; e = (d + t1) >>> 0;
+                          d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+                      }
+                      const upd = [a, b, c, d, e, f, g, hh];
+                      for (let i = 0; i < 8; i++) H[i] = (H[i] + upd[i]) >>> 0;
+                  }
+                  return H;
+              };
+              const __sha256 = (input) => {
+                  if (input == null) return null;
+                  const H = __sha2_core(input, [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+                  return H.map(x => x.toString(16).padStart(8, '0')).join('');
+              };
+              const __sha224 = (input) => {
+                  if (input == null) return null;
+                  const H = __sha2_core(input, [0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4]);
+                  return H.slice(0, 7).map(x => x.toString(16).padStart(8, '0')).join('');
+              };
+              const __sha2 = (input, bits) => {
+                  if (input == null) return null;
+                  const n = bits == null ? 256 : Math.trunc(Number(bits));
+                  if (n === 224) return __sha224(input);
+                  if (n === 0 || n === 256) return __sha256(input);
+                  return null;   // 384 / 512 は未対応（MySQL も未サポート幅は NULL を返す）
+              };
               const __octet_length = (v) => v != null ? __utf8_bytes(String(v)).length : null;
               const __bit_length = (v) => v != null ? __utf8_bytes(String(v)).length * 8 : null;
               const __unhex = (v) => {
                   if (v == null) return null;
                   const s0 = String(v);
                   if (s0.length % 2 !== 0 || /[^0-9a-fA-F]/.test(s0)) return null;
-                  let out = '';
-                  for (let i = 0; i < s0.length; i += 2) out += String.fromCharCode(parseInt(s0.slice(i, i + 2), 16));
-                  return out;
+                  const bytes = [];
+                  for (let i = 0; i < s0.length; i += 2) bytes.push(parseInt(s0.slice(i, i + 2), 16));
+                  // HEX と対になるよう UTF-8 として復号する（不正なバイト列は
+                  // Latin-1 相当の 1 バイト 1 文字へ落として往復を壊さない）
+                  try {
+                      if (typeof TextDecoder !== 'undefined') {
+                          return new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes));
+                      }
+                  } catch (e) { /* 不正な UTF-8 は下のフォールバックへ */ }
+                  return bytes.map(b => String.fromCharCode(b)).join('');
               };
               const __date_trunc = (unit, v) => {
                   // PostgreSQL 互換の DATE_TRUNC('unit', date)。WEEK は月曜始まり（ISO）
@@ -1605,8 +1984,21 @@
                   return res;
               };
               const __corr_exists = (k, ptrs, dbTables, aliases) => __corr_run(k, ptrs, dbTables, aliases).n > 0;
-              const __corr_scalar = (k, ptrs, dbTables, aliases) => { const r = __corr_run(k, ptrs, dbTables, aliases); return r.n > 0 ? r.first[0] : null; };
-              const __corr_in = (k, lhs, ptrs, dbTables, aliases) => (lhs === null || lhs === undefined) ? false : __corr_run(k, ptrs, dbTables, aliases).first.includes(lhs);
+              // 相関スカラーサブクエリ。2 行以上返したらエラー（非相関側と同じ規則）。
+              // 行評価の catch に飲まれて NULL に化けないよう __fatal を立てて上位へ伝播させる
+              const __corr_scalar = (k, ptrs, dbTables, aliases) => {
+                  const r = __corr_run(k, ptrs, dbTables, aliases);
+                  if (r.n > 1) {
+                      const e = new Error(`Subquery returned more than 1 row (${r.n} rows). A scalar subquery must return at most one row — add a WHERE, LIMIT 1, or an aggregate.`);
+                      e.__fatal = true;
+                      throw e;
+                  }
+                  return r.n > 0 ? r.first[0] : null;
+              };
+              // 相関 IN も 3 値論理（v1.24 で素の IN を直したときに、こちらが取り残されていた）。
+              // includes は SameValueZero なので NULL 同士が一致し、左辺 NULL で false を返すと
+              // `NOT IN` が NULL 行を拾ってしまう
+              const __corr_in = (k, lhs, ptrs, dbTables, aliases) => __in(lhs, __corr_run(k, ptrs, dbTables, aliases).first);
 
               // --- v1.1 追加関数群: メタ情報 ---
               const __uuid = () => (typeof crypto !== 'undefined' && crypto.randomUUID)
@@ -1648,10 +2040,22 @@
                   if (st < 1 || st > str.length || l < 0) return null;
                   return str.slice(0, st - 1) + (ins != null ? String(ins) : '') + str.slice(st - 1 + l);
               };
-              const __regexp_instr = (s, pat) => {
+              const __regexp_instr = (s, pat, pos, occ, retOpt, mt) => {
                   if (s == null || pat == null) return null;
                   __regexp_guard(pat);
-                  try { const m = String(s).match(new RegExp(String(pat))); return m ? m.index + 1 : 0; } catch (e) { return null; }
+                  try {
+                      const str = String(s);
+                      const p = pos == null ? 1 : Math.trunc(Number(pos));
+                      if (!isFinite(p) || p < 1) return null;
+                      const tail = str.slice(p - 1);
+                      const o = occ == null ? 1 : Math.trunc(Number(occ));
+                      if (o < 1) return null;
+                      const m = __regexp_nth(tail, new RegExp(String(pat), __regexp_flags(mt, '')), o);
+                      if (!m) return 0;
+                      // return_option 1 は「一致の直後の位置」（MySQL / Oracle）
+                      const base = p - 1 + m.index + 1;
+                      return (retOpt != null && Math.trunc(Number(retOpt)) === 1) ? base + m[0].length : base;
+                  } catch (e) { return null; }
               };
               // 数値
               const __square = (x) => x != null ? Number(x) * Number(x) : null;
@@ -1793,6 +2197,12 @@
               };
               const __to_timestamp = (s) => {
                   if (s == null) return null;
+                  // PostgreSQL / Oracle の TO_TIMESTAMP(数値) は **エポック秒**。
+                  // 従来は __date_parse がミリ秒として解釈し、2023年が 1970年台になっていた
+                  if (typeof s === 'number' && isFinite(s)) {
+                      const dn = new Date(Math.round(s * 1000));
+                      return isNaN(dn.getTime()) ? null : dn.toISOString().replace('T', ' ').slice(0, 19);
+                  }
                   const d = __date_parse(s);
                   return (d && !isNaN(d.getTime())) ? d.toISOString().replace('T', ' ').slice(0, 19) : null;
               };
@@ -1993,7 +2403,7 @@
                  __ilike, __similar, __concat_op, __setseed, __collate, __ft_tokens, __match_against,
                  __overlaps, __date_bin, __age, __is_json, __json_exists, __json_query,
                  __json_insert, __json_replace, __json_array_insert, __json_arrow, __json_arrow_text,
-                 __json_hash_arrow, __json_hash_arrow_text, __json_has_key, __json_contains_path, __is_bool,
+                 __json_hash_arrow, __json_hash_arrow_text, __json_has_key, __json_contains_path, __is_bool, __not3, __nul, __in, __DATEISH, __dnum, __cpair, __num, __add, __sub, __mul, __divf, __modf, __neg, __isnull, __notnull, __eq, __ne, __lt, __le, __gt, __ge,
                  __datecol,
                  __array, __toArray, __array_length, __array_position, __array_contains, __array_append,
                  __subscript, __array_slice,
@@ -2002,7 +2412,7 @@
                  __div, __safe_divide, __at_time_zone,
                  __dateadd, __datepart, __datename, __next_day, __nanvl, __remainder, __shiftleft, __shiftright, __to_hex, __parsename, __quote_ident, __quote_literal, __overlay, __sys_user, __current_schema, __newid, __sys_guid, __to_char, __to_char_number, __to_char_date, __normDatePart, __DATEPART_UNITS,
                  __quotename, __patindex, __bitand, __bitor, __bitxor, __bitnot, __isnumeric, __eomonth, __make_date, __make_timestamp, __to_number, __to_date, __to_timestamp,
-                 __decode, __nvl2, __zeroifnull, __nullifzero, __choose, __starts_with, __ends_with, __charindex, __len, __stuff, __regexp_instr, __square, __gcd, __lcm, __factorial, __width_bucket, __add_months, __months_between, __date_part, __sha1, __octet_length, __bit_length, __unhex, __date_trunc, __typeof, __regexp_count, __nextval, __currval, __setval, __colSuggest, __resolve, __like, __upper, __lower, __length, __round, __coalesce, __substring, __concat, __concat_ws, __substring_index, __locate, __truncate, __regexp, __replace, __trim, __abs, __ceil, __floor, __now, __lpad, __rpad, __power, __sqrt, __date_parse, __year, __month, __day, __hour, __minute, __second, __datediff, __interval, __add_interval, __date_add, __date_sub, __curdate, __dayofweek, __dayofyear, __quarter, __last_day, __ltrim, __rtrim, __ascii, __char, __sin, __cos, __tan, __sinh, __asin, __acos, __atan, __atan2, __degrees, __radians, __ln, __cbrt, __ifnull, __nullif, __is_distinct, __if, __left, __right, __instr, __reverse, __repeat, __greatest, __least, __exp, __log, __log10, __pi, __cast, __mod, __sign, __rand, __date, __log2, __cot, __format, __hex, __bin, __oct, __conv, __space, __strcmp, __elt, __field, __initcap, __MONTH_NAMES, __DAY_NAMES, __monthname, __dayname, __weekday, __week, __weekofyear, __unix_timestamp, __from_unixtime, __date_format, __extract, __timestampdiff, __json_parse, __json_path, __json_get, __json_extract, __json_array, __json_object, __json_length, __json_keys, __json_valid, __json_type, __json_contains_deep, __json_contains, __json_set, __json_remove, __regexp_guard, __regexp_replace, __regexp_substr, __regexp_like, __split_part, __quote, __bit_count, __sec_to_time, __time_to_sec, __makedate, __str_to_date, __time, __trim_dir, __utf8_bytes, __md5, __crc32, __B64_ALPHA, __to_base64, __from_base64, __inet_aton, __inet_ntoa, __soundex, __translate, __str_insert, __cosh, __tanh, __to_days, __from_days, __maketime, __curtime, __format_bytes, __timestampadd, __json_pretty, __json_quote, __json_unquote, __json_depth, __json_array_append, __json_merge_patch, __corr_run, __corr_exists, __corr_scalar, __corr_in, __uuid, __version, __database };
+                 __decode, __nvl2, __zeroifnull, __nullifzero, __choose, __starts_with, __ends_with, __charindex, __len, __stuff, __regexp_instr, __square, __gcd, __lcm, __factorial, __width_bucket, __add_months, __months_between, __date_part, __sha1, __sha2, __sha256, __sha224, __octet_length, __bit_length, __char_length, __unhex, __date_trunc, __typeof, __regexp_count, __nextval, __currval, __setval, __colSuggest, __resolve, __like, __upper, __lower, __length, __round, __coalesce, __substring, __concat, __concat_ws, __substring_index, __locate, __truncate, __regexp, __replace, __trim, __abs, __ceil, __floor, __now, __lpad, __rpad, __power, __sqrt, __date_parse, __year, __month, __day, __hour, __minute, __second, __datediff, __interval, __add_interval, __date_add, __date_sub, __curdate, __dayofweek, __dayofyear, __quarter, __last_day, __ltrim, __rtrim, __ascii, __char, __sin, __cos, __tan, __sinh, __asin, __acos, __atan, __atan2, __degrees, __radians, __ln, __cbrt, __ifnull, __nullif, __is_distinct, __if, __left, __right, __instr, __reverse, __repeat, __greatest, __least, __exp, __log, __log10, __pi, __cast, __mod, __sign, __rand, __date, __log2, __cot, __format, __hex, __bin, __oct, __conv, __space, __strcmp, __elt, __field, __initcap, __MONTH_NAMES, __DAY_NAMES, __monthname, __dayname, __weekday, __week, __weekofyear, __unix_timestamp, __from_unixtime, __date_format, __extract, __timestampdiff, __json_parse, __json_path, __json_get, __json_extract, __json_array, __json_object, __json_length, __json_keys, __json_valid, __json_type, __json_contains_deep, __json_contains, __json_set, __json_remove, __regexp_guard, __regexp_replace, __regexp_substr, __regexp_like, __split_part, __quote, __bit_count, __sec_to_time, __time_to_sec, __makedate, __str_to_date, __time, __trim_dir, __utf8_bytes, __md5, __crc32, __B64_ALPHA, __to_base64, __from_base64, __inet_aton, __inet_ntoa, __soundex, __translate, __str_insert, __cosh, __tanh, __to_days, __from_days, __maketime, __curtime, __format_bytes, __timestampadd, __json_pretty, __json_quote, __json_unquote, __json_depth, __json_array_append, __json_merge_patch, __corr_run, __corr_exists, __corr_scalar, __corr_in, __uuid, __version, __database };
     })();
     // コンパイル済み関数の先頭でヘルパーを一括束縛する分割代入文
     const __EXPR_PRELUDE = 'const { ' + Object.keys(__EXPR_LIB).join(', ') + ' } = __L;';
@@ -2019,6 +2429,21 @@
       // SQL標準の引用符二重化 ('' / "") も受理し、内部表現はバックスラッシュ
       // エスケープへ正規化する（JSソースへの再挿入時に安全な形式で統一するため）
       _maskStrings(sql, strMap) {
+          // 16 進リテラル `X'4869'` / `0x4869` を先に処理する。
+          // 従来はこの綴りを知らず、`X'DEADBEEF'` が「X」＋文字列リテラルに割れて
+          // **ソーステキストがそのまま列へ入り**（HEX() がその文字列を再符号化して
+          // 別の値を返す＝黙って壊れる）、裸の `SELECT X'41'` は
+          // "Column 'x__str_0__' not found." になっていた。
+          // MySQL と同じく `X'h'` は `UNHEX('h')` と同義に落とす（HEX との往復も成立する）
+          sql = sql.replace(/(^|[^a-zA-Z0-9_.$'"])(?:[xX]'([0-9a-fA-F]*)'|0[xX]([0-9a-fA-F]+))(?![0-9a-zA-Z_])/g,
+              (m, pre, q1, q2) => {
+                  const digits = (q1 !== undefined ? q1 : q2);
+                  if (digits.length % 2 !== 0) {
+                      throw new Error(`Invalid hex literal: '${digits}' has an odd number of digits.`);
+                  }
+                  strMap.push(`'${digits}'`);
+                  return `${pre}__unhex(__STR_${strMap.length - 1}__)`;
+              });
           return sql.replace(/('(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*")/g, match => {
               const q = match[0];
               const inner = match.slice(1, -1).replace(q === "'" ? /''/g : /""/g, '\\' + q);
@@ -2292,6 +2717,83 @@
       // 既存の `_rewriteCollate` が比較の右辺にも同じ照合を伝播させるので、
       // `WHERE nm = 'APPLE'` が NOCASE 列で正しく一致するようになる。
       // aliases: { 別名 -> 実表名 }。SELECT 句ではなく条件・並べ替え・グループ化に使う
+      // 修飾なしの列名が、いま見えている 2 つ以上の表に存在していたら拒否する。
+      //
+      // __resolve は `for (let alias in pts)` の**最初に見つかった表**を採って break する。
+      // つまり `SELECT SUM(amount) FROM orders o JOIN payments p ON ...` は、どちらの
+      // amount を足したのか書き手に判らないまま o.amount の合計を返していた。実DB
+      // （MySQL 1052 / PostgreSQL / SQLite）はいずれも「曖昧」として拒否する。
+      //
+      // __resolve は行ごとに走るホットパスなので、そこでは検査しない。別名 -> 実表の
+      // 対応が判っているコンパイル時に 1 度だけ見る。表が 1 つだけの問い合わせは
+      // そもそも曖昧になり得ないので即 return する（既存の大多数のクエリは無コスト）
+      _assertNoAmbiguousColumns(text, aliases) {
+          if (!text || !aliases) return text;
+          // 別名と実表名の両方がキーとして入っているので、実表名の集合で数える
+          const tableSet = new Set();
+          for (const a in aliases) if (aliases[a]) tableSet.add(String(aliases[a]).toLowerCase());
+          if (tableSet.size < 2) return text;
+
+          // 列名 -> それを持つ表名の一覧
+          const owners = Object.create(null);
+          for (const tn of tableSet) {
+              const t = this.tables[tn];
+              if (!t || !t.cols) continue;
+              for (const c in t.cols) {
+                  if (!owners[c]) owners[c] = [];
+                  if (!owners[c].includes(tn)) owners[c].push(tn);
+              }
+          }
+
+          const sm = [];
+          const s = this._maskStrings(text, sm);
+          // 修飾子つき (`a.col`)、関数呼び出し (`f(`)、内部トークンは対象外
+          const re = /\b([a-zA-Z_][a-zA-Z0-9_]*\s*\.\s*)?([a-zA-Z_][a-zA-Z0-9_]*)\b(\s*\()?/g;
+          let m;
+          while ((m = re.exec(s))) {
+              if (m[1] || m[3]) continue;                       // 修飾済み / 関数呼び出し
+              const name = m[2];
+              if (name.startsWith('__')) continue;              // 内部トークン
+              const lc = name.toLowerCase();
+              const own = owners[lc];
+              if (!own || own.length < 2) continue;
+              throw new Error(`Column '${name}' is ambiguous: it exists in ${own.join(' and ')}. Qualify it with a table name or alias.`);
+          }
+          return text;
+      },
+
+      // 条件式を「深さ 0 の AND」で分割する（述語の押し下げ用）。
+      // OR が深さ 0 に 1 つでもあれば分割しない（`a AND b OR c` は
+      // `a` だけを先に適用すると結果が変わるため）。文字列は退避してから見る
+      _splitTopLevelAnd(text) {
+          if (!text) return [];
+          const sm = [];
+          const s = this._maskStrings(text, sm);
+          const parts = [];
+          let depth = 0, last = 0;
+          const isWordBoundary = (i, len) => {
+              const before = i === 0 ? ' ' : s[i - 1];
+              const after = i + len >= s.length ? ' ' : s[i + len];
+              return !/[a-zA-Z0-9_]/.test(before) && !/[a-zA-Z0-9_]/.test(after);
+          };
+          for (let i = 0; i < s.length; i++) {
+              const ch = s[i];
+              if (ch === '(' || ch === '[') depth++;
+              else if (ch === ')' || ch === ']') depth--;
+              else if (depth === 0) {
+                  const rest = s.slice(i, i + 3).toLowerCase();
+                  if (rest === 'or ' && isWordBoundary(i, 2)) return [];   // 深さ0の OR があれば分割しない
+                  if (s.slice(i, i + 3).toLowerCase() === 'and' && isWordBoundary(i, 3)) {
+                      parts.push(s.slice(last, i));
+                      last = i + 3;
+                      i += 2;
+                  }
+              }
+          }
+          parts.push(s.slice(last));
+          return parts.map(p => this._restoreStrings(p, sm).trim()).filter(p => p !== '');
+      },
+
       _applyColumnCollations(text, aliases) {
           if (!text) return text;
           // 対象になる列名 -> 照合名（複数表で衝突する列名は曖昧なので対象外にする）
@@ -2472,7 +2974,7 @@
               if (txt.startsWith('__cast(', i)) {
                   const close = this._scanBalanced(txt, i + 6);
                   // __cast(x, 'DATE') と __cast(x, 'DATE', null, null) の両形
-                  if (close !== -1 && /,\s*'(?:DATE|DATETIME|TIMESTAMP)'\s*(?:,[^()]*)?\)$/i.test(txt.slice(i, close + 1))) return 6;
+                  if (close !== -1 && /,\s*'(?:DATEONLY|DATE|DATETIME|TIMESTAMP)'\s*(?:,[^()]*)?\)$/i.test(txt.slice(i, close + 1))) return 6;
               }
               return 0;
           };
@@ -2676,6 +3178,201 @@
       // '||' 連結演算子を __concat_op(...) へ畳む。括弧グループを内側から処理し、
       // 引数リストのトップレベルのカンマ区切りは保ったまま各要素を個別に畳む
       // （f(a || b, c) の展開で引数の切れ目を失わないため）
+      // 算術演算子を NULL 伝播するヘルパ呼び出しへ畳む。
+      //   a + b -> __add(a, b) / a - b -> __sub(a, b) / a * b -> __mul(a, b)
+      //   a / b -> __divf(a, b) / a % b -> __modf(a, b) / -a -> __neg(a)
+      // SQL では被演算子に NULL があれば結果は NULL。素の JS 演算子は null を 0 として
+      // 扱うため、`amt - qty` が qty=NULL のときに amt を返し、`amt * qty` が 0 を返して
+      // いた（その 0 が MIN に選ばれ、AVG の分母にも数えられる＝集計まで静かに狂う）。
+      // 比較の畳み込み（_rewriteCompareOps）より前に置くこと（算術のほうが強く結合する）
+      _rewriteArithOps(s) {
+          if (!/[+\-*/%]/.test(s)) return s;
+          const PREC = [['*', '/', '%'], ['+', '-']];
+          const FN = { '+': '__add', '-': '__sub', '*': '__mul', '/': '__divf', '%': '__modf' };
+          // 算術より優先順位の低い区切り。ここを跨いで畳んではいけない
+          const SEP = ['===', '!==', '<=', '>=', '&&', '||', '<', '>', '?', ':', ','];
+
+          // 単項マイナスの付いた被演算子を包む（数値リテラルはそのまま）
+          const unaryNeg = (atom) => {
+              const m = atom.match(/^(\s*)([+-])([\s\S]+)$/);
+              if (!m) return atom;
+              const inner = unaryNeg(m[2] === '-' ? m[3] : m[3]);
+              if (m[2] === '+') return m[1] + inner;
+              if (/^\s*\d/.test(m[3])) return atom;          // -3 / -1.5 はリテラルのまま
+              return `${m[1]}__neg(${inner.trim()})`;
+          };
+
+          // 1 つのオペランド領域（比較・論理を含まない範囲）の中で算術を畳む
+          const foldRegion = (text) => {
+              if (!/[+\-*/%]/.test(text)) return text;
+              const atoms = [], ops = [];
+              let cur = '', depth = 0;
+              for (let i = 0; i < text.length; i++) {
+                  const c = text[i];
+                  if (c === '(' || c === '[') { depth++; cur += c; continue; }
+                  if (c === ')' || c === ']') { depth--; cur += c; continue; }
+                  if (depth === 0 && (c === '+' || c === '-' || c === '*' || c === '/' || c === '%')) {
+                      // 指数表記の符号（1e-5 / 1E+5）は数値リテラルの一部
+                      if ((c === '+' || c === '-') && /\d[eE]$/.test(cur)) { cur += c; continue; }
+                      // 直前が空＝単項。被演算子側へ付ける
+                      if (cur.trim() === '') { cur += c; continue; }
+                      atoms.push(cur); ops.push(c); cur = '';
+                      continue;
+                  }
+                  cur += c;
+              }
+              atoms.push(cur);
+              if (ops.length === 0) return unaryNeg(atoms[0]);
+              if (atoms.some(a => a.trim() === '')) return text;   // 壊れた式は触らない
+
+              let a = atoms.map(unaryNeg), o = ops.slice();
+              for (const level of PREC) {
+                  const na = [a[0]], no = [];
+                  for (let i = 0; i < o.length; i++) {
+                      if (level.includes(o[i])) {
+                          const left = na.pop();
+                          na.push(`${FN[o[i]]}(${left.trim()}, ${a[i + 1].trim()})`);
+                      } else { no.push(o[i]); na.push(a[i + 1]); }
+                  }
+                  a = na; o = no;
+              }
+              let out = a[0];
+              for (let i = 0; i < o.length; i++) out += o[i] + a[i + 1];
+              return out;
+          };
+
+          // 深さ 0 を比較・論理で区切ってから、各領域を畳む
+          const foldLevel = (str) => {
+              const out = [];
+              let cur = '', depth = 0, i = 0;
+              while (i < str.length) {
+                  const c = str[i];
+                  if (c === '(' || c === '[') { depth++; cur += c; i++; continue; }
+                  if (c === ')' || c === ']') { depth--; cur += c; i++; continue; }
+                  if (depth === 0) {
+                      const sep = SEP.find(op => str.startsWith(op, i));
+                      if (sep) { out.push(foldRegion(cur)); out.push(sep); cur = ''; i += sep.length; continue; }
+                      if (c === '!' && str[i + 1] !== '=') { out.push(foldRegion(cur)); out.push('!'); cur = ''; i++; continue; }
+                  }
+                  cur += c; i++;
+              }
+              out.push(foldRegion(cur));
+              return out.join('');
+          };
+
+          const proc = (str) => {
+              let out = '', i = 0;
+              while (i < str.length) {
+                  const c = str[i];
+                  if (c === '(' || c === '[') {
+                      const close = c === '(' ? ')' : ']';
+                      let d = 0, j = i;
+                      for (; j < str.length; j++) {
+                          if (str[j] === c) d++;
+                          else if (str[j] === close) { d--; if (d === 0) break; }
+                      }
+                      if (j >= str.length) { out += str.slice(i); break; }
+                      out += c + proc(str.slice(i + 1, j)) + close;
+                      i = j + 1;
+                      continue;
+                  }
+                  out += c; i++;
+              }
+              return foldLevel(out);
+          };
+          try { return proc(s); } catch (e) { return s; }
+      },
+
+      // JS の比較演算子を 3 値論理のヘルパ呼び出しへ畳む。
+      //   a === b -> __eq(a, b) / a !== b -> __ne(a, b) / a < b -> __lt(a, b) ...
+      //   !X      -> __not3(X)
+      // SQL では「どちらかが NULL なら結果は UNKNOWN」だが、素の JS 演算子は
+      // null を 0 や null と突き合わせてしまう（`v < 100` が NULL 行を拾う、
+      // `x = NULL` が NULL 同士で真になる、`NOT (a = 1)` が NULL 行を拾う、
+      // `CHECK (b > 0)` が NULL を違反と判定する、等）。
+      // 括弧の内側から再帰的に処理し、各深さでは論理演算子・三項・カンマで
+      // オペランドへ切り分けてから、その境界にある比較演算子だけを畳む
+      _rewriteCompareOps(s) {
+          if (!/[<>=!]/.test(s)) return s;
+          const CMP = ['===', '!==', '<=', '>=', '<', '>'];
+          const FN = { '===': '__eq', '!==': '__ne', '<=': '__le', '>=': '__ge', '<': '__lt', '>': '__gt' };
+          const SEP = ['&&', '||', '?', ':', ','];
+
+          // 1 つの深さの中を畳む。括弧の中身は処理済みで、ここでは不可分な塊として扱う
+          const foldLevel = (str) => {
+              const toks = [];              // { t: 'operand'|'sep'|'cmp', v }
+              let cur = '', depth = 0, i = 0;
+              while (i < str.length) {
+                  const c = str[i];
+                  if (c === '(' || c === '[') { depth++; cur += c; i++; continue; }
+                  if (c === ')' || c === ']') { depth--; cur += c; i++; continue; }
+                  if (depth === 0) {
+                      const sep = SEP.find(o => str.startsWith(o, i));
+                      if (sep) { toks.push({ t: 'operand', v: cur }); toks.push({ t: 'sep', v: sep }); cur = ''; i += sep.length; continue; }
+                      const cmp = CMP.find(o => str.startsWith(o, i));
+                      if (cmp) { toks.push({ t: 'operand', v: cur }); toks.push({ t: 'cmp', v: cmp }); cur = ''; i += cmp.length; continue; }
+                  }
+                  cur += c; i++;
+              }
+              toks.push({ t: 'operand', v: cur });
+
+              // オペランドの先頭に付いた NOT(`!`) は 3 値論理の否定へ回す。
+              // `!null === true` のままだと `WHERE NOT (v = 10)` が v IS NULL の行まで拾う
+              const unary = (txt) => {
+                  const m = txt.match(/^(\s*)!(?!=)([\s\S]*)$/);
+                  if (!m) return txt;
+                  const inner = unary(m[2]);
+                  return `${m[1]}__not3(${inner.trim()})`;
+              };
+              if (!toks.some(t => t.t === 'cmp')) {
+                  return toks.map(t => (t.t === 'operand' ? unary(t.v) : t.v)).join('');
+              }
+              // 左から順に比較を畳む（SQL では比較の連鎖は書けないので実質 1 個）
+              const out = [];
+              for (let k = 0; k < toks.length; k++) {
+                  const t = toks[k];
+                  if (t.t !== 'cmp') { out.push(t); continue; }
+                  const left = out.pop();
+                  const right = toks[k + 1];
+                  k++;
+                  if (!left || !right || left.v.trim() === '' || right.v.trim() === '') {
+                      // 片側が空（`a = ` のような壊れた式）はそのまま返して既存の
+                      // 構文エラー経路に委ねる
+                      if (left) out.push(left);
+                      out.push({ t: 'operand', v: t.v });
+                      if (right) out.push(right);
+                      continue;
+                  }
+                  const lead = right.v.match(/^\s*/)[0];
+                  out.push({ t: 'operand', v: `${left.v.match(/^\s*/)[0]}${FN[t.v]}(${left.v.trim()}, ${right.v.trim()})` });
+                  void lead;
+              }
+              return out.map(t => (t.t === 'operand' ? unary(t.v) : t.v)).join('');
+          };
+
+          const proc = (str) => {
+              let out = '', i = 0;
+              while (i < str.length) {
+                  const c = str[i];
+                  if (c === '(' || c === '[') {
+                      const close = c === '(' ? ')' : ']';
+                      let d = 0, j = i;
+                      for (; j < str.length; j++) {
+                          if (str[j] === c) d++;
+                          else if (str[j] === close) { d--; if (d === 0) break; }
+                      }
+                      if (j >= str.length) { out += str.slice(i); break; }
+                      out += c + proc(str.slice(i + 1, j)) + close;
+                      i = j + 1;
+                      continue;
+                  }
+                  out += c; i++;
+              }
+              return foldLevel(out);
+          };
+          try { return proc(s); } catch (e) { return s; }
+      },
+
       _rewriteConcatOp(s) {
           if (s.indexOf('||') === -1) return s;
           // 1 つのオペランド（比較・論理演算子を含まない範囲）の中の '||' だけを畳む
@@ -2792,6 +3489,51 @@
           return compiled;
       },
 
+      // 組み込み関数の引数個数の検査。
+      //
+      // 対象は「カンマ区切りの引数しか取らない」関数だけに絞ってある。
+      // `EXTRACT(YEAR FROM d)` / `CAST(x AS INT)` / `TRIM(BOTH 'x' FROM y)` /
+      // `SUBSTRING(s FROM 2 FOR 3)` / `POSITION(a IN b)` のような**キーワード区切りの
+      // 引数を持つ綴りは表に入れない**（1 引数と数えて誤って弾いてしまう）。
+      // 集計関数・ウィンドウ関数・ユーザー定義関数も対象外（別経路で検証済み）。
+      // 表に無い名前は従来どおり寛容なままなので、この検査は純粋な追加で既存の
+      // 動作を狭めない
+      _checkBuiltinArity(expr) {
+          if (!expr || expr.indexOf('(') === -1) return;
+          const re = /(^|[^a-zA-Z0-9_.$])([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/g;
+          let m;
+          while ((m = re.exec(expr))) {
+              const name = m[2].toUpperCase();
+              const spec = LUMINA_FN_ARITY[name];
+              if (!spec) continue;
+              // ユーザー定義関数が同名を持つなら触らない
+              if (this.functions && this.functions[name.toLowerCase()]) continue;
+              const open = m.index + m[0].length - 1;
+              let depth = 0, close = -1;
+              for (let i = open; i < expr.length; i++) {
+                  const ch = expr[i];
+                  if (ch === '(' || ch === '[') depth++;
+                  else if (ch === ')' || ch === ']') { depth--; if (depth === 0) { close = i; break; } }
+              }
+              if (close === -1) continue;   // 括弧が閉じていない → 別の経路のエラーに任せる
+              const inner = expr.slice(open + 1, close);
+              // キーワード区切りの綴りが混ざっていたら数え方が変わるので見送る
+              if (/(^|\s)(from|for|as|in|using|placing|both|leading|trailing|order\s+by|separator)(\s|$)/i.test(inner)) continue;
+              const args = inner.trim() === '' ? [] : this.splitSelectClause(inner);
+              const n = args.length;
+              if (n < spec[0] || (spec[1] !== null && n > spec[1])) {
+                  const want = spec[1] === null
+                      ? `at least ${spec[0]}`
+                      : (spec[0] === spec[1] ? `${spec[0]}` : `${spec[0]} to ${spec[1]}`);
+                  throw new Error(`Incorrect parameter count in the call to native function '${name}': got ${n}, expected ${want}.`);
+              }
+              // 次の走査は開き括弧の位置から続ける（入れ子の呼び出しも個別に検査する）。
+              // open + 1 にすると、正規表現が要求する「名前の直前の区切り文字」を
+              // 消費できず入れ子が丸ごと読み飛ばされる（ABS(POWER(2)) が通ってしまう）
+              re.lastIndex = open;
+          }
+      },
+
       _compileConditionUncached(expr, strMap) {
           // 防御的措置: 式は new Function でJSへコンパイルされる。識別子は __resolve() へ
           // ラップされ文字列リテラルは退避されるため通常のSQLは安全だが、本方言が使わない
@@ -2800,6 +3542,10 @@
           if (/[`]|\$\{/.test(expr)) {
               throw new Error("Syntax Error: unsupported characters in expression.");
           }
+          // 組み込み関数の引数個数を検査する（誤った個数は黙って NULL / 変な値 /
+          // 列の消失になっていた）。名前だけの正規表現写像で JS 関数へ落とすため、
+          // JS の「足りない引数は undefined・余った引数は無視」がそのまま漏れていた
+          this._checkBuiltinArity(expr);
           let s = expr;
 
           // 連続ハイフン (5--3 のような二重否定) は JS のデクリメント演算子として
@@ -2877,7 +3623,9 @@
           s = s.replace(/\bSUBSTRING\s*\(((?:[^()]|\([^()]*\))+?)\s+FROM\s+/gi, (m, pre) => `SUBSTRING(${pre}, `);
           s = s.replace(/\bSUBSTRING\s*\(((?:[^()]|\([^()]*\))+?)\s+FOR\s+/gi, (m, pre) => `SUBSTRING(${pre}, `);
           // DATE '2026-01-01' / TIMESTAMP '...' 日付リテラル（格納形式の文字列へ正規化して比較可能に）
-          s = s.replace(/\b(?:DATE|TIMESTAMP)\s+(__STR_\d+__)/gi, (m, tok) => `__cast(${tok}, 'DATE')`);
+          // 型付きリテラル: DATE '...' は日付だけ、TIMESTAMP '...' は日付＋時刻
+          s = s.replace(/\b(DATE|TIMESTAMP)\s+(__STR_\d+__)/gi,
+              (m, kw, tok) => `__cast(${tok}, '${/^date$/i.test(kw) ? 'DATEONLY' : 'DATE'}')`);
           // LAST_INSERT_ID() はクエリ実行時点の値へ定数畳み込みする
           // （コンパイル済み関数からはエンジンインスタンスへ到達できないため）
           s = s.replace(/\bLAST_INSERT_ID\s*\(\s*\)/gi, () => `(${Number(this.lastInsertId) || 0})`);
@@ -2922,6 +3670,9 @@
           // （後続の関数マッピングと識別子解決が中身を処理する）
           const _lhs = (col) => {
               if (col.indexOf('(') !== -1) return col;
+              // NULL / TRUE / FALSE はリテラル。列名として解決しようとすると
+              // `NULL LIKE 'x'` が "Column 'null' not found." になっていた
+              if (/^(null|true|false)$/i.test(col)) return col.toLowerCase();
               return (/^\d+(?:\.\d+)?$/.test(col) || /^__STR_\d+__$/.test(col))
                   ? col
                   : `__resolve('${col.toLowerCase()}', ptrs, dbTables, aliases)`;
@@ -3063,8 +3814,13 @@
           s = this._rewriteIsBool(s);
 
           // IS [NOT] UNKNOWN (SQL標準): 3値論理の UNKNOWN 判定。ブール式に対する IS NULL と同義
-          s = s.replace(/\bIS\s+NOT\s+UNKNOWN\b/gi, '!== null').replace(/\bIS\s+UNKNOWN\b/gi, '=== null');
-          s = s.replace(/\bIS\s+NOT\s+NULL\b/gi, '!== null').replace(/\bIS\s+NULL\b/gi, '=== null');
+          // IS [NOT] UNKNOWN も IS [NOT] NULL と同じ述語（比較ではない）ので専用トークンへ
+          s = s.replace(/\bIS\s+NOT\s+UNKNOWN\b/gi, ' __ISNOTNULL__').replace(/\bIS\s+UNKNOWN\b/gi, ' __ISNULL__');
+          // IS [NOT] NULL は「NULL かどうか」を真偽で返す述語であって比較ではない。
+          // そのまま `=== null` にすると、後段の 3 値論理の畳み込み（_rewriteCompareOps）が
+          // __eq(x, null) へ変えてしまい必ず UNKNOWN になる。専用の後置トークンへ退避し、
+          // 畳み込みの直後にヘルパ呼び出しへ直す
+          s = s.replace(/\bIS\s+NOT\s+NULL\b/gi, ' __ISNOTNULL__').replace(/\bIS\s+NULL\b/gi, ' __ISNULL__');
           s = s.replace(new RegExp(LHS + '\\s+(NOT\\s+)?BETWEEN\\s+(.+?)\\s+AND\\s+(.+?)(?=\\s*(?:AND\\b|OR\\b|\\)|$))', 'gi'), (m, col, not, a, b) => `${not ? '!' : ''}(${_lhs(col)} >= ${a} && ${_lhs(col)} <= ${b})`);
           // LIKE ANY / ALL (pat1, pat2, ...): 複数パターンの OR / AND（Snowflake / Teradata）
           s = s.replace(new RegExp(LHS + '\\s+(NOT\\s+)?(?:LIKE|ILIKE)\\s+(ANY|SOME|ALL)\\s*\\(((?:[^()]|\\([^()]*\\))*)\\)', 'gi'),
@@ -3080,37 +3836,39 @@
           s = s.replace(new RegExp(LHS + '\\s+(NOT\\s+)?LIKE\\s+(__STR_\\d+__)\\s+ESCAPE\\s+__STR_(\\d+)__', 'gi'), (m, col, not, strRef, escIdx) => {
               const escLit = this._unquoteLiteral(strMap[Number(escIdx)]);
               if (escLit.length !== 1) throw new Error("ESCAPE clause requires a single character.");
-              return `${not ? '!' : ''}__like(${_lhs(col)}, ${strRef}, __STR_${escIdx}__)`;
+              return not ? `__not3(__like(${_lhs(col)}, ${strRef}, __STR_${escIdx}__))` : `__like(${_lhs(col)}, ${strRef}, __STR_${escIdx}__)`;
           });
-          s = s.replace(new RegExp(LHS + '\\s+(NOT\\s+)?LIKE\\s+(__STR_\\d+__)', 'gi'), (m, col, not, strRef) => `${not ? '!' : ''}__like(${_lhs(col)}, ${strRef})`);
+          s = s.replace(new RegExp(LHS + '\\s+(NOT\\s+)?LIKE\\s+(__STR_\\d+__)', 'gi'), (m, col, not, strRef) => not ? `__not3(__like(${_lhs(col)}, ${strRef}))` : `__like(${_lhs(col)}, ${strRef})`);
           // ILIKE (PostgreSQL): 大文字小文字を区別しない LIKE
           s = s.replace(new RegExp(LHS + '\\s+(NOT\\s+)?ILIKE\\s+(__STR_\\d+__)\\s+ESCAPE\\s+__STR_(\\d+)__', 'gi'), (m, col, not, strRef, escIdx) => {
               const escLit = this._unquoteLiteral(strMap[Number(escIdx)]);
               if (escLit.length !== 1) throw new Error("ESCAPE clause requires a single character.");
-              return `${not ? '!' : ''}__ilike(${_lhs(col)}, ${strRef}, __STR_${escIdx}__)`;
+              return not ? `__not3(__ilike(${_lhs(col)}, ${strRef}, __STR_${escIdx}__))` : `__ilike(${_lhs(col)}, ${strRef}, __STR_${escIdx}__)`;
           });
-          s = s.replace(new RegExp(LHS + '\\s+(NOT\\s+)?ILIKE\\s+(__STR_\\d+__)', 'gi'), (m, col, not, strRef) => `${not ? '!' : ''}__ilike(${_lhs(col)}, ${strRef})`);
+          s = s.replace(new RegExp(LHS + '\\s+(NOT\\s+)?ILIKE\\s+(__STR_\\d+__)', 'gi'), (m, col, not, strRef) => not ? `__not3(__ilike(${_lhs(col)}, ${strRef}))` : `__ilike(${_lhs(col)}, ${strRef})`);
           // SIMILAR TO (SQL標準): LIKE のワイルドカードと正規表現メタ文字を併用するパターン
           s = s.replace(new RegExp(LHS + '\\s+(NOT\\s+)?SIMILAR\\s+TO\\s+__STR_(\\d+)__', 'gi'), (m, col, not, strIdx) => {
               // ReDoS 緩和: 実行時 throw は行評価の catch に飲まれるのでコンパイル時に弾く
               const lit = strMap[Number(strIdx)];
               if (lit && lit.length > 1002) throw new Error("SIMILAR TO pattern too long (max 1000 characters).");
-              return `${not ? '!' : ''}__similar(${_lhs(col)}, __STR_${strIdx}__)`;
+              return not ? `__not3(__similar(${_lhs(col)}, __STR_${strIdx}__))` : `__similar(${_lhs(col)}, __STR_${strIdx}__)`;
           });
           s = s.replace(new RegExp(LHS + '\\s+(NOT\\s+)?REGEXP\\s+__STR_(\\d+)__', 'gi'), (m, col, not, strIdx) => {
               // DoSガード(ReDoS緩和): 異常に長い正規表現パターンをコンパイル時に拒否する
               const lit = strMap[Number(strIdx)];
               if (lit && lit.length > 1002) throw new Error("REGEXP pattern too long (max 1000 characters).");
-              return `${not ? '!' : ''}__regexp(${_lhs(col)}, __STR_${strIdx}__)`;
+              return not ? `__not3(__regexp(${_lhs(col)}, __STR_${strIdx}__))` : `__regexp(${_lhs(col)}, __STR_${strIdx}__)`;
           });
 
           // Execute IN / NOT IN replacements before standalone NOT replacements
           // リストは1段の括弧ネストまで対応（IN (ROUND(1.4), 2) 等の関数呼び出しを許容）
-          s = s.replace(new RegExp(LHS + '\\s+NOT\\s+IN\\s*\\(((?:[^()]|\\([^()]*\\))*)\\)', 'gi'), (m, col, vals) => `!([${vals}].includes(${_lhs(col)}))`);
-          s = s.replace(new RegExp(LHS + '\\s+IN\\s*\\(((?:[^()]|\\([^()]*\\))*)\\)', 'gi'), (m, col, vals) => `[${vals}].includes(${_lhs(col)})`);
+          s = s.replace(new RegExp(LHS + '\\s+NOT\\s+IN\\s*\\(((?:[^()]|\\([^()]*\\))*)\\)', 'gi'), (m, col, vals) => `__not3(__in(${_lhs(col)}, [${vals}]))`);
+          s = s.replace(new RegExp(LHS + '\\s+IN\\s*\\(((?:[^()]|\\([^()]*\\))*)\\)', 'gi'), (m, col, vals) => `__in(${_lhs(col)}, [${vals}])`);
 
           // 相関サブクエリのトークン（expandSubqueries が登録）を実行時評価の呼び出しへ変換する
-          s = s.replace(new RegExp(LHS + '\\s+NOT\\s+IN\\s+__CORRIN_(\\d+)__', 'gi'), (m, col, k) => `!__corr_in(${k}, ${_lhs(col)}, ptrs, dbTables, aliases)`);
+          // 3 値論理の否定。素の `!` だと UNKNOWN(null) が true に化けて、
+          // NOT IN が NULL を含むリストの行まで拾う（v1.24 で素の IN 側だけ直っていた）
+          s = s.replace(new RegExp(LHS + '\\s+NOT\\s+IN\\s+__CORRIN_(\\d+)__', 'gi'), (m, col, k) => `__not3(__corr_in(${k}, ${_lhs(col)}, ptrs, dbTables, aliases))`);
           s = s.replace(new RegExp(LHS + '\\s+IN\\s+__CORRIN_(\\d+)__', 'gi'), (m, col, k) => `__corr_in(${k}, ${_lhs(col)}, ptrs, dbTables, aliases)`);
           s = s.replace(/__CORREX_(\d+)__/g, (m, k) => `__corr_exists(${k}, ptrs, dbTables, aliases)`);
           s = s.replace(/__CORRSC_(\d+)__/g, (m, k) => `__corr_scalar(${k}, ptrs, dbTables, aliases)`);
@@ -3288,8 +4046,8 @@
           s = s.replace(/\bMAKEDATE\(/gi, '__makedate(');
           s = s.replace(/\bSTR_TO_DATE\(/gi, '__str_to_date(');
           // v1.3 追加: 別名・時刻部分抽出
-          s = s.replace(/\bCHAR_LENGTH\(/gi, '__length(');
-          s = s.replace(/\bCHARACTER_LENGTH\(/gi, '__length(');
+          s = s.replace(/\bCHAR_LENGTH\(/gi, '__char_length(');
+          s = s.replace(/\bCHARACTER_LENGTH\(/gi, '__char_length(');
           s = s.replace(/\bUTC_TIMESTAMP\(\)/gi, '__now()');
           s = s.replace(/\bSYSDATE\(\)/gi, '__now()');
           s = s.replace(/\bTIME\(/gi, '__time(');
@@ -3331,6 +4089,10 @@
           // v1.6 追加関数: ハッシュ / バイト長 / 日付切り捨て / 型 / 別名 / シーケンス
           s = s.replace(/\bSHA1\(/gi, '__sha1(');
           s = s.replace(/\bSHA\(/gi, '__sha1(');
+          // SHA-2 系（長い綴りから順に置換する）
+          s = s.replace(/\bSHA256\(/gi, '__sha256(');
+          s = s.replace(/\bSHA224\(/gi, '__sha224(');
+          s = s.replace(/\bSHA2\(/gi, '__sha2(');
           s = s.replace(/\bSUBSTR\(/gi, '__substring(');
           s = s.replace(/\bIIF\(/gi, '__if(');
           s = s.replace(/\bOCTET_LENGTH\(/gi, '__octet_length(');
@@ -3462,11 +4224,42 @@
                .replace(/=/g, '===')
                .replace(/__LTE__/g, '<=').replace(/__GTE__/g, '>=').replace(/__NEQ__/g, '!==').replace(/__LT__/g, '<').replace(/__GT__/g, '>');
 
-          const protectedKeywords = ['&&', '||', '!', 'true', 'false', 'null', 'undefined', '__cast', '__like', '__regexp', '__upper', '__lower', '__length', '__round', '__coalesce', '__substring', '__substring_index', '__concat', '__concat_ws', '__locate', '__truncate', '__replace', '__trim', '__abs', '__ceil', '__floor', '__now', '__lpad', '__rpad', '__power', '__sqrt', '__year', '__month', '__day', '__mod', '__sign', '__rand', '__date', '__datediff', '__ifnull', '__nullif', '__is_distinct', '__if', '__left', '__right', '__instr', '__reverse', '__repeat', '__greatest', '__least', '__exp', '__log', '__log10', '__pi', '__hour', '__minute', '__second', '__ltrim', '__rtrim', '__ascii', '__char', '__sin', '__cos', '__tan', '__sinh', '__asin', '__acos', '__atan', '__atan2', '__degrees', '__radians', '__ln', '__cbrt', '__datecol', '__date_add', '__date_sub', '__dayofweek', '__dayofyear', '__quarter', '__last_day', '__curdate', '__log2', '__cot', '__format', '__hex', '__bin', '__oct', '__conv', '__space', '__strcmp', '__elt', '__field', '__initcap', '__monthname', '__dayname', '__week', '__weekday', '__weekofyear', '__unix_timestamp', '__from_unixtime', '__date_format', '__extract', '__timestampdiff', '__interval', '__json_extract', '__json_array', '__json_object', '__json_length', '__json_keys', '__json_valid', '__json_type', '__json_contains', '__json_set', '__json_remove', '__uuid', '__version', '__database', '__regexp_replace', '__regexp_substr', '__regexp_like', '__split_part', '__quote', '__bit_count', '__sec_to_time', '__time_to_sec', '__makedate', '__str_to_date', '__trim_dir', '__corr_exists', '__corr_scalar', '__corr_in', '__time', '__md5', '__crc32', '__to_base64', '__from_base64', '__inet_aton', '__inet_ntoa', '__soundex', '__translate', '__str_insert', '__cosh', '__tanh', '__to_days', '__from_days', '__maketime', '__curtime', '__format_bytes', '__timestampadd', '__json_pretty', '__json_quote', '__json_unquote', '__json_array_append', '__json_merge_patch', '__json_depth', '__sha1', '__octet_length', '__bit_length', '__unhex', '__date_trunc', '__typeof', '__regexp_count', '__nextval', '__currval', '__setval', '__decode', '__nvl2', '__zeroifnull', '__nullifzero', '__choose', '__starts_with', '__ends_with', '__charindex', '__len', '__stuff', '__regexp_instr', '__square', '__gcd', '__lcm', '__factorial', '__width_bucket', '__add_months', '__months_between', '__date_part', '__quotename', '__patindex', '__bitand', '__bitor', '__bitxor', '__bitnot', '__isnumeric', '__eomonth', '__make_date', '__make_timestamp', '__to_number', '__to_date', '__to_timestamp', '__dateadd', '__datepart', '__datename', '__next_day', '__nanvl', '__remainder', '__shiftleft', '__shiftright', '__to_hex', '__parsename', '__quote_ident', '__quote_literal', '__overlay', '__sys_user', '__current_schema', '__newid', '__sys_guid', '__to_char', '__op_like', '__op_nlike', '__op_ilike', '__op_nilike', '__op_regex', '__op_iregex', '__op_nregex', '__op_niregex', '__ilike', '__similar', '__concat_op', '__setseed', '__collate', '__match_against', '__ft_tokens', '__overlaps', '__date_bin', '__age', '__is_json', '__json_exists', '__json_query', '__array', '__subscript', '__array_slice', '__toArray', '__array_length', '__array_position', '__array_contains', '__array_append', '__array_prepend', '__array_remove', '__array_to_string', '__string_to_array', '__array_agg_sort', '__levenshtein', '__similarity', '__difference', '__regexp_matches', '__regexp_split_to_array', '__div', '__safe_divide', '__at_time_zone', '__json_insert', '__json_replace', '__json_array_insert', '__json_arrow', '__json_arrow_text', '__json_hash_arrow', '__json_hash_arrow_text', '__json_has_key', '__json_contains_path', '__is_bool', '__resolve', 'ptrs', 'dbTables', 'aliases', 'includes', 'Math', 'Date'];
-          s = s.replace(/('([^'\\]|\\.)*'|"([^"\\]|\\.)*")|\b([a-zA-Z_][a-zA-Z0-9_.]*)\b/g, (m, stringLit, _1, _2, word) => {
+          // IS [NOT] NULL の後置トークンを述語ヘルパへ直す（比較の畳み込みより前）。
+          // 被演算子は後方走査で取る（`__cast(x, 'DATE') IS NULL` のような呼び出しも拾う）
+          while (/__IS(?:NOT)?NULL__/.test(s)) {
+              const at = s.search(/__IS(?:NOT)?NULL__/);
+              const tok = s.slice(at).match(/^__IS(NOT)?NULL__/);
+              const neg = !!tok[1];
+              const { start, end } = this._operandStartBefore(s, at, tok[0]);
+              const operand = s.slice(start, end + 1).trim();
+              s = s.slice(0, start) + `${neg ? '__notnull' : '__isnull'}(${operand})` + s.slice(at + tok[0].length);
+          }
+
+          // 算術の NULL 伝播（比較より前。算術のほうが強く結合する）
+          s = this._rewriteArithOps(s);
+
+          // 比較を 3 値論理のヘルパへ畳む（識別子解決より前に置くこと）
+          s = this._rewriteCompareOps(s);
+
+          const protectedKeywords = ['&&', '||', '!', 'true', 'false', 'null', 'undefined', '__cast', '__like', '__regexp', '__upper', '__lower', '__length', '__round', '__coalesce', '__substring', '__substring_index', '__concat', '__concat_ws', '__locate', '__truncate', '__replace', '__trim', '__abs', '__ceil', '__floor', '__now', '__lpad', '__rpad', '__power', '__sqrt', '__year', '__month', '__day', '__mod', '__sign', '__rand', '__date', '__datediff', '__ifnull', '__nullif', '__is_distinct', '__if', '__left', '__right', '__instr', '__reverse', '__repeat', '__greatest', '__least', '__exp', '__log', '__log10', '__pi', '__hour', '__minute', '__second', '__ltrim', '__rtrim', '__ascii', '__char', '__sin', '__cos', '__tan', '__sinh', '__asin', '__acos', '__atan', '__atan2', '__degrees', '__radians', '__ln', '__cbrt', '__datecol', '__date_add', '__date_sub', '__dayofweek', '__dayofyear', '__quarter', '__last_day', '__curdate', '__log2', '__cot', '__format', '__hex', '__bin', '__oct', '__conv', '__space', '__strcmp', '__elt', '__field', '__initcap', '__monthname', '__dayname', '__week', '__weekday', '__weekofyear', '__unix_timestamp', '__from_unixtime', '__date_format', '__extract', '__timestampdiff', '__interval', '__json_extract', '__json_array', '__json_object', '__json_length', '__json_keys', '__json_valid', '__json_type', '__json_contains', '__json_set', '__json_remove', '__uuid', '__version', '__database', '__regexp_replace', '__regexp_substr', '__regexp_like', '__split_part', '__quote', '__bit_count', '__sec_to_time', '__time_to_sec', '__makedate', '__str_to_date', '__trim_dir', '__corr_exists', '__corr_scalar', '__corr_in', '__time', '__md5', '__crc32', '__to_base64', '__from_base64', '__inet_aton', '__inet_ntoa', '__soundex', '__translate', '__str_insert', '__cosh', '__tanh', '__to_days', '__from_days', '__maketime', '__curtime', '__format_bytes', '__timestampadd', '__json_pretty', '__json_quote', '__json_unquote', '__json_array_append', '__json_merge_patch', '__json_depth', '__sha1', '__sha2', '__sha256', '__sha224', '__octet_length', '__bit_length', '__char_length', '__unhex', '__date_trunc', '__typeof', '__regexp_count', '__nextval', '__currval', '__setval', '__decode', '__nvl2', '__zeroifnull', '__nullifzero', '__choose', '__starts_with', '__ends_with', '__charindex', '__len', '__stuff', '__regexp_instr', '__square', '__gcd', '__lcm', '__factorial', '__width_bucket', '__add_months', '__months_between', '__date_part', '__quotename', '__patindex', '__bitand', '__bitor', '__bitxor', '__bitnot', '__isnumeric', '__eomonth', '__make_date', '__make_timestamp', '__to_number', '__to_date', '__to_timestamp', '__dateadd', '__datepart', '__datename', '__next_day', '__nanvl', '__remainder', '__shiftleft', '__shiftright', '__to_hex', '__parsename', '__quote_ident', '__quote_literal', '__overlay', '__sys_user', '__current_schema', '__newid', '__sys_guid', '__to_char', '__op_like', '__op_nlike', '__op_ilike', '__op_nilike', '__op_regex', '__op_iregex', '__op_nregex', '__op_niregex', '__ilike', '__similar', '__concat_op', '__setseed', '__collate', '__match_against', '__ft_tokens', '__overlaps', '__date_bin', '__age', '__is_json', '__json_exists', '__json_query', '__array', '__subscript', '__array_slice', '__toArray', '__array_length', '__array_position', '__array_contains', '__array_append', '__array_prepend', '__array_remove', '__array_to_string', '__string_to_array', '__array_agg_sort', '__levenshtein', '__similarity', '__difference', '__regexp_matches', '__regexp_split_to_array', '__div', '__safe_divide', '__at_time_zone', '__json_insert', '__json_replace', '__json_array_insert', '__json_arrow', '__json_arrow_text', '__json_hash_arrow', '__json_hash_arrow_text', '__json_has_key', '__json_contains_path', '__is_bool', '__not3', '__nul', '__in', '__DATEISH', '__dnum', '__cpair', '__num', '__add', '__sub', '__mul', '__divf', '__modf', '__neg', '__isnull', '__notnull', '__eq', '__ne', '__lt', '__le', '__gt', '__ge', '__resolve', 'ptrs', 'dbTables', 'aliases', 'includes', 'Math', 'Date'];
+          s = s.replace(/('([^'\\]|\\.)*'|"([^"\\]|\\.)*")|\b([a-zA-Z_][a-zA-Z0-9_.]*)\b/g, (m, stringLit, _1, _2, word, offset, whole) => {
               if (stringLit) return m;
               if (!word) return m;
               if (protectedKeywords.includes(word) || word.startsWith('__STR_')) return word;
+              // ここまでのどの関数写像にも当たらなかった名前が `(` を伴っていれば「未知の関数」。
+              // 従来は列参照として解決され、実行時に "Column 'foo' not found." になっていて
+              // 「関数名が間違っている」と気づけなかった
+              if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(word) && /^\s*\(/.test(String(whole).slice(offset + word.length))) {
+                  const lw = word.toLowerCase();
+                  const isAgg = new RegExp('^(?:' + LUMINA_AGG_NAMES + ')$', 'i').test(word);
+                  const isWin = typeof LUMINA_WINDOW_FN_NAMES !== 'undefined' && LUMINA_WINDOW_FN_NAMES.has(word.toUpperCase());
+                  const isUdf = this.functions && this.functions[lw];
+                  if (!isAgg && !isWin && !isUdf) {
+                      const names = (typeof LUMINA_BUILTIN_FN_NAMES !== 'undefined') ? [...LUMINA_BUILTIN_FN_NAMES] : [];
+                      const sug = this._suggestName ? this._suggestName(lw, names) : null;
+                      throw new Error(`Function '${word}' does not exist.${sug ? ` Did you mean '${sug.toUpperCase()}'?` : ''}`);
+                  }
+              }
               return `__resolve('${word.toLowerCase()}', ptrs, dbTables, aliases)`;
           });
 
@@ -3483,6 +4276,10 @@
               s = s.replace(new RegExp(`__STR_${i}__`, 'g'), () => safe);
           });
 
+          // new Function は JS としての構文エラーを投げる。そのまま外へ出すと
+          // "Unexpected token ';'. Expected ')' ..." のような JS の言い回しが
+          // ユーザーへ届いてしまうので、SQL 側の言葉へ言い換える
+          try {
           return new Function('__L', __EXPR_PRELUDE +
               '\nreturn function(ptrs, dbTables, aliases) {' +
               '\n    try {' +
@@ -3492,6 +4289,13 @@
               '\n        return null;' +
               '\n    }' +
               '\n};')(__EXPR_LIB);
+          } catch (e) {
+              if (e instanceof SyntaxError) {
+                  const src = (strMap && this._restoreStrings) ? this._restoreStrings(expr, strMap) : expr;
+                  throw new Error(`Malformed expression: ${String(src).trim().slice(0, 120)} — check for unbalanced parentheses, an unclosed quote, or a missing operand.`);
+              }
+              throw e;
+          }
       },
 
       // 句をトップレベルのカンマで分割する。括弧に加えて角括弧も数える
@@ -3508,5 +4312,31 @@
           }
           parts.push(current.trim());
           return parts;
+      },
+
+      // SELECT 項目の「AS を省いた後置別名」を切り出す。
+      //   'id x' -> { expr: 'id', alias: 'x' } / 'COUNT(*) c' -> { expr: 'COUNT(*)', alias: 'c' }
+      // 末尾が裸の語になる構文（`a IS NULL` / `INTERVAL 1 DAY` / `x COLLATE NOCASE` /
+      // `LAG(x) IGNORE NULLS OVER (...)`）を別名と誤認しないよう、
+      //   (a) 別名になり得ない語の集合、(b) 直前の語が被演算子を要求するか、
+      //   (c) 直前が演算子記号か
+      // の 3 条件で保守的に弾く。判定できないときは null（＝従来どおり別名なし）を返す
+      _trailingAlias(part) {
+          const m = part.match(/^([\s\S]*[^\s,])\s+([a-zA-Z_][a-zA-Z0-9_]*)$/);
+          if (!m) return null;
+          const head = m[1].trim();
+          const cand = m[2];
+          if (head === '') return null;
+          if (LUMINA_NON_ALIAS_WORDS.has(cand.toLowerCase())) return null;
+          // 直前の語が「次に被演算子が来る」種類なら、cand は別名ではなく被演算子
+          const prevWord = (head.match(/([a-zA-Z_][a-zA-Z0-9_]*)$/) || [])[1];
+          if (prevWord && LUMINA_OPERAND_EXPECTING_WORDS.has(prevWord.toLowerCase())) return null;
+          // 直前が演算子記号（`a +` など）なら式の途中
+          if (/[+\-*/%=<>!&|^~,.(]$/.test(head)) return null;
+          // 括弧の対応が取れていない断片は式として壊れているので触らない
+          let depth = 0;
+          for (const ch of head) { if (ch === '(' || ch === '[') depth++; else if (ch === ')' || ch === ']') depth--; }
+          if (depth !== 0) return null;
+          return { expr: head, alias: cand };
       }
     });

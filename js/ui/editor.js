@@ -23,7 +23,7 @@
     // v1.6 で追加された構文・関数
     'QUALIFY', 'ESCAPE', 'GROUPING', 'PREPARE', 'EXECUTE', 'DEALLOCATE', 'PREPARED',
     'SEQUENCE', 'SEQUENCES', 'NEXTVAL', 'CURRVAL', 'SETVAL', 'START', 'INCREMENT',
-    'SHA1', 'SUBSTR', 'OCTET_LENGTH', 'BIT_LENGTH', 'UNHEX', 'DATE_TRUNC', 'TYPEOF', 'IIF', 'REGEXP_COUNT',
+    'SHA1', 'SHA2', 'SHA256', 'SHA224', 'SUBSTR', 'OCTET_LENGTH', 'BIT_LENGTH', 'UNHEX', 'DATE_TRUNC', 'TYPEOF', 'IIF', 'REGEXP_COUNT',
     'STRING_AGG', 'ARRAY_AGG', 'BOOL_AND', 'BOOL_OR', 'CORR', 'COVAR_POP', 'COVAR_SAMP',
     // v1.8 で追加された商用DB頻用の関数（Oracle / SQL Server / PostgreSQL）
     'DECODE', 'NVL2', 'ISNULL', 'ZEROIFNULL', 'NULLIFZERO', 'CHOOSE', 'STARTS_WITH', 'ENDS_WITH',
@@ -149,12 +149,42 @@
         return [...new Set(all)];
     }
 
+    // カーソル直前の語。`u.` のように修飾子が付いている場合は qualifier も返す。
+    // 以前は /[a-zA-Z0-9_]+$/ だけを見ていたため、'.' の直後は match が null になり
+    // `u.` と打っても候補が一切出なかった（列名補完が効かない最大の原因）
     function getCurrentWord() {
         const val = els.query.value;
         const cursor = els.query.selectionStart;
         const textBefore = val.slice(0, cursor);
+        const qm = textBefore.match(/([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\s*([a-zA-Z0-9_]*)$/);
+        if (qm) {
+            return { qualifier: qm[1], word: qm[2], start: cursor - qm[2].length, end: cursor };
+        }
         const match = textBefore.match(/[a-zA-Z0-9_]+$/);
-        return match ? { word: match[0], start: match.index, end: cursor } : null;
+        return match ? { qualifier: null, word: match[0], start: match.index, end: cursor } : null;
+    }
+
+    // いま編集している文に出てくる表と別名を集める（alias -> 実表名）。
+    // FROM / JOIN / UPDATE / INTO の直後の名前を拾う
+    function statementTableMap() {
+        const map = Object.create(null);
+        let stmt = els.query.value;
+        try {
+            if (typeof statementAtCursor === 'function') {
+                stmt = statementAtCursor(els.query.value, els.query.selectionStart) || els.query.value;
+            }
+        } catch (e) { /* 解析できなければ全文で代用する */ }
+        const re = /\b(?:from|join|update|into)\s+([a-zA-Z_]\w*)(?:\s+(?:as\s+)?([a-zA-Z_]\w*))?/gi;
+        const NOT_ALIAS = new Set(['where', 'on', 'using', 'set', 'group', 'order', 'having', 'limit',
+            'join', 'inner', 'left', 'right', 'full', 'cross', 'natural', 'values', 'select', 'as', 'qualify', 'window']);
+        let m;
+        while ((m = re.exec(stmt))) {
+            const tbl = m[1].toLowerCase();
+            if (!db.tables[tbl]) continue;
+            map[tbl] = tbl;
+            if (m[2] && !NOT_ALIAS.has(m[2].toLowerCase())) map[m[2].toLowerCase()] = tbl;
+        }
+        return map;
     }
 
     function hideSuggestions() {
@@ -169,13 +199,33 @@
 
     function showSuggestions() {
         const wordInfo = getCurrentWord();
-        if (!wordInfo || wordInfo.word.length < 1) {
+        // 修飾子付き（`u.`）は語が空でも候補を出す。素の語は 1 文字以上必要
+        if (!wordInfo || (!wordInfo.qualifier && wordInfo.word.length < 1)) {
             hideSuggestions();
             return;
         }
         const lowerWord = wordInfo.word.toLowerCase();
-        const allKw = getDynamicKeywords();
-        currentSuggestions = allKw.filter(s => s.toLowerCase().startsWith(lowerWord) && s.toLowerCase() !== lowerWord).slice(0, 10);
+        const tblMap = statementTableMap();
+        let pool;
+        if (wordInfo.qualifier) {
+            // `alias.` / `table.` の後ろは、その表の列だけを出す
+            const t = tblMap[wordInfo.qualifier.toLowerCase()] || wordInfo.qualifier.toLowerCase();
+            pool = db.tables[t] ? db.tables[t].getColumnNames() : [];
+        } else {
+            // 修飾子なし: この文で使っている表の列 → 表名 → キーワードの順に並べる。
+            // 以前はキーワードと全表の全列をまとめて並べていたため、無関係な表の列が
+            // 先に来て本当に欲しい名前が 10 件の枠から押し出されていた
+            const ctxCols = [];
+            Object.keys(tblMap).forEach(a => {
+                const t = tblMap[a];
+                if (db.tables[t]) db.tables[t].getColumnNames().forEach(c => ctxCols.push(c));
+            });
+            const tableNames = Object.keys(db.tables).filter(t => !t.startsWith('__'));
+            pool = [...ctxCols, ...tableNames, ...keywords];
+        }
+        currentSuggestions = [...new Set(pool)]
+            .filter(s => s.toLowerCase().startsWith(lowerWord) && s.toLowerCase() !== lowerWord)
+            .slice(0, 20);
 
         if (currentSuggestions.length === 0) {
             hideSuggestions();
@@ -701,4 +751,68 @@
             e.preventDefault();
             applyFormat();
         }
+        // Ctrl+Shift+E: 実行せずに実行計画だけ見る
+        if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'e') {
+            e.preventDefault();
+            const btn = document.getElementById('explainBtn');
+            if (btn) btn.click();
+        }
     });
+
+    // ============================================================================
+    // エディタと結果ペインの境界（スプリッタ）
+    // 従来はエディタの高さが 128px 固定で、長い SQL が数行しか見えなかった。
+    // 高さは localStorage に残し、次回起動でも保つ
+    // ============================================================================
+    (function initSplitter() {
+        const splitter = document.getElementById('editorSplitter');
+        const box = document.getElementById('editorBox');
+        if (!splitter || !box) return;
+        const KEY = 'luminadb_editor_height';
+        const MIN = 64, MAX_RATIO = 0.7;
+        const clamp = (h) => Math.max(MIN, Math.min(Math.round(window.innerHeight * MAX_RATIO), Math.round(h)));
+        const apply = (h) => { box.style.height = clamp(h) + 'px'; };
+        // 起動時に前回の高さを戻す（localStorage が使えない環境でも落ちないように）
+        try {
+            const saved = parseInt(localStorage.getItem(KEY) || '', 10);
+            if (!isNaN(saved)) apply(saved);
+        } catch (err) { /* プライベートモード等では既定の高さのまま */ }
+
+        let dragging = false;
+        const onMove = (ev) => {
+            if (!dragging) return;
+            const y = ev.touches ? ev.touches[0].clientY : ev.clientY;
+            apply(y - box.getBoundingClientRect().top);
+            ev.preventDefault();
+        };
+        const onUp = () => {
+            if (!dragging) return;
+            dragging = false;
+            document.body.style.userSelect = '';
+            try { localStorage.setItem(KEY, String(parseInt(box.style.height, 10) || MIN)); } catch (err) { /* 保存できなくても動作は続く */ }
+        };
+        const onDown = (ev) => {
+            dragging = true;
+            document.body.style.userSelect = 'none';
+            ev.preventDefault();
+        };
+        splitter.addEventListener('mousedown', onDown);
+        splitter.addEventListener('touchstart', onDown, { passive: false });
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('touchmove', onMove, { passive: false });
+        window.addEventListener('mouseup', onUp);
+        window.addEventListener('touchend', onUp);
+        // ダブルクリックで既定（8rem）へ戻す
+        splitter.addEventListener('dblclick', () => {
+            box.style.height = '';
+            try { localStorage.removeItem(KEY); } catch (err) { /* 何もしない */ }
+        });
+        // キーボードでも操作できるようにする（矢印で 16px ずつ）
+        splitter.addEventListener('keydown', (ev) => {
+            if (ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown') return;
+            ev.preventDefault();
+            const cur = box.getBoundingClientRect().height;
+            apply(cur + (ev.key === 'ArrowDown' ? 16 : -16));
+            try { localStorage.setItem(KEY, String(parseInt(box.style.height, 10) || MIN)); } catch (err) { /* 保存できなくても動作は続く */ }
+        });
+    })();

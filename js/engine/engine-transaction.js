@@ -135,6 +135,13 @@
           this.undoLog.push({ type: 'SEQ_STATE', name, prev: cur ? { ...cur } : undefined });
       },
 
+      // COMMENT ON の undo ログ（従来は記録されず ROLLBACK で戻らなかった）
+      _logCommentState(key) {
+          if (!this.inTransaction) return;
+          this.comments = this.comments || Object.create(null);
+          this.undoLog.push({ type: 'COMMENT_STATE', key, prev: this.comments[key] });
+      },
+
       // CREATE/DROP DOMAIN・TYPE の undo ログ
       _logDomainState(name) {
           name = name.toLowerCase();
@@ -205,6 +212,10 @@
               this.domains = this.domains || Object.create(null);
               if (log.prev === undefined) delete this.domains[log.name];
               else this.domains[log.name] = JSON.parse(JSON.stringify(log.prev));
+          } else if (log.type === 'COMMENT_STATE') {
+              this.comments = this.comments || Object.create(null);
+              if (log.prev === undefined) delete this.comments[log.key];
+              else this.comments[log.key] = log.prev;
           } else if (log.type === 'SEQ_STATE') {
               if (log.prev === undefined) delete this.sequences[log.name];
               else this.sequences[log.name] = { ...log.prev };
@@ -213,6 +224,68 @@
               else this.functions[log.name] = JSON.parse(JSON.stringify(log.prev));
           }
           // type === 'SAVEPOINT' はマーカーのため何もしない
+      },
+
+      // ------------------------------------------------------------------
+      // 文単位のロールバック（内部用の暗黙 SAVEPOINT）
+      //
+      // 検証を通した後で throw する箇所（AFTER トリガーの失敗など）があると、
+      // 「文はエラーを返したのに変更は残っている」状態になる。実DBはどれも
+      // 文単位で原子的なので、書き込み文を _stmtBegin / _stmtRollback で囲って
+      // 途中失敗を巻き戻す。明示トランザクションの外でも一時的に undo ログを
+      // 立ち上げるため、単発の文でも原子性が得られる
+      // ------------------------------------------------------------------
+      _stmtBegin() {
+          if (!this.inTransaction) {
+              this.inTransaction = true;
+              this.undoLog = [];
+              this._implicitStmtTx = (this._implicitStmtTx || 0) + 1;
+          }
+          this.undoLog.push({ type: 'SAVEPOINT', name: '__stmt__' });
+          return this.undoLog.length - 1;
+      },
+
+      // mark 以降の変更を巻き戻す（mark 位置の SAVEPOINT マーカーごと捨てる）
+      _stmtRollback(mark) {
+          if (mark === null || mark === undefined) return;
+          for (let i = this.undoLog.length - 1; i >= mark; i--) {
+              this._applyUndoEntry(this.undoLog[i]);
+          }
+          this.undoLog.length = mark;
+          this._stmtEndImplicit();
+      },
+
+      // 成功時: マーカーだけ外して、変更は外側のトランザクションへ残す
+      _stmtCommit(mark) {
+          if (mark === null || mark === undefined) return;
+          if (this.undoLog[mark] && this.undoLog[mark].type === 'SAVEPOINT' && this.undoLog[mark].name === '__stmt__') {
+              this.undoLog.splice(mark, 1);
+          }
+          this._stmtEndImplicit();
+      },
+
+      // 暗黙で立ち上げたトランザクションを畳む（明示 BEGIN 中なら何もしない）
+      _stmtEndImplicit() {
+          if (this._implicitStmtTx > 0) {
+              this._implicitStmtTx--;
+              if (this._implicitStmtTx === 0) {
+                  this.inTransaction = false;
+                  this.undoLog = [];
+              }
+          }
+      },
+
+      // fn を文単位で原子的に実行する。throw したら変更を巻き戻して再 throw する
+      _atomicStatement(fn) {
+          const mark = this._stmtBegin();
+          try {
+              const r = fn();
+              this._stmtCommit(mark);
+              return r;
+          } catch (e) {
+              try { this._stmtRollback(mark); } catch (e2) { /* 巻き戻しの失敗で元の例外を隠さない */ }
+              throw e;
+          }
       },
 
       _executeTransaction(sql) {
@@ -242,7 +315,13 @@
                  if (this.undoLog[i].type === 'SAVEPOINT' && this.undoLog[i].name === name) { idx = i; break; }
              }
              if (idx === -1) throw new Error(`Savepoint '${name}' not found.`);
+             // 解放したセーブポイントより後に作られたセーブポイントも一緒に消える
+             // （SQL 標準。残しておくと入れ子の内側へ後から戻れてしまう）。
+             // undo エントリ本体は外側の ROLLBACK が必要とするので順序ごと残す
              this.undoLog.splice(idx, 1);
+             for (let i = this.undoLog.length - 1; i >= idx; i--) {
+                 if (this.undoLog[i].type === 'SAVEPOINT') this.undoLog.splice(i, 1);
+             }
              return { data: [{ Result: "Success", Message: `Savepoint '${name}' released.` }] };
           }
           else if (/^rollback\s+to\s+(?:savepoint\s+)?([a-zA-Z0-9_]+)$/i.test(sql)) {
@@ -260,7 +339,11 @@
              this.undoLog.length = idx + 1;
              return { data: [{ Result: "Success", Message: `Rolled back to savepoint '${name}'.` }] };
           }
-          else if (/^rollback$/i.test(sql.trim())) {
+          // ROLLBACK / ROLLBACK WORK / ROLLBACK TRANSACTION（標準のノイズ語）。
+          // 以前は素の ROLLBACK だけを受け、他は「Invalid transaction command.」で
+          // 弾いた上に**トランザクションを開いたまま**にしていたため、
+          // 「ロールバックしたつもりで続きを書く」という最悪の取り違えが起きた
+          else if (/^rollback(\s+(work|transaction))?$/i.test(sql.trim())) {
              if(!this.inTransaction) throw new Error("No active transaction.");
              for (let i = this.undoLog.length - 1; i >= 0; i--) {
                  this._applyUndoEntry(this.undoLog[i]);
@@ -269,6 +352,8 @@
              this.undoLog = [];
              return { data: [{ Result: "Success", Message: "Transaction Rolled Back" }] };
           }
-          throw new Error("Invalid transaction command.");
+          throw new Error(this.inTransaction
+              ? "Invalid transaction command. A transaction is still active — use COMMIT or ROLLBACK."
+              : "Invalid transaction command.");
       }
     });

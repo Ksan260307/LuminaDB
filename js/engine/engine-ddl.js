@@ -12,7 +12,7 @@
         'JSON': 'JSON_EXTRACT JSON_VALUE JSON_ARRAY JSON_OBJECT JSON_LENGTH JSON_KEYS JSON_VALID JSON_TYPE JSON_CONTAINS JSON_CONTAINS_PATH JSON_SET JSON_INSERT JSON_REPLACE JSON_REMOVE JSON_PRETTY JSON_QUOTE JSON_UNQUOTE JSON_ARRAY_APPEND JSON_ARRAY_INSERT JSON_MERGE_PATCH JSON_DEPTH',
         'Null & Flow': 'COALESCE IFNULL ISNULL NVL NVL2 ZEROIFNULL NULLIFZERO NULLIF DECODE CHOOSE IF IIF CASE CAST CONVERT TRY_CAST TRY_CONVERT',
         'Conversion': 'CAST CONVERT TRY_CAST TRY_CONVERT TO_NUMBER TO_CHAR TO_HEX TO_DATE TO_TIMESTAMP',
-        'Encoding & Hash': 'MD5 SHA1 TO_BASE64 FROM_BASE64 INET_ATON INET_NTOA',
+        'Encoding & Hash': 'MD5 SHA1 SHA2 SHA256 SHA224 TO_BASE64 FROM_BASE64 INET_ATON INET_NTOA',
         'Aggregate': 'COUNT SUM AVG MAX MIN GROUP_CONCAT STRING_AGG LISTAGG ARRAY_AGG STDDEV STDDEV_POP STDDEV_SAMP VARIANCE VAR_POP VAR_SAMP MEDIAN BIT_AND BIT_OR BIT_XOR BOOL_AND BOOL_OR CORR COVAR_POP COVAR_SAMP ANY_VALUE JSON_ARRAYAGG JSON_OBJECTAGG MIN_BY MAX_BY COUNT_IF PERCENTILE_CONT PERCENTILE_DISC GROUPING',
         'Window': 'ROW_NUMBER RANK DENSE_RANK LAG LEAD NTILE FIRST_VALUE LAST_VALUE NTH_VALUE PERCENT_RANK CUME_DIST',
         'Sequence': 'NEXTVAL CURRVAL SETVAL',
@@ -54,17 +54,45 @@
       },
 
       // FK 定義末尾の ON DELETE / ON UPDATE 参照アクションを解釈する。
-      // 未指定は RESTRICT（既定）。対応: CASCADE / SET NULL / RESTRICT / NO ACTION
+      // 未指定は RESTRICT（既定）。対応: CASCADE / SET NULL / SET DEFAULT / RESTRICT / NO ACTION
+      // （SET DEFAULT は v1.25 で追加。従来は綴りが解釈されず黙って RESTRICT に落ちていた）
       _parseFkActions(tail) {
           tail = tail || '';
-          const dm = tail.match(/on\s+delete\s+(cascade|set\s+null|no\s+action|restrict)/i);
-          const um = tail.match(/on\s+update\s+(cascade|set\s+null|no\s+action|restrict)/i);
+          const dm = tail.match(/on\s+delete\s+(cascade|set\s+null|set\s+default|no\s+action|restrict)/i);
+          const um = tail.match(/on\s+update\s+(cascade|set\s+null|set\s+default|no\s+action|restrict)/i);
           const norm = (mm) => mm ? mm[1].toUpperCase().replace(/\s+/g, ' ') : 'RESTRICT';
           return { onDelete: norm(dm), onUpdate: norm(um) };
       },
 
       // ADD CONSTRAINT <name> で付いた名前を表へ登録する（DROP CONSTRAINT の逆引き用）。
       // 実体は uniqueCols / compositeKeys / foreignKeys 側にあり、ここは索引だけを持つ
+      // 名前付き索引の台帳（this.indexNames）を列の改名・削除に追随させる。
+      // 台帳は Table.indices とは別管理なので、ここを忘れると
+      // 「SHOW INDEXES の名前が消える」「DROP INDEX で消せない索引が残る」ことになる。
+      // newCol が null のときは削除（その列を含む索引定義ごと落とす）
+      _syncIndexNamesOnColumnChange(table, oldCol, newCol) {
+          if (!this.indexNames) return;
+          for (const nm of Object.keys(this.indexNames)) {
+              const rec = this.indexNames[nm];
+              if (!rec || rec.table !== table) continue;
+              const cols = rec.cols || [];
+              if (!cols.some(c => String(c).toLowerCase() === oldCol)) continue;
+              if (newCol === null) delete this.indexNames[nm];
+              else rec.cols = cols.map(c => String(c).toLowerCase() === oldCol ? newCol : c);
+          }
+      },
+
+      // 削除しようとしている列に依存する生成列があれば明示的に拒否する。
+      // 黙って落とすと「その表へ挿入できない」状態になるだけで原因が判らない
+      _assertNoGeneratedDependents(t, table, col) {
+          for (const g in (t.generatedCols || {})) {
+              if (g === col) continue;
+              if (Table.exprRefsCol(t.generatedCols[g], col)) {
+                  throw new Error(`Cannot drop column '${col}': generated column '${g}' of '${table}' depends on it. Drop '${g}' first.`);
+              }
+          }
+      },
+
       _recordConstraintName(t, name, kind, cols) {
           if (!name) return;
           t.constraintNames = t.constraintNames || Object.create(null);
@@ -1406,6 +1434,7 @@
                   if (!this.tables[tn].cols[cn]) throw new Error(`Column '${cn}' not found in table '${tn}'.`);
               }
               const key = kind + ':' + target;
+              this._logCommentState(key);
               if (text === null) delete this.comments[key]; else this.comments[key] = text;
               return { data: [{ Result: "Success", Message: `Comment ${text === null ? 'removed' : 'set'} on ${kind} '${target}'.` }], affectedRows: 0 };
           }
@@ -1445,6 +1474,34 @@
           seed: 'float'                  // RAND()/RANDOM() の決定的な種（NULL で解除）
       },
 
+      // 全表の外部キーを走査し、親の無い子行の説明を配列で返す（空なら整合している）。
+      // SET FOREIGN_KEY_CHECKS = 1 に戻すときの検証に使う
+      _revalidateForeignKeys() {
+          const problems = [];
+          for (const tname in this.tables) {
+              if (tname.startsWith('__')) continue;
+              const t = this.tables[tname];
+              if (!t || !t.foreignKeys || t.foreignKeys.length === 0) continue;
+              for (const fk of t.foreignKeys) {
+                  const cols = this._fkCols(fk);
+                  const refCols = this._fkRefCols(fk);
+                  const refTbl = this.tables[fk.refTable];
+                  if (!refTbl) { problems.push(`${tname}: referenced table '${fk.refTable}' is missing`); continue; }
+                  for (let i = 0; i < t.rowCount; i++) {
+                      const tuple = this._fkTupleOrNull((c) => t.getValue(c, i), cols);
+                      if (tuple === null) continue;   // NULL を含むタプルは検査対象外
+                      const norm = tuple.map((v, j) => this._normalizeByColType(t, cols[j], v));
+                      if (this._fkMatchRows(refTbl, refCols, norm).length === 0) {
+                          problems.push(`${tname}(${cols.join(', ')}) = (${norm.join(', ')}) has no parent in ${fk.refTable}`);
+                          if (problems.length >= 50) return problems;   // 上限で打ち切る
+                          break;   // 同じ FK で延々報告しない
+                      }
+                  }
+              }
+          }
+          return problems;
+      },
+
       _executeSetSessionVar(sql, strMap) {
           const raw = this._restoreStrings(sql, strMap).replace(/;$/, '');
           // SET CONSTRAINTS { ALL | name[, ...] } { DEFERRED | IMMEDIATE }（SQL標準）。
@@ -1455,9 +1512,29 @@
               const mode = scM[2].toUpperCase();
               this.sessionSettings['constraints'] = mode;
               if (mode === 'DEFERRED') {
-                  this._warn('CONSTRAINTS_IMMEDIATE', 'SET CONSTRAINTS ... DEFERRED is accepted but constraints are always checked immediately in LuminaDB.');
+                  this._warn('CONSTRAINTS_IMMEDIATE', 'SET CONSTRAINTS ... DEFERRED is accepted but constraints are always checked immediately in LuminaDB. For mutually-referencing tables, use SET FOREIGN_KEY_CHECKS = 0 during the load and set it back to 1 afterwards (which re-validates every table).');
               }
               return { data: [{ Result: 'Success', Message: `Constraints set to ${mode} for ${scM[1]}.` }], affectedRows: 0 };
+          }
+          // SET FOREIGN_KEY_CHECKS = 0|1（MySQL）/ PRAGMA foreign_keys 相当。
+          // 相互参照する 2 表（社員↔部署のような定番の形）は、検査が常に即時だと
+          // どちらにも最初の 1 行を入れられない。取り込み・移行のための逃げ道として
+          // セッション単位で検査を止められるようにする。
+          // **再開時に全表を検査し直す**ので、黙って不整合が残ることはない（MySQL より厳しい）
+          const fkcM = raw.match(/^set\s+(?:session\s+|global\s+)?foreign_key_checks\s*(?::=|=|\s+to\s+)\s*(0|1|on|off|true|false)$/i);
+          if (fkcM) {
+              const v = fkcM[1].toLowerCase();
+              const on = !(v === '0' || v === 'off' || v === 'false');
+              this.fkChecksEnabled = on;
+              if (!on) {
+                  return { data: [{ Result: 'Success', Message: 'FOREIGN_KEY_CHECKS = 0. Foreign keys are not enforced until you set it back to 1 (which re-validates every table).' }], affectedRows: 0 };
+              }
+              const orphans = this._revalidateForeignKeys();
+              if (orphans.length > 0) {
+                  this.fkChecksEnabled = false;
+                  throw new Error(`Cannot re-enable FOREIGN_KEY_CHECKS: ${orphans.length} orphaned row(s) found — ${orphans.slice(0, 3).join('; ')}${orphans.length > 3 ? ' ...' : ''}. Fix the data first; FOREIGN_KEY_CHECKS is still 0.`);
+              }
+              return { data: [{ Result: 'Success', Message: 'FOREIGN_KEY_CHECKS = 1. All foreign keys re-validated.' }], affectedRows: 0 };
           }
           const m = raw.match(/^set\s+(?:session\s+|local\s+|global\s+)?([a-zA-Z_][a-zA-Z0-9_.]*)\s*(?::=|=|\s+to\s+)\s*([\s\S]+)$/i);
           if (!m) throw new Error("Syntax Error in SET. Use SET [SESSION] <name> = <value>.");
@@ -1952,8 +2029,22 @@
                     return { data: [{ Result: "Success", Message: `Index on ${table}(${cols.join(', ')}) already exists. Skipped.` }], affectedRows: 0 };
                 }
                 this._logTableMeta(table);
-                // UNIQUE INDEX は一意制約としても登録する（既存の重複は検出してエラー）
-                if (m[1]) {
+                // UNIQUE INDEX は一意制約としても登録する（既存の重複は検出してエラー）。
+                // **複数列の UNIQUE INDEX は「組（タプル）が一意」** であって
+                // 「各列がそれぞれ一意」ではない。従来は列ごとに uniqueCols へ入れていたため、
+                // (1,2) の後に (1,3) を入れられない＝正しい行が拒否される誤りだった
+                if (m[1] && cols.length > 1 && exprKeys.length === 0) {
+                    const seen = new Set();
+                    for (let r = 0; r < t.rowCount; r++) {
+                        const vals = cols.map(c => t.getValue(c, r));
+                        if (vals.some(v => v === null || v === undefined)) continue;   // NULL を含む組は検査しない
+                        const k = vals.map(v => String(v)).join(' ');
+                        if (seen.has(k)) throw new Error(`Cannot create UNIQUE index '${idxName}': duplicate key (${vals.join(', ')}) in ${table}(${cols.join(', ')}).`);
+                        seen.add(k);
+                    }
+                    const already = (t.compositeKeys || []).some(ck => !ck.isPK && ck.cols.length === cols.length && ck.cols.every((c, i) => c === cols[i]));
+                    if (!already) t.compositeKeys.push({ cols: cols.slice(), isPK: false });
+                } else if (m[1]) {
                     cols.forEach(c => {
                         const seen = new Set();
                         for (let r = 0; r < t.rowCount; r++) {
@@ -2322,6 +2413,18 @@
              resultSet = [{ Result: "Success", Message: `Sequence '${name}' dropped.` }];
           }
           else if (/^create\s+(?:(?:global|local)\s+)?(?:temp(?:orary)?\s+)?table/i.test(sql)) {
+             // 先頭が '__' の名前はエンジンの内部枠（カタログ項目 __views__ 等・一時表 __tmp_）と
+             // 衝突する。作れてしまうと SHOW TABLES に出ず、保存時にカタログ扱いされて
+             // **黙って消える**ため、作成時に明示的に拒否する
+             const resM = sql.match(/^create\s+(?:(?:global|local)\s+)?(?:temp(?:orary)?\s+)?table\s+(?:if\s+not\s+exists\s+)?(__[a-zA-Z0-9_]*)/i);
+             if (resM) {
+                 // ダブルクォートは（MySQL 既定と同じく）文字列リテラルなので、
+                 // 表名の位置に来ると退避トークンのまま届く。区切り識別子はバッククォート
+                 if (/^__STR_\d+__$/i.test(resM[1])) {
+                     throw new Error("A double-quoted value is a string literal, not a table name. Use backticks for a quoted identifier: CREATE TABLE `my table` (...).");
+                 }
+                 throw new Error(`Table name '${resM[1]}' is reserved: names beginning with '__' are used internally by LuminaDB. Choose another name.`);
+             }
              // CREATE [TEMPORARY] TABLE。TEMPORARY はセッション限り（IDB保存・SQLエクスポート対象外）
              // CREATE TABLE new LIKE src: スキーマ（型/制約/インデックス）のみ複製（データは含まない）
              const likeM = sql.match(/^create\s+(?:(?:global|local)\s+)?(temp(?:orary)?\s+)?table\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+like\s+([a-zA-Z0-9_]+)$/i);
@@ -2622,6 +2725,34 @@
                     if (!refTableExists(fk.refTable)) throw new Error(`Table '${fk.refTable}' not found for FOREIGN KEY on column '${fkCols.join(', ')}'.`);
                     refCols.forEach(rc => { if (!hasRefCol(fk.refTable, rc)) throw new Error(`Column '${rc}' not found in table '${fk.refTable}'.`); });
                     fkCols.forEach(c => { if (!colDefs.some(cd => cd.name === c)) throw new Error(`Column '${c}' not found for FOREIGN KEY constraint.`); });
+                    // 参照先には PRIMARY KEY か UNIQUE が要る（SQL 標準 / PostgreSQL / InnoDB）。
+                    // 一意でない列を参照できてしまうと、親に同じ値の行が複数あるとき
+                    // ON DELETE CASCADE が「まだ親が残っている子」まで消す。
+                    // 自己参照は作成中で this.tables に無いので、いま組み立てている定義側を見る
+                    const selfRef = fk.refTable === tableName;
+                    const refIsUnique = (() => {
+                        if (selfRef) {
+                            if (refCols.length === 1) {
+                                return primaryKey === refCols[0] || uniqueCols.includes(refCols[0])
+                                    || compositeDefs.some(ck => ck.cols.length === 1 && ck.cols[0] === refCols[0]);
+                            }
+                            return compositeDefs.some(ck => ck.cols.length === refCols.length
+                                && ck.cols.every(c => refCols.includes(c)));
+                        }
+                        const rt = this.tables[fk.refTable];
+                        if (!rt) return true;   // ここまで来ないが、存在検証は上で済んでいる
+                        if (refCols.length === 1) {
+                            return rt.primaryKey === refCols[0] || (rt.uniqueCols || []).includes(refCols[0])
+                                || (rt.compositeKeys || []).some(ck => ck.cols.length === 1 && ck.cols[0] === refCols[0]);
+                        }
+                        if ((rt.compositeKeys || []).some(ck => ck.cols.length === refCols.length
+                                && ck.cols.every(c => refCols.includes(c)))) return true;
+                        // 単一列 PK / UNIQUE の組み合わせでは複合参照を満たせない
+                        return false;
+                    })();
+                    if (!refIsUnique) {
+                        throw new Error(`FOREIGN KEY (${fkCols.join(', ')}) requires a PRIMARY KEY or UNIQUE constraint on ${fk.refTable}(${refCols.join(', ')}).`);
+                    }
                 });
 
                 const aiCols = colDefs.filter(c => c.autoInc);
@@ -2629,6 +2760,16 @@
 
                 const t = new Table();
                 colDefs.forEach(cd => t.addColumn(cd.name, cd.type));
+                // 桁指定・長さ指定を覚えておく。従来は「内部表現に影響しない」として
+                // 捨てていたため、DECIMAL(10,2) や VARCHAR(3) が単なる飾りで、
+                // 123.4567 や 8 文字がそのまま入っていた（CAST では正しく丸め・切り詰めるので
+                // 同じ規則を格納時にも適用する）
+                colDefs.forEach(cd => {
+                    const spec = this._normalizeCastType(cd.type);
+                    if (!spec.name) return;
+                    if (spec.name === 'DECIMAL' && spec.s !== null) t.colTypeSpec[cd.name] = { kind: 'DECIMAL', p: spec.p, s: spec.s };
+                    else if ((spec.name === 'TEXT' || spec.name === 'CHAR') && spec.p !== null) t.colTypeSpec[cd.name] = { kind: 'TEXT', len: spec.p };
+                });
                 t.foreignKeys = foreignKeys;
                 t.primaryKey = primaryKey;
                 t.uniqueCols = uniqueCols;
@@ -2673,6 +2814,7 @@
 
                  this._logFullTable(table);
                  this.tables[table].renameColumn(oldCol, newCol);
+                 this._syncIndexNamesOnColumnChange(table, oldCol, newCol);
                  resultSet = [{ Result: "Success", Message: `Column '${oldCol}' renamed to '${newCol}'.` }];
                  return { data: resultSet, affectedRows: 0 };
              }
@@ -2880,6 +3022,13 @@
                  const aliases = { [table]: table };
                  for (let i = 0; i < t.rowCount; i++) {
                      let ok; try { ok = fn({ [table]: i }, this.tables, aliases); } catch (e) { ok = false; }
+                     // NULL を含む行の評価は UNKNOWN(null) になる。SQL 標準では
+                     // CHECK は「偽のときだけ違反」なので UNKNOWN は満たしたものとして通す。
+                     // INSERT 側（_validateChecksAt / _validateChecksForChanges）は v1.24 で
+                     // そう直っていたが、この ALTER 側だけ取り残されており、
+                     // 「同じ制約を INSERT では通すのに、後から付けようとすると拒否される」
+                     // ＝ NULL を含む列へ CHECK を追加できない状態だった
+                     if (ok === null || ok === undefined) continue;
                      if (!ok) throw new Error(`CHECK constraint failed: existing data violates CHECK (${expr}).`);
                  }
                  this._logTableMeta(table);
@@ -3053,16 +3202,28 @@
 
              // MODIFY COLUMN / ALTER COLUMN: 既存カラムの型を変更（データは changeColumnType がキャスト）。
              // TYPE / SET DATA TYPE（SQL標準）の両綴りを受け、USING <expr> で変換式を与えられる
-             m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+(?:modify|alter)\s+(?:column\s+)?([a-zA-Z0-9_]+)\s+(?:set\s+data\s+type\s+|type\s+)?([a-zA-Z]+)(?:\s+using\s+([\s\S]+))?$/i);
+             // 型は VARCHAR(50) / DECIMAL(12,4) のような桁指定付きも受ける。
+             // 従来は `[a-zA-Z]+` しか許さず、`MODIFY COLUMN a VARCHAR(50)` が
+             // 「Syntax Error in ALTER TABLE.」になっていた（CAST 側は既に対応済みだった）
+             m = sql.match(/alter\s+table\s+([a-zA-Z0-9_]+)\s+(?:modify|alter)\s+(?:column\s+)?([a-zA-Z0-9_]+)\s+(?:set\s+data\s+type\s+|type\s+)?([a-zA-Z][a-zA-Z0-9_]*(?:\s+[a-zA-Z][a-zA-Z0-9_]*)?\s*(?:\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)(?:\s+using\s+([\s\S]+?))?$/i);
              if (m) {
                  const table = m[1].toLowerCase();
                  if (!this.tables[table]) throw new Error(`Table '${table}' not found.`);
                  const t = this.tables[table];
                  const colName = m[2].toLowerCase();
                  if (!t.cols[colName]) throw new Error(`Column '${colName}' not found.`);
-                 const newType = m[3].toUpperCase();
+                 // 方言別名（VARCHAR / INT / NUMBER ...）を正準名へ寄せる。桁指定は
+                 // 内部表現に影響しないので受理して捨てる（CAST と同じ扱い）
+                 const rawType = m[3].trim();
+                 const norm = this._normalizeCastType(rawType);
+                 const CANON = { INTEGER: 'INTEGER', DECIMAL: 'FLOAT', FLOAT: 'FLOAT', DOUBLE: 'FLOAT',
+                                 BOOLEAN: 'BOOLEAN', DATEONLY: 'DATE', DATE: 'DATE', DATETIME: 'DATE', TIME: 'TEXT',
+                                 TEXT: 'TEXT', CHAR: 'TEXT', JSON: 'TEXT', BLOB: 'TEXT' };
                  const validTypes = ['INTEGER', 'FLOAT', 'BOOLEAN', 'DATE', 'TEXT', 'ANY'];
-                 if (!validTypes.includes(newType)) throw new Error(`Unknown type '${newType}'. Use ${validTypes.join('/')}.`);
+                 let newType = rawType.replace(/\s*\([\s\S]*$/, '').toUpperCase();
+                 if (validTypes.includes(newType)) { /* そのまま */ }
+                 else if (norm.name && CANON[norm.name]) newType = CANON[norm.name];
+                 else throw new Error(`Unknown type '${rawType}'. Use ${validTypes.join('/')} or a standard alias (VARCHAR, INT, DECIMAL, ...).`);
 
                  // USING <expr>: 旧行の値で式を評価してから新しい型で格納する（PostgreSQL 互換）
                  let transform = null;
@@ -3204,8 +3365,10 @@
                  if (!this.tables[table].cols[colName]) {
                      return { data: [{ Result: "Success", Message: `Column '${colName}' does not exist. Skipped.` }], affectedRows: 0 };
                  }
+                 this._assertNoGeneratedDependents(this.tables[table], table, colName);
                  this._logFullTable(table);
                  this.tables[table].dropColumn(colName);
+                 this._syncIndexNamesOnColumnChange(table, colName, null);
                  return { data: [{ Result: "Success", Message: `Column '${colName}' dropped.` }], affectedRows: 0 };
              }
 
@@ -3216,8 +3379,10 @@
                  const colName = m[2].toLowerCase();
                  if (!this.tables[table].cols[colName]) throw new Error(`Column '${colName}' not found.`);
 
+                 this._assertNoGeneratedDependents(this.tables[table], table, colName);
                  this._logFullTable(table); // 列構成が変わるため全体スナップショット
                  this.tables[table].dropColumn(colName);
+                 this._syncIndexNamesOnColumnChange(table, colName, null);
                  resultSet = [{ Result: "Success", Message: `Column '${colName}' dropped.` }];
                  return { data: resultSet, affectedRows: 0 };
              }
@@ -3248,9 +3413,36 @@
                 names.forEach(n => { if (!this.tables[n]) throw new Error(`Table '${n}' not found.`); });
                 const restartIdentity = /\brestart\s+identity\b/i.test(sql);
                 const continueIdentity = /\bcontinue\s+identity\b/i.test(sql);
+                // 外部キーの検査。TRUNCATE は DELETE と違って参照を一切見ておらず、
+                // 直前の DELETE が拒否される表でも丸ごと空にできてしまい、
+                // 子行が親の無い状態で残った（黙って参照整合性が壊れる）。
+                // PostgreSQL に合わせて既定 RESTRICT ＝拒否、CASCADE なら子表も空にする。
+                // 変更を始める前に対象集合を確定させ、文全体を all-or-nothing に保つ
+                const cascade = /(?:^|\s)cascade\s*$/i.test(opts);
+                const truncSet = new Set(names);
+                if (this.fkChecksEnabled !== false) {
+                    const queue = [...names];
+                    while (queue.length > 0) {
+                        const parent = queue.shift();
+                        for (const otherName in this.tables) {
+                            const other = this.tables[otherName];
+                            if (!other || !other.foreignKeys) continue;
+                            const refs = other.foreignKeys.some(fk => String(fk.refTable).toLowerCase() === parent);
+                            if (!refs || truncSet.has(otherName)) continue;
+                            // 自表を参照する FK（自己参照）は行を全部消せば矛盾しないので許す
+                            if (otherName === parent) continue;
+                            if (!cascade) {
+                                throw new Error(`Table '${parent}' cannot be truncated: it is referenced by a foreign key on '${otherName}'. Use TRUNCATE ${parent} CASCADE, or delete the referencing rows first.`);
+                            }
+                            truncSet.add(otherName);
+                            queue.push(otherName);
+                        }
+                    }
+                }
+                const truncNames = [...truncSet];
                 const notes = [];
                 affectedRows = 0;
-                names.forEach(table => {
+                truncNames.forEach(table => {
                     this._cowColumns(table, 'ALL');
                     const t = this.tables[table];
                     // 採番は既存行の最大値から続く実装なので、行を消すと自然に 1 へ戻る。

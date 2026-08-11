@@ -3,7 +3,7 @@
     // 各機能メソッドは engine-*.js で prototype 拡張として定義される
     // ============================================================================
     // エンジンバージョン（VERSION() 関数 / SHOW STATUS / 外部APIが参照する）
-    var LUMINA_VERSION = '1.22.0';
+    var LUMINA_VERSION = '1.27.0';
 
     class DatabaseEngine {
       constructor() {
@@ -23,6 +23,10 @@
         // ロール・ユーザー（LuminaDB に認証機構は無い。移行スクリプトを通すための名簿）。
         // IDB保存対象外（セッション限り）
         this.roles = Object.create(null);
+        // 外部キー検査の有効/無効（SET FOREIGN_KEY_CHECKS = 0|1）。セッション限りで
+        // IDB 保存対象外。相互参照する表への初回投入や一括取り込みのための逃げ道で、
+        // 1 に戻すときに全表を検査し直すので不整合が残ったままにはならない
+        this.fkChecksEnabled = true;
         // ユーザー変数 (SET @name = ...)。セッション限り（IDB保存対象外）
         this.userVars = Object.create(null);
         // プリペアドステートメント (PREPARE name FROM '...')。セッション限り・非トランザクション
@@ -70,6 +74,77 @@
         this._isShowWarnings = false;
         this._attachEngineRef();
         this._initDefaultData();
+      }
+
+      // バッククォート識別子 `x` を素の x へ戻す（MySQL 形式の区切り識別子）。
+      // 主用途は「予約語を列名・表名に使う」こと（`order` / `select` など）。
+      // LuminaDB の識別子は英数字とアンダースコアなので、それ以外の文字を含む名前は
+      // 受理せず明示エラーにする（黙って別名を作るより判るほうがよい）。
+      // 二重バッククォート ``` `` ``` は名前中の 1 文字として扱う（MySQL と同じ）
+      // エラーメッセージに内部トークンが残っていたら、人が読める形へ直す。
+      //
+      // 文字列を退避した後の SQL でエラーを組み立てる箇所が多数あるため、
+      // `SELECT * FROM "some table"` が `Table '__str_0__' not found.` になっていた
+      // （ダブルクォートは MySQL 既定どおり文字列リテラルなので表名にはならない）。
+      // 個々の throw を全部直すのは漏れるので、最後の出口で一括して言い換える
+      _humanizeError(msg, strMap) {
+          if (!msg || msg.indexOf('__str_') === -1 && msg.indexOf('__STR_') === -1) return msg;
+          let out = msg.replace(/__STR_(\d+)__/gi, (m, i) => {
+              const lit = strMap && strMap[Number(i)];
+              return lit === undefined ? m : this._unquoteLiteral(lit);
+          });
+          // ダブルクォートの意味を説明する。バックティックは「予約語を識別子として
+          // 使う」ためのもので、空白入りの名前を許すわけではない（識別子は
+          // [a-zA-Z_][a-zA-Z0-9_]* のみ）ので、そこまで含めて正確に案内する
+          if (/not found/i.test(msg)) {
+              out += ' (Note: "..." is a string literal in LuminaDB, as in MySQL — it is not an identifier.'
+                  + ' Use a bare name, or backticks if the name is a reserved word (`order`).'
+                  + ' Identifiers may contain only letters, digits and underscores.)';
+          }
+          return out;
+      }
+
+      _unquoteBacktickIdents(sql) {
+          let out = '', i = 0;
+          while (i < sql.length) {
+              if (sql[i] !== '`') { out += sql[i]; i++; continue; }
+              let j = i + 1, name = '';
+              for (; j < sql.length; j++) {
+                  if (sql[j] !== '`') { name += sql[j]; continue; }
+                  if (sql[j + 1] === '`') { name += '`'; j++; continue; }
+                  break;
+              }
+              if (j >= sql.length) throw new Error("Unterminated quoted identifier: a '`' is not closed.");
+              if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+                  throw new Error(`Quoted identifier '${name}' is not usable: LuminaDB identifiers may contain only letters, digits and underscores, and cannot start with a digit.`);
+              }
+              out += name;
+              i = j + 1;
+          }
+          return out;
+      }
+
+      // `ALTER TABLE t <action>, <action>` を個別の ALTER 文の配列へ分解する。
+      // 分解できない（単一アクション／すべての断片がアクション動詞で始まらない）ときは
+      // null を返し、従来どおり 1 文として処理させる。
+      // カンマは括弧の外側だけを数える（`ADD PRIMARY KEY (a, b)` を割らないため）
+      _splitAlterActions(sql) {
+          const head = sql.match(/^alter\s+table\s+(?:if\s+exists\s+)?[a-zA-Z0-9_]+\s+/i);
+          if (!head) return null;
+          const body = sql.slice(head[0].length);
+          const parts = [];
+          let cur = '', depth = 0;
+          for (const ch of body) {
+              if (ch === '(' || ch === '[') depth++;
+              else if (ch === ')' || ch === ']') depth--;
+              if (ch === ',' && depth === 0) { parts.push(cur.trim()); cur = ''; }
+              else cur += ch;
+          }
+          parts.push(cur.trim());
+          if (parts.length < 2) return null;
+          const ACTION = /^(add|drop|modify|change|alter|rename|set|reset|enable|disable|validate|owner|inherit|no)\b/i;
+          if (!parts.every(p => p !== '' && ACTION.test(p))) return null;
+          return parts.map(p => head[0] + p);
       }
 
       // 致命的でない問題を「警告」として記録する。エラーと違い実行は続行し、
@@ -199,7 +274,20 @@
             // 「直前の文」の警告を読む文なので、この 2 つだけはリセットしない（MySQL と同じ）
             this._isShowWarnings = /^\s*show\s+(?:count\s*\(\s*\*\s*\)\s+)?warnings\b/i.test(sql);
             if (!this._isShowWarnings) this._warnings = [];
-            sql = this._maskStrings(sql, strMap);
+            // ここはまだ try の外なので、投げると呼び出し側へ生の JS 例外が漏れる。
+            // _maskStrings は 16 進リテラルの桁数不正で throw し得るため包む
+            try { sql = this._maskStrings(sql, strMap); }
+            catch (e) { return { error: e.message }; }
+            // バッククォートで囲んだ識別子（MySQL 形式）を素の識別子へ戻す。
+            // 文字列を退避した後に行うので、データ中のバッククォートには触らない。
+            // 従来は素通しで、`` `order` `` という列名がそのまま作られたり
+            // `` `col name` `` が `` `col `` に切れたりしていた（黙って壊れる）
+            // 不正な区切り識別子はエラー結果として返す（この時点はまだ try の外なので、
+            // 例外のまま投げると呼び出し側へ生の JS 例外として漏れる）
+            if (sql.indexOf('`') !== -1) {
+                try { sql = this._unquoteBacktickIdents(sql); }
+                catch (e) { return { error: e.message }; }
+            }
             // 文単位の実行時間上限。ネストした executeQuery は最上位の期限を引き継ぐ
             this._deadline = this.statementTimeoutMs > 0 ? (startTime + this.statementTimeoutMs) : 0;
         }
@@ -262,6 +350,14 @@
           if (/^select/i.test(sql)) {
               sql = sql.replace(/\s+FOR\s+(?:UPDATE|SHARE|KEY\s+SHARE|NO\s+KEY\s+UPDATE)(?:\s+OF\s+[a-zA-Z0-9_,\s]+?)?(?:\s+(?:NOWAIT|SKIP\s+LOCKED))?\s*$/i, '');
           }
+          // 集合演算の枝を括弧で包む書き方 `(SELECT ...) UNION (SELECT ...)` や、
+          // 文全体を括弧で包んだ `(SELECT ...)` を括弧無しの等価な形へ正規化する。
+          // サブクエリ展開より前に行うこと（後だと枝が派生表として実体化されてしまう）
+          if (!isSubquery && /^\(\s*(?:select|with)\b/i.test(sql)) {
+              const segs0 = this._splitUnion(sql);
+              sql = segs0.map((s2, i) => (i === 0 ? '' : s2.op + ' ') + s2.sql).join(' ').trim();
+          }
+
           // 単一スキーマ (main / public) の修飾は取り除いて素の表名にする
           if (/\b(?:main|public)\s*\.\s*[a-zA-Z_]/i.test(sql)) {
               sql = sql.replace(/\b(?:main|public)\s*\.\s*(?=[a-zA-Z_])/gi, '');
@@ -279,6 +375,22 @@
           // SHOW 文の FROM はメタデータの対象指定（`SHOW COLUMNS FROM v` / `SHOW TRIGGERS FROM v`）
           // であってクエリのデータ源ではない。ビュー展開に通すと名前が SELECT へ
           // 書き換わって対象が特定できなくなるため除外する
+          // CHECK 制約・DEFAULT 式の中のサブクエリは、この後の expandSubqueries が
+          // 「定義した瞬間の結果」へ畳み込んでしまう。畳み込まれた式はそのまま
+          // スキーマへ保存されるので、後から親表が変わっても追従せず、
+          // 正しい行を拒否し・不正な行を通す（両方向に誤る）。実DBはどれも
+          // 定義時に拒否するので、こちらも拒否する。CTAS の AS SELECT は対象外
+          if (!isSubquery
+              && /^create\s+(?:global\s+|local\s+)?(?:temp(?:orary)?\s+)?table\b/i.test(sql)
+              && !/\bas\s+select\b/i.test(sql)
+              && /\(\s*select\b/i.test(sql)) {
+              throw new Error("A CHECK constraint or DEFAULT expression cannot contain a subquery. Use a FOREIGN KEY constraint or a trigger instead.");
+          }
+          if (!isSubquery
+              && /^alter\s+table\b/i.test(sql)
+              && /\bcheck\s*\([\s\S]*\(\s*select\b/i.test(sql)) {
+              throw new Error("A CHECK constraint cannot contain a subquery. Use a FOREIGN KEY constraint or a trigger instead.");
+          }
           if (!isSubquery
               && !/^create\s+(or\s+replace\s+)?(view|procedure|trigger|function)\b/i.test(sql)
               && !/^show\b/i.test(sql)
@@ -293,12 +405,19 @@
           if (isAnalyze && !/^select/i.test(sql)) {
               throw new Error("EXPLAIN ANALYZE supports SELECT statements only.");
           }
+          // 素の EXPLAIN も SELECT 以外は拒否する。isExplain は SELECT の分岐でしか
+          // 見ていなかったため、`EXPLAIN DELETE FROM t` や `EXPLAIN DROP TABLE t` が
+          // **計画ではなく本体を実行**していた（実DBはどれも実行しない）。
+          // ここは各ディスパッチ分岐より前なので、まだ何も書き換わっていない
+          if (isExplain && !/^select/i.test(sql) && !/^\(\s*(?:select|with)\b/i.test(sql)) {
+              throw new Error("EXPLAIN supports SELECT statements only.");
+          }
 
           if (/^(begin|start|commit|rollback|savepoint|release)/i.test(sql)) {
              const res = this._executeTransaction(sql);
              resultSet = res.data;
           }
-          else if (/^select/i.test(sql)) {
+          else if (/^select/i.test(sql) || /^\(\s*(?:select|with)\b/i.test(sql)) {
              // SQL Server の SELECT ... INTO <newtable> FROM ...: 結果から新テーブルを作る
              // （CREATE TABLE ... AS SELECT と同義）。INTO を外して本体を実行し実体化する。
              const intoM = sql.match(/^([\s\S]*?)\s+INTO\s+([a-zA-Z0-9_]+)\s+(FROM\b[\s\S]*)$/i);
@@ -477,6 +596,19 @@
              affectedRows = res.affectedRows;
           }
           else if (/^(create|truncate|drop|alter|rename|optimize|vacuum)/i.test(sql)) {
+             // ALTER TABLE t <action>, <action>, ... （カンマ区切りの複数アクション）は
+             // 標準・MySQL・PostgreSQL いずれも認める形。個別アクションへ分解して順に適用する。
+             // 従来は 1 つ目しか見ないか構文エラーになっていた
+             const multi = this._splitAlterActions(sql);
+             if (multi) {
+                 const msgs = [];
+                 for (const one of multi) {
+                     const r = this._executeDDL(one, strMap);
+                     (r.data || []).forEach(d => { if (d && d.Message) msgs.push(d.Message); });
+                 }
+                 resultSet = [{ Result: "Success", Message: msgs.join(' ') }];
+                 affectedRows = 0;
+             } else {
              const res = this._executeDDL(sql, strMap);
              resultSet = res.data;
              affectedRows = res.affectedRows || 0;
@@ -486,6 +618,7 @@
                  && /\bSkipped\.$/.test(resultSet[0].Message)) {
                  this._warn('DDL_NOOP', resultSet[0].Message);
              }
+             }
           }
           else {
              throw new Error("Syntax Error or Unsupported Command.");
@@ -493,10 +626,11 @@
 
         } catch (e) {
           if (!isSubquery) this.cleanupTempTables();
-          if (isTopLevel) { this._deadline = 0; this._recordProfile(rawSql, startTime, -1, e.message); }
+          const msg = this._humanizeError(e.message, strMap);
+          if (isTopLevel) { this._deadline = 0; this._recordProfile(rawSql, startTime, -1, msg); }
           return this._warnings && this._warnings.length > 0
-              ? { error: e.message, warnings: this._warnings.slice() }
-              : { error: e.message };
+              ? { error: msg, warnings: this._warnings.slice() }
+              : { error: msg };
         }
 
         if (!isSubquery) this.cleanupTempTables();

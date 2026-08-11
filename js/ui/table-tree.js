@@ -8,6 +8,10 @@
     // 展開状態はここで保持して描き直しても畳まれないようにする
     const expandedTables = new Set();
 
+    // スキーマ検索の入力値（表名・列名の部分一致で絞り込む）。
+    // renderTree() は毎回作り直すので、状態はここに持つ
+    let schemaSearchText = '';
+
     // 列の制約バッジ。実DBクライアントと同じく一目で鍵と NULL 可否が分かるようにする
     function columnBadges(t, col) {
       const badges = [];
@@ -68,10 +72,26 @@
       tree.innerHTML = '';
       [genSel, helpSel, csvSel].forEach(s => s.innerHTML = '');
 
+      // スキーマ検索: 表名か列名に部分一致（大小無視）する表だけを出す。
+      // 列名で当たった表は自動的に展開して、どの列が当たったかすぐ判るようにする
+      const q = (schemaSearchText || '').trim().toLowerCase();
+      const colHit = (tbl) => q !== '' && db.tables[tbl].getColumnNames().some(c => c.toLowerCase().includes(q));
+      const tableMatches = (tbl) => q === '' || tbl.toLowerCase().includes(q) || colHit(tbl);
+      let shownTables = 0, totalTables = 0;
+
       Object.keys(db.tables).forEach(tbl => {
         if(tbl.startsWith('__tmp_')) return;
+        totalTables++;
+        // 選択肢（Test Data / Help / CSV）は検索に関わらず全表を載せる
+        [genSel, helpSel, csvSel].forEach(s => {
+          const opt = document.createElement('option');
+          opt.value = tbl; opt.textContent = tbl;
+          s.appendChild(opt);
+        });
+        if (!tableMatches(tbl)) return;
+        shownTables++;
 
-        const isOpen = expandedTables.has(tbl);
+        const isOpen = expandedTables.has(tbl) || colHit(tbl);
         const li = document.createElement('li');
         li.innerHTML = `
         <div class="flex justify-between items-center group">
@@ -91,13 +111,30 @@
         </div>`;
         if (isOpen) li.appendChild(buildColumnList(tbl));
         tree.appendChild(li);
-
-        [genSel, helpSel, csvSel].forEach(s => {
-          const opt = document.createElement('option');
-          opt.value = tbl; opt.textContent = tbl;
-          s.appendChild(opt);
-        });
       });
+
+      // CSV の取り込み先には「新しい表を作る」を先頭に足す。
+      // 既存表が 1 つも無いときでも CSV から始められるようにするため
+      if (csvSel) {
+          const opt = document.createElement('option');
+          opt.value = '__new__';
+          opt.textContent = '＋ 新しい表を作る';
+          // 末尾に置く（既存表を既定の取り込み先にしたいので先頭にはしない）
+          csvSel.appendChild(opt);
+          if (typeof syncCsvNewTableRow === 'function') syncCsvNewTableRow();
+      }
+
+      // 検索中は「何件に絞られているか」を出す（0 件のときの無言の空欄を避ける）
+      const note = document.getElementById('schemaSearchNote');
+      if (note) {
+        if (q === '') { note.classList.add('hidden'); note.textContent = ''; }
+        else {
+          note.classList.remove('hidden');
+          note.textContent = shownTables === 0
+              ? `「${schemaSearchText}」に一致する表・列はありません（全 ${totalTables} 表）。`
+              : `${shownTables} / ${totalTables} 表を表示中`;
+        }
+      }
 
       // ビュー / トリガー等のセクション（存在する場合のみ表示）。
       // makeQuery が null の項目はクリックしても何もしない（純粋な一覧表示）
@@ -178,4 +215,84 @@
 
       renderHelpCommands();
     }
+
+    // ============================================================================
+    // 表の右クリックメニュー
+    // DDL の確認・データの閲覧・件数・削除は、これまで SQL を手で書くしか
+    // 到達手段が無かった。実 DB クライアントと同じくツリーから辿れるようにする
+    // ============================================================================
+    function closeTreeMenu() {
+        const m = document.getElementById('treeMenu');
+        if (m) { m.classList.add('hidden'); m.innerHTML = ''; }
+    }
+
+    function openTreeMenu(table, x, y) {
+        const menu = document.getElementById('treeMenu');
+        if (!menu) return;
+        const run = (sql) => { setQueryValue(sql); runQuery(); };
+        const items = [
+            { label: 'データを見る（先頭 100 行）', act: () => run(`SELECT * FROM ${table} LIMIT 100`) },
+            { label: '件数を数える', act: () => run(`SELECT COUNT(*) AS rows FROM ${table}`) },
+            { label: 'DDL を表示', act: () => run(`SHOW CREATE TABLE ${table}`) },
+            { label: '列の一覧', act: () => run(`DESCRIBE ${table}`) },
+            { label: '列プロファイル', act: () => { if (typeof openProfile === 'function') openProfile(table); } },
+            { label: 'スキーマを編集', act: () => openSchemaEditor(table) },
+            { label: '表名をコピー', act: () => {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(table).then(() => showToast(`'${table}' をコピーしました。`)).catch(() => {});
+                }
+            } },
+            { sep: true },
+            { label: '表を削除', danger: true, act: () => {
+                // 破壊的操作なのでエディタへ置くだけにし、実行はユーザーに委ねる
+                setQueryValue(`DROP TABLE ${table}`);
+                showToast(`DROP 文をエディタへ入れました。実行すると ${table} は消えます。`, true);
+            } }
+        ];
+        menu.innerHTML = '';
+        items.forEach(it => {
+            if (it.sep) {
+                const hr = document.createElement('div');
+                hr.className = 'my-1 border-t border-gray-100';
+                menu.appendChild(hr);
+                return;
+            }
+            const b = document.createElement('button');
+            b.className = `w-full text-left px-3 py-1.5 hover:bg-gray-100 transition-colors ${it.danger ? 'text-red-600' : 'text-gray-700'}`;
+            b.textContent = it.label;   // textContent なのでエスケープ不要
+            b.addEventListener('click', () => { closeTreeMenu(); it.act(); });
+            menu.appendChild(b);
+        });
+        menu.classList.remove('hidden');
+        // 画面からはみ出さない位置へ寄せる
+        const r = menu.getBoundingClientRect();
+        menu.style.left = Math.min(x, window.innerWidth - r.width - 8) + 'px';
+        menu.style.top = Math.min(y, window.innerHeight - r.height - 8) + 'px';
+    }
+
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest || !e.target.closest('#treeMenu')) closeTreeMenu();
+    });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeTreeMenu(); });
+    document.getElementById('tableTree').addEventListener('contextmenu', (e) => {
+        const btn = e.target.closest('.table-select-btn');
+        if (!btn) return;
+        e.preventDefault();
+        openTreeMenu(btn.dataset.table, e.clientX, e.clientY);
+    });
+
+    // スキーマ検索の入力配線（要素が無い環境でも落ちないよう存在確認する）
+    (function initSchemaSearch() {
+      const input = document.getElementById('schemaSearch');
+      const clear = document.getElementById('schemaSearchClear');
+      if (!input) return;
+      input.addEventListener('input', () => { schemaSearchText = input.value; renderTree(); });
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') { input.value = ''; schemaSearchText = ''; renderTree(); }
+      });
+      if (clear) clear.addEventListener('click', () => {
+        input.value = ''; schemaSearchText = ''; renderTree(); input.focus();
+      });
+    })();
+
     renderTree();

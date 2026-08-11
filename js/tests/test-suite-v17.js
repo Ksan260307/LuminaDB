@@ -180,7 +180,7 @@
       push('V17Udf replace', "CREATE OR REPLACE FUNCTION v17_tax(a) RETURNS FLOAT AS RETURN a * 2", r => r.data[0].Result === 'Success');
       push('V17Udf replaced value', "SELECT v17_tax(5) AS x", r => r.data[0].x === 10);
       push('V17Udf drop', "DROP FUNCTION v17_tax", r => r.data[0].Result === 'Success');
-      err('V17Udf gone', "SELECT v17_tax(1) AS x", 'not found');
+      err('V17Udf gone', "SELECT v17_tax(1) AS x", 'does not exist');
 
       // ------------------------------------------------------------
       // 9. INFORMATION_SCHEMA
@@ -289,8 +289,13 @@
       // 14. 日付リテラルのタイムゾーン修正
       // ------------------------------------------------------------
       push('V17Ts literal', "SELECT TIMESTAMP '2026-03-04 10:20:30' AS d", r => r.data[0].d === '2026-03-04 10:20:30');
-      push('V17Ts date literal', "SELECT DATE '2026-03-04' AS d", r => r.data[0].d === '2026-03-04 00:00:00');
-      push('V17Ts cast agrees', "SELECT CAST('2026-03-04 10:20:30' AS DATE) AS d", r => r.data[0].d === '2026-03-04 10:20:30');
+      // v1.25: DATE は「日付だけ」、DATETIME / TIMESTAMP は「日付＋時刻」で区別する。
+      // 比較は時刻へ寄せて行うので、表記が違っても同じ瞬間なら一致する
+      push('V17Ts date literal', "SELECT DATE '2026-03-04' AS d", r => r.data[0].d === '2026-03-04');
+      push('V17Ts timestamp literal keeps the time', "SELECT TIMESTAMP '2026-03-04 10:20:30' AS d", r => r.data[0].d === '2026-03-04 10:20:30');
+      push('V17Ts cast to date truncates', "SELECT CAST('2026-03-04 10:20:30' AS DATE) AS d", r => r.data[0].d === '2026-03-04');
+      push('V17Ts cast to datetime keeps the time', "SELECT CAST('2026-03-04 10:20:30' AS DATETIME) AS d", r => r.data[0].d === '2026-03-04 10:20:30');
+      push('V17Ts date and timestamp compare equal', "SELECT DATE '2026-03-04' = TIMESTAMP '2026-03-04 00:00:00' AS x", r => r.data[0].x === true);
       push('V17Ts extract', "SELECT EXTRACT(HOUR FROM TIMESTAMP '2026-03-04 10:20:30') AS h", r => r.data[0].h === 10);
       push('V17Ts compare', "SELECT (TIMESTAMP '2026-03-04 10:00:00' > TIMESTAMP '2026-03-04 09:00:00') AS x", r => r.data[0].x === true);
 

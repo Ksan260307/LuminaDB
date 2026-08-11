@@ -29,6 +29,7 @@
             onUpdateNowCols: t.onUpdateNowCols || [],
             identityFloor: t.identityFloor || 1,
             collations: t.collations,
+            colTypeSpec: t.colTypeSpec,
             // 差分保存用の指紋。前回保存時と同じなら中身は書き直さない
             // （変更世代・行数・容量の3点。値の上書きは version、行の増減は rowCount が拾う）
             fp: `${t.version || 0}:${t.rowCount}:${t.capacity}`,
@@ -104,6 +105,7 @@
           t.constraintNames = Object.assign(Object.create(null), dt.constraintNames || {});
           t.identityFloor = dt.identityFloor || 1;
           t.collations = Object.assign(Object.create(null), dt.collations || {});
+          t.colTypeSpec = Object.assign(Object.create(null), dt.colTypeSpec || {});
           t.rebuildIndices();
           // PK / UNIQUE の自動インデックスに加え、ユーザー作成インデックスも復元する
           [...(t.primaryKey ? [t.primaryKey] : []), ...t.uniqueCols, ...(dt.indexCols || [])].forEach(c => { if (t.cols[c]) t.createIndex(c); });
@@ -288,8 +290,18 @@
                   }
               }
 
+              // 索引は登録されている名前で出す（無い場合だけ従来の合成名にする）。
+              // PRIMARY KEY / UNIQUE 由来の索引は CREATE TABLE 側の制約で復元されるので
+              // 重ねて出さない（従来は必ず出していたため、取り込むと余計な索引が増えていた）
+              const namedIdx = Object.create(null);
+              for (const nm in (this.indexNames || {})) {
+                  const rec = this.indexNames[nm];
+                  if (rec && rec.table === tName && (rec.cols || []).length === 1) namedIdx[rec.cols[0]] = nm;
+              }
+              const implicitIdx = new Set([t.primaryKey].concat(t.uniqueCols || []).filter(Boolean));
               for (let c in t.indices) {
-                  sqlLines.push(`CREATE INDEX idx_${tName}_${c} ON ${tName} (${c});`);
+                  if (implicitIdx.has(c) && !namedIdx[c]) continue;
+                  sqlLines.push(`CREATE INDEX ${namedIdx[c] || `idx_${tName}_${c}`} ON ${tName} (${c});`);
               }
           }
           // ビュー定義を出力（プロシージャは本体に';'を含むためSQLエクスポート対象外）
@@ -302,6 +314,33 @@
               const s = this.sequences[sn];
               sqlLines.push(`CREATE SEQUENCE ${sn} START WITH ${s.start} INCREMENT BY ${s.increment};`);
               if (s.value !== null) sqlLines.push(`SELECT SETVAL('${sn}', ${s.value});`);
+          }
+          // ユーザー定義関数 / プロシージャ / トリガー / コメント。
+          // 従来はどれも出力されず、SQL ダンプがスキーマの完全なバックアップに
+          // なっていなかった（表とビューとシーケンスだけが戻る状態だった）。
+          // 本体に ';' を含むが、取り込み側の splitStatements は
+          // CREATE PROCEDURE / TRIGGER / FUNCTION の BEGIN...END を 1 文として保つ
+          for (const fn in (this.functions || {})) {
+              const f = this.functions[fn];
+              const params = (f.params || []).map(p => (typeof p === 'string' ? `${p} ANY` : `${p.name} ${p.type || 'ANY'}`)).join(', ');
+              sqlLines.push(`CREATE FUNCTION ${fn}(${params}) RETURNS ${f.returns || 'ANY'} AS RETURN ${f.body};`);
+          }
+          for (const pn in (this.procedures || {})) {
+              const body = this.procedures[pn];
+              const stmts = Array.isArray(body) ? body : [String(body)];
+              const params = (this.procParams && this.procParams[pn]) ? this.procParams[pn].join(', ') : '';
+              sqlLines.push(`CREATE PROCEDURE ${pn}(${params}) BEGIN ${stmts.map(x => `${x};`).join(' ')} END;`);
+          }
+          for (const tn in (this.triggers || {})) {
+              const tr = this.triggers[tn];
+              const stmts = Array.isArray(tr.statements) ? tr.statements : [String(tr.statements)];
+              sqlLines.push(`CREATE TRIGGER ${tn} ${String(tr.timing).toUpperCase()} ${String(tr.event).toUpperCase()} ON ${tr.table} FOR EACH ROW BEGIN ${stmts.map(x => `${x};`).join(' ')} END;`);
+          }
+          for (const key in (this.comments || {})) {
+              const i = key.indexOf(':');
+              if (i === -1) continue;
+              const kind = key.slice(0, i).toUpperCase(), target = key.slice(i + 1);
+              sqlLines.push(`COMMENT ON ${kind} ${target} IS ${this._quoteLiteral(this.comments[key])};`);
           }
           return sqlLines.join('\n');
       },

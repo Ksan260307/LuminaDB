@@ -91,12 +91,16 @@
         { name: "XCplx: Window Lag Offset 3", sql: "SELECT id, LAG(salary, 3) OVER(ORDER BY id ASC) AS pv FROM cq_emp ORDER BY id ASC LIMIT 4", check: r => r.data[0].pv === null && r.data[2].pv === null && r.data[3].pv === 500 },
         { name: "XCplx: Window NTILE 2", sql: "SELECT id, NTILE(2) OVER(ORDER BY id ASC) AS nt FROM cq_emp ORDER BY id ASC", check: r => r.data[4].nt === 1 && r.data[5].nt === 2 },
         { name: "XCplx: Window NTILE 3 Uneven", sql: "SELECT id, NTILE(3) OVER(ORDER BY id ASC) AS nt FROM cq_emp ORDER BY id ASC", check: r => r.data[3].nt === 1 && r.data[4].nt === 2 && r.data[6].nt === 2 && r.data[7].nt === 3 },
-        { name: "XCplx: Window First Last Value", sql: "SELECT FIRST_VALUE(name) OVER(ORDER BY salary ASC) AS f, LAST_VALUE(name) OVER(ORDER BY salary ASC) AS l FROM cq_emp LIMIT 1", check: r => r.data[0].f === 'Gus' && r.data[0].l === 'Jon' },
+        // v1.25: 既定フレームは RANGE ... CURRENT ROW なので、先頭行の LAST_VALUE は自分自身
+        { name: "XCplx: Window First Last Value", sql: "SELECT FIRST_VALUE(name) OVER(ORDER BY salary ASC) AS f, LAST_VALUE(name) OVER(ORDER BY salary ASC) AS l FROM cq_emp ORDER BY salary ASC LIMIT 1", check: r => r.data[0].f === 'Gus' && r.data[0].l === 'Gus' },
+        { name: "XCplx: Window Last Value Whole Partition", sql: "SELECT LAST_VALUE(name) OVER(ORDER BY salary ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l FROM cq_emp LIMIT 1", check: r => r.data[0].l === 'Jon' },
         { name: "XCplx: Two Windows One Query", sql: "SELECT id, ROW_NUMBER() OVER(ORDER BY id ASC) AS rn, RANK() OVER(ORDER BY salary DESC) AS rk FROM cq_emp WHERE id <= 3 ORDER BY id ASC", check: r => r.data[0].rn === 1 && r.data[0].rk === 1 && r.data[1].rk === 2 && r.data[2].rn === 3 && r.data[2].rk === 2 },
 
         // --- 集計・式 複合 ---
         { name: "XCplx: Multi Aggregates", sql: "SELECT COUNT(*) AS c, SUM(salary) AS s, AVG(salary) AS a, MAX(salary) AS mx, MIN(salary) AS mn FROM cq_emp", check: r => r.data[0].c === 10 && r.data[0].s === 4230 && r.data[0].a === 423 && r.data[0].mx === 800 && r.data[0].mn === 250 },
-        { name: "XCplx: Avg Rounded 2 Digits", sql: "SELECT AVG(salary) AS a FROM cq_emp WHERE dept_id = 1", check: r => r.data[0].a === 366.67 },
+        // v1.27: AVG は倍精度のまま返す（以前は 2 桁へ丸めていた）。2 桁は ROUND で明示する
+        { name: "XCplx: Avg Full Precision", sql: "SELECT AVG(salary) AS a FROM cq_emp WHERE dept_id = 1", check: r => Math.abs(r.data[0].a - 1100 / 3) < 1e-9 },
+        { name: "XCplx: Avg Rounded 2 Digits", sql: "SELECT ROUND(AVG(salary), 2) AS a FROM cq_emp WHERE dept_id = 1", check: r => r.data[0].a === 366.67 },
         { name: "XCplx: Group By Expression", sql: "SELECT COUNT(*) AS c FROM cq_emp GROUP BY salary >= 500", check: r => r.data.length === 2 && r.data[0].c === 3 && r.data[1].c === 7 },
         { name: "XCplx: Group By Multi Column", sql: "SELECT dept_id, active, COUNT(*) AS c FROM cq_emp GROUP BY dept_id, active", check: r => r.data.length === 7 },
         { name: "XCplx: Having Multi Condition", sql: "SELECT dept_id, COUNT(*) AS c, SUM(salary) AS s FROM cq_emp WHERE dept_id IS NOT NULL GROUP BY dept_id HAVING c >= 2 AND s < 2000 ORDER BY dept_id ASC", check: r => r.data.length === 2 && r.data[0].dept_id === 1 && r.data[1].dept_id === 3 },
@@ -527,14 +531,22 @@
         { name: "XBnd: Single Row Stats", sql: "SELECT MEDIAN(v) AS md, STDDEV(v) AS sd, VARIANCE(v) AS va FROM bx_one", check: r => r.data[0].md === 100 && r.data[0].sd === 0 && r.data[0].va === 0 },
 
         // --- NULL 境界 ---
-        { name: "XBnd: Equality With Null Literal", sql: "SELECT COUNT(*) AS c FROM bx_t WHERE v = null", check: r => r.data[0].c === 1 },
-        { name: "XBnd: Inequality With Null Literal", sql: "SELECT COUNT(*) AS c FROM bx_t WHERE v <> null", check: r => r.data[0].c === 6 },
-        { name: "XBnd: Null In List Matches", sql: "SELECT COUNT(*) AS c FROM bx_t WHERE v IN (null, 10)", check: r => r.data[0].c === 2 },
-        { name: "XBnd: Null Not In List", sql: "SELECT COUNT(*) AS c FROM bx_t WHERE v NOT IN (null, 10)", check: r => r.data[0].c === 5 },
+        // v1.24: NULL との比較は 3 値論理で UNKNOWN になり、WHERE は真の行だけを通す。
+        // v1.23 までは JS の === / !== に落ちていたため `v = null` が NULL 行に一致し、
+        // `v <> null` が NULL 以外の全行に一致していた（実DBはどちらも 0 件）
+        { name: "XBnd: Equality With Null Literal Is Unknown", sql: "SELECT COUNT(*) AS c FROM bx_t WHERE v = null", check: r => r.data[0].c === 0 },
+        { name: "XBnd: Inequality With Null Literal Is Unknown", sql: "SELECT COUNT(*) AS c FROM bx_t WHERE v <> null", check: r => r.data[0].c === 0 },
+        // v1.24: IN も 3 値論理。左辺が NULL なら UNKNOWN、値が一致しなくても
+        // リストに NULL があれば UNKNOWN になる。したがって NULL を含むリストの
+        // NOT IN は決して真にならない（v1.23 までは NULL を普通の値として突き合わせていた）
+        { name: "XBnd: Null In List Matches Only Real Values", sql: "SELECT COUNT(*) AS c FROM bx_t WHERE v IN (null, 10)", check: r => r.data[0].c === 1 },
+        { name: "XBnd: Not In A List Containing Null Is Never True", sql: "SELECT COUNT(*) AS c FROM bx_t WHERE v NOT IN (null, 10)", check: r => r.data[0].c === 0 },
         { name: "XBnd: Null Sorts First Asc", sql: "SELECT id, v FROM bx_t ORDER BY v ASC", check: r => r.data[0].id === 6 },
         { name: "XBnd: Null Sorts Last Desc", sql: "SELECT id, v FROM bx_t ORDER BY v DESC", check: r => r.data[6].id === 6 },
-        { name: "XBnd: Aggregates Skip Null", sql: "SELECT COUNT(v) AS c, SUM(v) AS s, AVG(v) AS a, MAX(v) AS mx, MIN(v) AS mn FROM bx_t", check: r => r.data[0].c === 6 && r.data[0].s === 220 && r.data[0].a === 36.67 && r.data[0].mx === 70 && r.data[0].mn === 10 },
-        { name: "XBnd: Null Plus Number Is Number", sql: "SELECT v + 10 AS x FROM bx_t WHERE id = 6", check: r => r.data[0].x === 10 },
+        { name: "XBnd: Aggregates Skip Null", sql: "SELECT COUNT(v) AS c, SUM(v) AS s, AVG(v) AS a, MAX(v) AS mx, MIN(v) AS mn FROM bx_t", check: r => r.data[0].c === 6 && r.data[0].s === 220 && Math.abs(r.data[0].a - 220 / 6) < 1e-9 && r.data[0].mx === 70 && r.data[0].mn === 10 },
+        // v1.25: 算術も NULL 伝播する（NULL + 10 は 10 ではなく NULL）。
+        // v1.24 までは JS の `null + 10` がそのまま出て 10 になっていた
+        { name: "XBnd: Null Plus Number Is Null", sql: "SELECT v + 10 AS x FROM bx_t WHERE id = 6", check: r => r.data[0].x === null },
         { name: "XBnd: Concat Null Column", sql: "SELECT CONCAT(s, '-') AS x FROM bx_t WHERE id = 7", check: r => r.data[0].x === '-' },
         { name: "XBnd: Group By With Null Group", sql: "SELECT v, COUNT(*) AS c FROM bx_t GROUP BY v", check: r => r.data.length === 7 },
         { name: "XBnd: Coalesce Fallback Chain", sql: "SELECT COALESCE(v, id, -1) AS x FROM bx_t WHERE id = 6", check: r => r.data[0].x === 6 },
@@ -573,9 +585,12 @@
             return !r.error && v.data[0].c === 1;
         }},
         { name: "XBnd: Types Cleanup", sql: "DROP TABLE bx_types", check: r => r.data[0].Result === "Success" },
-        { name: "XBnd: Divide By Zero Infinity", sql: "SELECT 10 / 0 AS v", check: r => r.data[0].v === Infinity },
-        { name: "XBnd: Negative Divide By Zero", sql: "SELECT -10 / 0 AS v", check: r => r.data[0].v === -Infinity },
-        { name: "XBnd: Zero Divide Zero NaN", sql: "SELECT 0 / 0 AS v", check: r => typeof r.data[0].v === 'number' && isNaN(r.data[0].v) },
+        // v1.25: 0 除算は MySQL 同様 NULL を返す（従来は JS の Infinity / NaN が
+        // そのまま出ていた。どの実DBもそういう値は返さない）
+        { name: "XBnd: Divide By Zero Is Null", sql: "SELECT 10 / 0 AS v", check: r => r.data[0].v === null },
+        { name: "XBnd: Negative Divide By Zero Is Null", sql: "SELECT -10 / 0 AS v", check: r => r.data[0].v === null },
+        { name: "XBnd: Zero Divide Zero Is Null", sql: "SELECT 0 / 0 AS v", check: r => r.data[0].v === null },
+        { name: "XBnd: Modulo By Zero Is Null", sql: "SELECT 10 % 0 AS v", check: r => r.data[0].v === null },
         { name: "XBnd: Mod By Zero NaN", sql: "SELECT MOD(10, 0) AS v", check: r => typeof r.data[0].v === 'number' && isNaN(r.data[0].v) },
         { name: "XBnd: Mod Negative Operands", sql: "SELECT MOD(-7, 3) AS a, MOD(7, -3) AS b", check: r => r.data[0].a === -1 && r.data[0].b === 1 },
         // v1.1: ROUND は MySQL 互換の「ゼロから遠い方向」丸めへ変更（JS Math.round の
@@ -619,7 +634,10 @@
             return !r.error && v.data[0].l === 5000;
         }},
         { name: "XBnd: Concat Numbers", sql: "SELECT CONCAT(1, 2) AS v", check: r => r.data[0].v === '12' },
-        { name: "XBnd: Lpad No Truncate", sql: "SELECT LPAD('abcde', 3, '0') AS a, RPAD('abcde', 3, '-') AS b, LPAD('a', 5, 'xy') AS c", check: r => r.data[0].a === 'abcde' && r.data[0].b === 'abcde' && r.data[0].c === 'xyxya' },
+        // v1.23: LPAD / RPAD は「目的の長さちょうど」にする関数なので、
+        // 元の文字列が長ければ切り詰める（MySQL / PostgreSQL / Oracle と同じ）。
+        // v1.22 までは切り詰めずそのまま返していた
+        { name: "XBnd: Lpad Truncates When Longer", sql: "SELECT LPAD('abcde', 3, '0') AS a, RPAD('abcde', 3, '-') AS b, LPAD('a', 5, 'xy') AS c", check: r => r.data[0].a === 'abc' && r.data[0].b === 'abc' && r.data[0].c === 'xyxya' },
         { name: "XBnd: Repeat Zero And Negative", sql: "SELECT REPEAT('ab', 0) AS a, REPEAT('ab', -1) AS b", check: r => r.data[0].a === '' && r.data[0].b === null },
         { name: "XBnd: Left Right Extremes", sql: "SELECT LEFT('abc', 0) AS a, RIGHT('abc', 0) AS b, LEFT('abc', 10) AS c, RIGHT('abc', 10) AS d", check: r => r.data[0].a === '' && r.data[0].b === '' && r.data[0].c === 'abc' && r.data[0].d === 'abc' },
         { name: "XBnd: Substring Index Beyond Parts", sql: "SELECT SUBSTRING_INDEX('a.b.c', '.', 10) AS a, SUBSTRING_INDEX('a.b.c', '.', -10) AS b", check: r => r.data[0].a === 'a.b.c' && r.data[0].b === 'a.b.c' },
@@ -797,7 +815,9 @@
             return (performance.now() - start) < 5000 && r.data.length === 20000;
         }},
         { name: "XPerf: Hash Join 50k x 100", fn: () => {
-            db.executeQuery("CREATE TABLE px_dim (gid INTEGER, label TEXT)");
+            // gid に PK: v1.27 から FK の参照先には PRIMARY KEY / UNIQUE が必要
+            // （XPerf: Generate Dummy Constrained 20k が px_dim(gid) を参照する）
+            db.executeQuery("CREATE TABLE px_dim (gid INTEGER PRIMARY KEY, label TEXT)");
             const rows = [];
             for (let i = 0; i < 100; i++) rows.push([i, 'G' + i]);
             db.insertRows('px_dim', ['gid', 'label'], rows);
@@ -963,8 +983,11 @@
             const r = db.executeQuery("SELECT * FROM users WHERE alert(1)");
             return r.error !== undefined;
         }},
+        // v1.26: バッククォートは MySQL 形式の区切り識別子として受理するようになった
+        // （`SELECT \`id\` FROM users` は正しく動く）。危険なのは中身が識別子として
+        // 成立しない場合なので、そちらは引き続き拒否されることを下で固定する
+        { name: "XSec Gen: Backtick Identifier Is Data Safe", sql: "SELECT `id` FROM users WHERE id = 1", check: r => !r.error && r.data[0].id === 1 },
         ...[
-            "SELECT `id` FROM users",
             "SELECT * FROM users WHERE name = `whoami`",
             "UPDATE users SET age = `29` WHERE id = 1",
             "SELECT ${window.__e1=1} AS v",

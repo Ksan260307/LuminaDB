@@ -18,7 +18,7 @@
         { name: "Create Table B", sql: "CREATE TABLE test_b (id, a_id, note)", check: r => r.data[0].Result === "Success" },
         { name: "Create Table C", sql: "CREATE TABLE test_c (id, c_val)", check: r => r.data[0].Result === "Success" },
         { name: "Create Table Empty", sql: "CREATE TABLE test_empty (id, none)", check: r => r.data[0].Result === "Success" },
-        { name: "Create Table Trunc", sql: "CREATE TABLE test_trunc (id, val)", check: r => r.data[0].Result === "Success" },
+        { name: "Create Table Trunc", sql: "CREATE TABLE test_trunc (id, val, dt, flag)", check: r => r.data[0].Result === "Success" },
         { name: "Create Index", sql: "CREATE INDEX idx_user_id ON orders (user_id)", check: r => r.data[0].Result === "Success" },
 
         // Explain
@@ -61,7 +61,9 @@
         { name: "DDL: ALTER DROP COLUMN", sql: "ALTER TABLE test_types DROP COLUMN new_extra", check: r => !db.tables['test_types'].getColumnNames().includes('new_extra') },
 
         // FOREIGN KEY テスト
-        { name: "FK: Create Parent", sql: "CREATE TABLE fk_parent (id INTEGER)", check: r => true },
+        // v1.27: FK の参照先には PRIMARY KEY / UNIQUE が必要（実DBと同じ規則）になったので
+        // 親側に PK を付ける。このテスト群が確かめたいのは FK の強制であって PK の不在ではない
+        { name: "FK: Create Parent", sql: "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY)", check: r => true },
         { name: "FK: Insert Parent", sql: "INSERT INTO fk_parent (id) VALUES (1), (2)", check: r => true },
         { name: "FK: Create Child", sql: "CREATE TABLE fk_child (id INTEGER, p_id INTEGER, FOREIGN KEY (p_id) REFERENCES fk_parent(id))", check: r => true },
         { name: "FK: Insert Valid Child", sql: "INSERT INTO fk_child (id, p_id) VALUES (10, 1)", check: r => r.data[0].Message.includes('1') },
@@ -718,7 +720,9 @@
         { name: "Neg DropIdx: Missing Table", sql: "DROP INDEX idx_x ON no_such_table (id)", isErrorExpected: true, check: r => r.error !== undefined },
 
         // ALTER TABLE ... RENAME TO
-        { name: "RenameTbl: Setup", sql: "CREATE TABLE rn_src (id INTEGER)", check: r => r.data[0].Result === "Success" },
+        // PK を付ける: v1.27 から FK の参照先には PRIMARY KEY / UNIQUE が必要
+        // （RenameTbl: FK Reference Follows が rn_dst を参照する）
+        { name: "RenameTbl: Setup", sql: "CREATE TABLE rn_src (id INTEGER PRIMARY KEY)", check: r => r.data[0].Result === "Success" },
         { name: "RenameTbl: Insert", sql: "INSERT INTO rn_src (id) VALUES (1), (2)", check: r => r.data[0].Message.includes('2') },
         { name: "RenameTbl: Rename", sql: "ALTER TABLE rn_src RENAME TO rn_dst", check: r => r.data[0].Result === "Success" },
         { name: "RenameTbl: Select New Name", sql: "SELECT COUNT(*) as c FROM rn_dst", check: r => r.data[0].c === 2 },
@@ -757,7 +761,9 @@
         { name: "Agg: COUNT DISTINCT", sql: "SELECT COUNT(DISTINCT user_id) as c FROM orders", check: r => r.data[0].c === 4 },
         { name: "Agg: COUNT DISTINCT vs COUNT", sql: "SELECT COUNT(DISTINCT user_id) as cd, COUNT(user_id) as c FROM orders", check: r => r.data[0].cd === 4 && r.data[0].c === 5 },
         { name: "Agg: SUM DISTINCT", sql: "SELECT SUM(DISTINCT amount) as s FROM orders", check: r => r.data[0].s === 8 },
-        { name: "Agg: AVG DISTINCT", sql: "SELECT AVG(DISTINCT amount) as a FROM orders", check: r => r.data[0].a === 2.67 },
+        // v1.27: AVG は倍精度のまま返す（2 桁で欲しいときは ROUND を明示する）
+        { name: "Agg: AVG DISTINCT", sql: "SELECT AVG(DISTINCT amount) as a FROM orders", check: r => Math.abs(r.data[0].a - 8 / 3) < 1e-9 },
+        { name: "Agg: AVG DISTINCT Rounded", sql: "SELECT ROUND(AVG(DISTINCT amount), 2) as a FROM orders", check: r => r.data[0].a === 2.67 },
         { name: "Agg: COUNT DISTINCT with Group By", sql: "SELECT user_id, COUNT(DISTINCT product_id) as c FROM orders GROUP BY user_id ORDER BY user_id ASC", check: r => r.data.length === 4 && r.data[0].user_id === 1 && r.data[0].c === 2 },
 
         // INSERT カラムリスト省略形
@@ -802,7 +808,9 @@
         }},
         { name: "Neg Modify: Invalid Type", fn: () => {
             db.executeQuery("CREATE TABLE mod_t3 (id INTEGER)");
-            const r = db.executeQuery("ALTER TABLE mod_t3 MODIFY COLUMN id VARCHAR");
+            // v1.24: VARCHAR / INT / DECIMAL などの標準別名は受理するようになったので、
+            // 本当に存在しない型で「不正な型は拒否する」ことを検査する
+            const r = db.executeQuery("ALTER TABLE mod_t3 MODIFY COLUMN id NOSUCHTYPE");
             db.executeQuery("DROP TABLE mod_t3");
             return r.error !== undefined;
         }},
@@ -1382,7 +1390,12 @@
         { name: "Window: NTILE Even Split", sql: "SELECT id, NTILE(2) OVER(ORDER BY id ASC) AS nt FROM users WHERE id <= 4", check: r => r.data[0].nt === 1 && r.data[1].nt === 1 && r.data[2].nt === 2 && r.data[3].nt === 2 },
         { name: "Window: NTILE Uneven Split", sql: "SELECT id, NTILE(2) OVER(ORDER BY id ASC) AS nt FROM users WHERE id <= 5", check: r => r.data[0].nt === 1 && r.data[2].nt === 1 && r.data[3].nt === 2 && r.data[4].nt === 2 },
         { name: "Window: NTILE More Buckets Than Rows", sql: "SELECT id, NTILE(10) OVER(ORDER BY id ASC) AS nt FROM users WHERE id <= 3", check: r => r.data[0].nt === 1 && r.data[1].nt === 2 && r.data[2].nt === 3 },
-        { name: "Window: FIRST_VALUE & LAST_VALUE", sql: "SELECT id, FIRST_VALUE(name) OVER(ORDER BY id ASC) AS f, LAST_VALUE(name) OVER(ORDER BY id ASC) AS l FROM users WHERE id <= 3", check: r => r.data.length === 3 && r.data.every(d => d.f === 'Alice' && d.l === 'Charlie') },
+        // v1.25: ORDER BY だけを書いた OVER 句の既定フレームは SQL 標準の
+        // RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW。したがって LAST_VALUE は
+        // 「パーティションの最後」ではなく「現在行（と同順位の行）まで」の最後を返す。
+        // パーティション全体の最後が欲しいときはフレームを明示する（実DBと同じ作法）
+        { name: "Window: FIRST_VALUE & LAST_VALUE Default Frame", sql: "SELECT id, FIRST_VALUE(name) OVER(ORDER BY id ASC) AS f, LAST_VALUE(name) OVER(ORDER BY id ASC) AS l FROM users WHERE id <= 3", check: r => r.data.length === 3 && r.data.every(d => d.f === 'Alice') && r.data[0].l === 'Alice' && r.data[2].l === 'Charlie' },
+        { name: "Window: LAST_VALUE Whole Partition", sql: "SELECT id, LAST_VALUE(name) OVER(ORDER BY id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l FROM users WHERE id <= 3", check: r => r.data.every(d => d.l === 'Charlie') },
         { name: "Window: FIRST_VALUE with Partition", sql: "SELECT order_id, FIRST_VALUE(order_id) OVER(PARTITION BY user_id ORDER BY order_id ASC) AS f FROM orders WHERE user_id = 1 ORDER BY order_id ASC", check: r => r.data.length === 2 && r.data[0].f === 1001 && r.data[1].f === 1001 },
 
         // === コードレビュー修正の回帰テスト (Fix #1〜#6) ===
@@ -2073,13 +2086,14 @@
             const r = eng2.executeQuery("SELECT v FROM sec_r WHERE v = '__proto__'");
             return !r.error && r.data.length === 1 && r.data[0].v === '__proto__';
         }},
-        { name: "Sec: Table Named __proto__ Isolated", fn: () => {
+        // v1.24: '__' 始まりの表名は予約（保存時に内部カタログと衝突して消えるため）。
+        // 「作れるが隔離されている」より強い「作れない」を固定し、拒否後も他の表が無事なことを見る
+        { name: "Sec: Table Named __proto__ Is Refused", fn: () => {
             const r1 = db.executeQuery("CREATE TABLE __proto__ (id INTEGER)");
-            const ins = db.executeQuery("INSERT INTO __proto__ (id) VALUES (1)");
-            const sel = db.executeQuery("SELECT id FROM __proto__");
             const others = db.executeQuery("SELECT COUNT(*) AS c FROM users"); // 他テーブルが無事
-            const dr = db.executeQuery("DROP TABLE __proto__");
-            return !r1.error && !ins.error && sel.data[0].id === 1 && !others.error && !dr.error;
+            return !!r1.error && /reserved/i.test(r1.error)
+                && db.tables.__proto__ === undefined
+                && !others.error && ({}).id === undefined;
         }},
         { name: "Sec: Column Named constructor Works", fn: () => {
             db.executeQuery("CREATE TABLE sec_c (constructor TEXT)");
@@ -2477,6 +2491,56 @@
         //   PostgreSQL の照合演算子、および UI（列プロファイル・ER 図）
         // ============================================================
         ...getV27Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v28.js の getV28Tests()
+        //   v1.23: AS を省いた別名 / 引用符付き別名 / 修飾スター / 出力列名の重複解決、
+        //   LTRIM・RTRIM の文字集合、SUBSTRING の負の開始位置、LPAD/RPAD の切り詰め、
+        //   HEX/UNHEX の UTF-8 化、TO_TIMESTAMP のエポック秒、AGE の符号、
+        //   REGEXP_* の position/occurrence/match_type、SHA2/SHA256/SHA224、
+        //   列の改名・削除に伴うメタデータ追随（生成列・CHECK・列順・索引名）、
+        //   複合 UNIQUE INDEX、INSERT の未知列拒否、INSERT OR <action>、
+        //   ALTER TABLE の複数アクション、括弧付き集合演算、エラーメッセージの改善、
+        //   および UI（スキーマ検索・スプリッタ・Explain・行選択・書き出し）
+        // ============================================================
+        ...getV28Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v29.js の getV29Tests()
+        //   v1.24: NULL の 3 値論理（比較 / NOT / IN / CHECK / LIKE 系）、
+        //   IS [NOT] NULL・UNKNOWN の述語としての据え置き、外部結合の SELECT * の
+        //   NULL 埋め、ALTER TABLE の括弧付き型と方言別名、'__' で始まる表名の拒否、
+        //   transaction() の async 拒否 / insert() の列は全行の和集合。
+        //   UI（Data モーダルへの集約、SQL インポートの失敗レポート、
+        //   RFC4180 CSV・新規表作成・置換・ドラッグ&ドロップ）も含む
+        // ============================================================
+        ...getV29Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v30.js の getV30Tests()
+        //   v1.25: 算術の NULL 伝播と 0 除算、DATE と DATETIME / TIMESTAMP の分離
+        //   （CAST(x AS DATE) の時刻切り捨て・日付比較の時刻寄せ）、
+        //   ウィンドウ関数の既定フレーム（RANGE ... CURRENT ROW）、
+        //   FOREIGN KEY の ON DELETE SET DEFAULT、COMMENT ON の ROLLBACK、
+        //   および UI（1 文あたりの実行時間の上限）
+        // ============================================================
+        ...getV30Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v31.js の getV31Tests()
+        //   v1.26: バッククォートの区切り識別子（予約語を列名・表名に使える／
+        //   識別子として不正な名前は明示エラー／ダブルクォートは文字列のまま案内）、
+        //   GROUPING SETS の中の ROLLUP / CUBE / 入れ子、
+        //   exportSQL のトリガー・関数・プロシージャ・コメント出力と索引名、
+        //   および UI（スキーマツリーの右クリックメニュー）
+        // ============================================================
+        ...getV31Tests(),
+        // 定義は js/tests/test-suite-v32.js の getV32Tests()
+        ...getV32Tests(),
+        // 定義は js/tests/test-suite-v33.js の getV33Tests()
+        //   v1.27 後半: 曖昧な列名の拒否 / 組み込み関数の引数個数 / 16進リテラル /
+        //   ADD CHECK の 3 値論理 / EXPLAIN の行数見積りと段の追加
+        ...getV33Tests(),
 
         // Cleanup (New Features)
         { name: "Drop View Stats", sql: "DROP VIEW v_stats", check: r => true },

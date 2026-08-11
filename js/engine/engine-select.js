@@ -16,6 +16,24 @@
     ]);
     // パーティション全体を見て 1 つの値を出すウィンドウ関数（フレームは効かない）
     const LUMINA_WINDOW_WHOLE_PARTITION = new Set(['PERCENTILE_CONT', 'PERCENTILE_DISC', 'MEDIAN']);
+
+    // SUM / AVG が足し込める値へ寄せる。集計対象でなければ null を返す。
+    // 従来は `typeof v === 'number'` だけを見ていたため、BOOLEAN 列の SUM
+    // （「フラグの立った件数」という定番の書き方）と、CSV 取り込み後によくある
+    // 数値文字列の列がどちらも黙って 0 になっていた。MySQL / SQLite はどちらも
+    // 数値として扱う。NULL・空文字・数値でない文字列は従来どおり集計から外す
+    const LUMINA_AGG_NUM = (v) => {
+        if (v === null || v === undefined) return null;
+        if (typeof v === 'number') return isFinite(v) ? v : null;
+        if (typeof v === 'boolean') return v ? 1 : 0;
+        if (typeof v === 'string') {
+            const t = v.trim();
+            if (t === '') return null;
+            const n = Number(t);
+            return isFinite(n) ? n : null;
+        }
+        return null;
+    };
     // 式の「途中」に集計呼び出しが現れるか（ROUND(AVG(x),2) や a/SUM(b) を拾う）。
     // 直前が識別子文字だと my_sum( のような列名を誤検出するため、境界を明示する。
     const AGG_ANYWHERE = new RegExp('(^|[^A-Za-z0-9_.])(' + LUMINA_AGG_NAMES + ')\\s*\\(', 'i');
@@ -267,7 +285,8 @@
                                         if (!argFn) { cnt++; return; }
                                         if (v2 === null || v2 === undefined) return;
                                         cnt++;
-                                        if (typeof v2 === 'number') sum += v2;
+                                        const n2 = LUMINA_AGG_NUM(v2);
+                                        if (n2 !== null) sum += n2;
                                         if (best === null) best = v2;
                                         else if (w.funcName === 'MIN' ? v2 < best : v2 > best) best = v2;
                                     });
@@ -277,14 +296,15 @@
                                 if (!argFn) cnt++;
                                 else if (val !== null && val !== undefined) {
                                     cnt++;
-                                    if (typeof val === 'number') sum += val;
+                                    const nv = LUMINA_AGG_NUM(val);
+                                    if (nv !== null) sum += nv;
                                     if (best === null) best = val;
                                     else if (w.funcName === 'MIN' ? val < best : val > best) best = val;
                                 }
                             }
                             if (w.funcName === 'COUNT') out = cnt;
                             else if (w.funcName === 'SUM') out = cnt > 0 ? sum : null;
-                            else if (w.funcName === 'AVG') out = cnt > 0 ? Number((sum / cnt).toFixed(2)) : null;
+                            else if (w.funcName === 'AVG') out = cnt > 0 ? sum / cnt : null;
                             else out = best;
                             break;
                         }
@@ -469,6 +489,19 @@
 
           const wMatch = tempSql.match(/\s+where\s+([\s\S]+)$/i);
           if(wMatch) { whereStr = wMatch[1]; tempSql = tempSql.substring(0, wMatch.index); }
+          // 空の WHERE（`SELECT * FROM t WHERE`）は構文エラー。以前は条件が無いものとして
+          // 全行を返しており、条件を書き忘れた・削り過ぎたクエリが黙って通っていた
+          if (/\swhere\s*$/i.test(tempSql) || (wMatch && whereStr.trim() === '')) {
+              throw new Error("Syntax Error: WHERE has no condition.");
+          }
+          // 集計は WHERE より後に評価されるので WHERE には書けない。以前は識別子解決まで
+          // 落ちて「Column 'sum' not found.」になり、存在しない列を探させていた
+          if (whereStr) {
+              const aggInWhere = whereStr.match(new RegExp('(?:^|[^a-zA-Z0-9_.])(' + LUMINA_AGG_NAMES + ')\\s*\\(', 'i'));
+              if (aggInWhere) {
+                  throw new Error(`Invalid use of aggregate function '${aggInWhere[1].toUpperCase()}' in WHERE. Filter on aggregates with HAVING instead.`);
+              }
+          }
           // WHERE / GROUP BY はウィンドウ関数より前に評価されるので、そこに書くことはできない
           // （SQL標準。実DBと同じく QUALIFY かサブクエリを案内する）。
           // この時点で OVER (...) は __OVER_n__ トークンへ退避済み
@@ -733,10 +766,53 @@
           }
 
           let explainPlan = [];
+          // EXPLAIN の Details には内部トークンや内部表名が漏れていたので、
+          // 文字列リテラルを書き戻し、一時表は由来の判る名前に言い換える
+          const exDet = (s) => this._restoreStrings(String(s), strMap);
+          const exName = (t) => {
+              const n = String(t);
+              let m2 = n.match(/^__tmp_cte_(.+)$/);
+              if (m2) return `CTE '${m2[1]}'`;
+              if (/^__tmp_series_\d+$/.test(n)) return 'GENERATE_SERIES';
+              if (/^__tmp_\d+$/.test(n)) return '<derived table>';
+              if (/^__tmp_/.test(n)) return '<materialised subquery>';
+              return `'${n}'`;
+          };
+          // 行数の見積り。厳密である必要はなく、「どの段で何行に減る想定か」が
+          // 判れば計画を読む役に立つ（従来は見積りが一切無かった）
+          let exRows = this.tables[fromTable] ? this.tables[fromTable].rowCount : 0;
+          const exPush = (op, details, rows) => {
+              if (rows !== undefined && rows !== null) exRows = Math.max(0, Math.round(rows));
+              explainPlan.push({ Step: explainPlan.length + 1, Operation: op, Details: exDet(details), Rows: exRows });
+          };
+          // 結合 1 段で行数が何倍になるかの目安。等価結合なら「右表の平均バケット長」、
+          // 入れ子ループなら右表の行数（最悪ケース）を掛ける
+          const exJoinFanout = (join, rightCol) => {
+              const jt = this.tables[join.table];
+              if (!jt) return 1;
+              if (rightCol && jt.indices[rightCol]) {
+                  const b = jt.indices[rightCol].size;
+                  return b > 0 ? Math.max(1, jt.rowCount / b) : 1;
+              }
+              if (rightCol) {
+                  // 索引が無い等価結合でも、キーの相異なり数は判らないので 1 対 1 を仮定する
+                  return 1;
+              }
+              return Math.max(1, jt.rowCount);
+          };
           if (isExplain) {
-              if (isIndexScan) explainPlan.push({ Step: explainPlan.length + 1, Operation: 'INDEX SCAN',
-                  Details: `Index ${indexValList ? `lookup of ${indexValList.length} value(s)` : 'scan'} on '${fromTable}(${indexScanCol})'` });
-              else explainPlan.push({ Step: explainPlan.length + 1, Operation: 'TABLE SCAN', Details: `Full scan on '${fromTable}'` });
+              if (isIndexScan) {
+                  // 索引一致は等価なので、平均バケット長 × 引く値の数で見積る
+                  const idx = this.tables[fromTable] && this.tables[fromTable].indices[indexScanCol];
+                  const buckets = idx ? idx.size : 0;
+                  const avg = buckets > 0 ? exRows / buckets : 1;
+                  const n = indexValList ? indexValList.length : 1;
+                  exPush('INDEX SCAN',
+                      `Index ${indexValList ? `lookup of ${indexValList.length} value(s)` : 'scan'} on '${fromTable}(${indexScanCol})'`,
+                      Math.min(exRows, Math.max(1, avg * n)));
+              } else {
+                  exPush('TABLE SCAN', `Full scan on ${exName(fromTable)}`, exRows);
+              }
           }
 
           // USING / NATURAL の左辺解決用: これまでに現れたエイリアスの順序付きリスト
@@ -779,6 +855,17 @@
               const eqMatch = join.onCond.match(/^\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*=\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*$/);
               if (eqMatch) {
                   let a1 = eqMatch[1].toLowerCase(), c1 = eqMatch[2].toLowerCase(), a2 = eqMatch[3].toLowerCase(), c2 = eqMatch[4].toLowerCase();
+                  // 単純な等値 ON はハッシュ結合へ載せるが、列名は誰も検証していなかった。
+                  // 存在しない列だとキーが両側 undefined になり、INNER は 0 件・LEFT は
+                  // 右側が全 NULL という「もっともらしい結果」を返していた（実DBは全て
+                  // エラー）。USING の分岐（すぐ上）と同じ規則で弾く。別名が未知の場合は
+                  // 入れ子ループ側の既存エラーに任せるため素通しする
+                  const colAt = (al, c) => {
+                      const t = this.tables[aliases[al]];
+                      return !!(t && t.cols && t.cols[c]);
+                  };
+                  if (aliases[a1] && !colAt(a1, c1)) throw new Error(`Column '${a1}.${c1}' not found (ON).`);
+                  if (aliases[a2] && !colAt(a2, c2)) throw new Error(`Column '${a2}.${c2}' not found (ON).`);
                   // 照合順序付きの列はハッシュキーを生値で作れないため入れ子ループへ落とす
                   const collAt = (al, c) => {
                       const t = this.tables[aliases[al]];
@@ -795,12 +882,12 @@
               if (isExplain) {
                   if (isHashJoin) {
                       if (jTbl.indices[rightColMatch]) {
-                          explainPlan.push({ Step: explainPlan.length + 1, Operation: 'INDEX HASH JOIN', Details: `Join '${join.table}' using index on '${rightColMatch}'` });
+                          exPush('INDEX HASH JOIN', `Join '${join.table}' using index on '${rightColMatch}'`, exRows * exJoinFanout(join, rightColMatch));
                       } else {
-                          explainPlan.push({ Step: explainPlan.length + 1, Operation: 'HASH JOIN', Details: `Build hash on '${join.table}.${rightColMatch}', probe with '${leftAliasMatch}.${leftColMatch}'` });
+                          exPush('HASH JOIN', `Build hash on '${join.table}.${rightColMatch}', probe with '${leftAliasMatch}.${leftColMatch}'`, exRows * exJoinFanout(join, rightColMatch));
                       }
                   } else {
-                          explainPlan.push({ Step: explainPlan.length + 1, Operation: 'NESTED LOOP JOIN', Details: `Join '${join.table}' ON ${join.onCond}` });
+                          exPush('NESTED LOOP JOIN', `Join '${join.table}' ON ${join.onCond}`, exRows * exJoinFanout(join, null));
                   }
               }
 
@@ -808,15 +895,108 @@
           });
 
           if (isExplain) {
-              if (residualWhere) explainPlan.push({ Step: explainPlan.length + 1, Operation: 'FILTER', Details: `Apply WHERE ${residualWhere}` });
-              if (groupByStr) explainPlan.push({ Step: explainPlan.length + 1, Operation: 'GROUP BY', Details: `Group by ${groupByStr}` });
-              if (havingStr) explainPlan.push({ Step: explainPlan.length + 1, Operation: 'HAVING', Details: `Filter by ${havingStr}` });
-              if (parsed.qualifyStr) explainPlan.push({ Step: explainPlan.length + 1, Operation: 'QUALIFY', Details: `Filter by ${parsed.qualifyStr}` });
-              if (orderByStr) explainPlan.push({ Step: explainPlan.length + 1, Operation: 'ORDER BY', Details: `Order by ${orderByStr}` });
-              if (limitVal) explainPlan.push({ Step: explainPlan.length + 1, Operation: 'LIMIT', Details: `Limit ${limitVal}` });
+              // 選択率は MySQL 同様の固定値（等価 0.1 / 範囲 0.33）。荒くても
+              // 「ここで大きく減る想定」が読めれば計画の役に立つ
+              // 押し下げた分と結合後に残る分を分けて出す（実行と同じ判定を使う）
+              const exSplit = this._splitPushdownWhere(residualWhere, fromTable, baseAlias, joinPlans);
+              if (residualWhere) {
+                  const selOf = (w) => (/[<>]|between/i.test(w) ? 0.33 : 0.1);
+                  if (exSplit.pushed) {
+                      // 表示位置は結合の後ろになるが、実際には結合の前に効いている
+                      exPush('FILTER (pushed down)', `Apply WHERE ${exSplit.pushed} before the join`, exRows * selOf(exSplit.pushed));
+                  }
+                  if (exSplit.residual) {
+                      exPush('FILTER', `Apply WHERE ${exSplit.residual}`, exRows * selOf(exSplit.residual));
+                  }
+              }
+              if (groupByStr) {
+                  // グループ数は判らないので「半分に減る」程度の目安に留める
+                  exPush('GROUP BY', `Group by ${groupByStr}`, Math.max(1, exRows / 2));
+              } else if (parsed.selectClause && AGG_ANYWHERE.test(parsed.selectClause)) {
+                  // GROUP BY の無い集計は必ず 1 行になる（従来この段は計画に出ていなかった）
+                  exPush('AGGREGATE', 'Aggregate over the whole result (no GROUP BY)', 1);
+              }
+              if (havingStr) exPush('HAVING', `Filter by ${havingStr}`, Math.max(1, exRows / 2));
+              if (parsed.qualifyStr) exPush('QUALIFY', `Filter by ${parsed.qualifyStr}`, Math.max(1, exRows / 2));
+              // ウィンドウ関数は行数を変えないが、並べ替えと分割のコストがある段なので出す
+              // この時点の selectClause は経路によって OVER が __OVER_n__ トークンの
+              // ままの場合と復元済みの場合があるので、どちらでも拾えるようにする
+              if (parsed.selectClause && /__OVER_\d+__|\bover\s*\(/i.test(parsed.selectClause)) {
+                  exPush('WINDOW', 'Evaluate window functions', exRows);
+              }
+              if (parsed.isDistinct || parsed.distinctOn) {
+                  exPush('DISTINCT', parsed.distinctOn ? `Distinct on (${parsed.distinctOn})` : 'Remove duplicate rows',
+                      Math.max(1, exRows / 2));
+              }
+              if (orderByStr) exPush('ORDER BY', `Order by ${orderByStr}`, exRows);
+              if (limitVal) {
+                  const lim = String(limitVal).endsWith('%') ? exRows : Number(limitVal);
+                  exPush('LIMIT', `Limit ${limitVal}`, isFinite(lim) ? Math.min(exRows, lim) : exRows);
+              }
           }
 
           return { parsed, isIndexScan, indexScanCol, indexValStr, indexValList, residualWhere, aliases, joinPlans, explainPlan, isExplain };
+      },
+
+      // ------------------------------------------------------------------
+      // 述語の押し下げ: WHERE のうち「基底表の列だけを見る条件」を切り出す。
+      //
+      // 従来は WHERE を必ず結合の**後**に評価していたため、
+      //   SELECT ... FROM big a JOIN big b ON a.k = b.k WHERE a.id < 200
+      // が 20 万行すべてを結合してから 200 行へ絞っていた（実測 5.0 秒）。
+      // 同じ意味を派生表で書くと 18ms だったので、書き方だけで 267 倍違っていた。
+      //
+      // 安全性: 条件が基底表の列しか参照しないなら、結合の前後どちらで適用しても
+      // INNER / LEFT の結果は同じ（WHERE は最終結果を絞るので、早く消した左行は
+      // 後で消えるのと変わらない）。RIGHT / FULL は未マッチの右行が NULL 補完で
+      // 残るため、左行を先に消すと「後段の WHERE で落ちるはずの行」が出てしまう
+      // ので押し下げない。深さ 0 に OR がある式も分割しない
+      // ------------------------------------------------------------------
+      _splitPushdownWhere(residualWhere, fromTable, baseAlias, joinPlans) {
+          const none = { pushed: null, residual: residualWhere };
+          if (!residualWhere || !joinPlans || joinPlans.length === 0) return none;
+          if (joinPlans.some(j => j.type === 'RIGHT' || j.type === 'FULL')) return none;
+          const conj = this._splitTopLevelAnd(residualWhere);
+          if (conj.length === 0) return none;
+
+          const baseTbl = this.tables[fromTable];
+          const baseNames = new Set([String(fromTable).toLowerCase(), String(baseAlias).toLowerCase()]);
+          const otherNames = new Set();
+          joinPlans.forEach(j => {
+              if (j.table) otherNames.add(String(j.table).toLowerCase());
+              if (j.alias) otherNames.add(String(j.alias).toLowerCase());
+          });
+          const keep = [], push = [];
+          conj.forEach(c => {
+              // 相関サブクエリのトークンは外側の行に依存するので触らない
+              if (/__CORR(?:EX|SC|IN)_\d+__/.test(c)) { keep.push(c); return; }
+              // 結合先の別名で修飾された参照があれば押し下げられない
+              let refsOther = false, mm;
+              const qre = /\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\./g;
+              while ((mm = qre.exec(c))) {
+                  const nm = mm[1].toLowerCase();
+                  if (!baseNames.has(nm) && otherNames.has(nm)) { refsOther = true; break; }
+              }
+              if (refsOther) { keep.push(c); return; }
+              // 修飾なしの列が結合先の表のものなら押し下げられない
+              // （両方に在る曖昧な名前は _assertNoAmbiguousColumns が既に弾いている）
+              const ure = /(^|[^a-zA-Z0-9_.])([a-zA-Z_][a-zA-Z0-9_]*)\b(\s*\()?/g;
+              let onlyBase = true;
+              while ((mm = ure.exec(c))) {
+                  if (mm[3]) continue;                            // 関数呼び出し
+                  const nm = mm[2].toLowerCase();
+                  if (nm.startsWith('__')) continue;              // 内部トークン
+                  if (baseTbl && baseTbl.cols && baseTbl.cols[nm]) continue;
+                  for (const j of joinPlans) {
+                      const jt = this.tables[j.table];
+                      if (jt && jt.cols && jt.cols[nm]) { onlyBase = false; break; }
+                  }
+                  if (!onlyBase) break;
+              }
+              if (onlyBase) push.push(c); else keep.push(c);
+          });
+          if (push.length === 0) return none;
+          return { pushed: push.join(' AND '), residual: keep.length > 0 ? keep.join(' AND ') : null };
       },
 
       _executeSelectPlan(plan, strMap) {
@@ -843,8 +1023,27 @@
                   if (val.toLowerCase() === 'false') return false;
                   return isNaN(val) ? val : Number(val);
               };
+              // 索引はキーを生値で持つので、比較側の型寄せ（__cpair）と食い違わないよう
+              // 列の型に合わせてキーを正規化する。BOOLEAN 列に対する `ok = 1` は
+              // 索引経路だと 1 というキーが無く 0 件になり、索引の有無で答えが変わっていた
+              const normKey = (v) => {
+                  const ct = baseTbl.colTypes ? baseTbl.colTypes[indexScanCol] : null;
+                  if (ct === 'BOOLEAN' && v !== null && typeof v !== 'boolean') {
+                      if (typeof v === 'number') return v !== 0;
+                      if (typeof v === 'string') {
+                          const t = v.trim().toLowerCase();
+                          if (t === 'true' || t === '1') return true;
+                          if (t === 'false' || t === '0') return false;
+                      }
+                  }
+                  if ((ct === 'INTEGER' || ct === 'FLOAT') && typeof v === 'string' && v.trim() !== '') {
+                      const n = Number(v);
+                      if (isFinite(n)) return n;
+                  }
+                  return v;
+              };
               // IN (...) は各値を索引で引いて和集合を取る（行の重複は除く）
-              const keys = indexValList ? indexValList.map(toVal) : [toVal(indexValStr)];
+              const keys = (indexValList ? indexValList.map(toVal) : [toVal(indexValStr)]).map(normKey);
               const seenRow = keys.length > 1 ? new Set() : null;
               for (const val of keys) {
                   const matchedIndices = baseTbl.indices[indexScanCol].get(val);
@@ -860,6 +1059,35 @@
               for(let i=0; i<baseTbl.rowCount; i++) {
                   rowPtrs.push({ [fromTable]: i, [baseAlias]: i });
               }
+          }
+
+          // ------------------------------------------------------------------
+          // 述語の押し下げ（WHERE の「基底表だけを見る条件」を結合より前に適用する）
+          //
+          // 従来は WHERE を必ず結合の**後**に評価していたため、
+          //   SELECT ... FROM big a JOIN big b ON a.k = b.k WHERE a.id < 200
+          // が 20 万行すべてを結合してから 200 行へ絞っていた（実測 5.0 秒）。
+          // 同じ問い合わせを派生表で書くと 18ms なので、書き方だけで 267 倍違っていた。
+          //
+          // 安全性: 条件が基底表の列しか参照していなければ、結合の前後どちらで
+          // 適用しても INNER / LEFT の結果は変わらない（WHERE は最終結果を絞るので、
+          // 早く消した左行は後で消えるのと同じ）。ただし RIGHT / FULL では
+          // 未マッチの右行が NULL 補完で残るため、左行を先に消すと後段の WHERE で
+          // 落ちるはずの行が出てしまう → その場合は押し下げない
+          // 曖昧な列名の検査は**押し下げより前**に、全別名を見た状態で行うこと。
+          // 押し下げた条件は基底表の別名だけでコンパイルするので、後回しにすると
+          // `WHERE amount > 50`（両表に amount がある）が黙って基底表側へ解決されてしまう
+          if (residualWhere) this._assertNoAmbiguousColumns(residualWhere, aliases);
+
+          const split = this._splitPushdownWhere(residualWhere, fromTable, baseAlias, joinPlans);
+          const pushedWhere = split.pushed;
+          const residualAfterJoin = split.residual;
+          if (pushedWhere) {
+              const baseAliases = { [baseAlias]: fromTable, [fromTable]: fromTable };
+              const pf = this.compileCondition(
+                  this._applyDateColumns(this._applyColumnCollations(pushedWhere, baseAliases), baseAliases), strMap);
+              const tickP = this._mkTick();
+              rowPtrs = rowPtrs.filter(ptr => { tickP(); return pf(ptr, this.tables, baseAliases); });
           }
 
           let ptrKeys = [fromTable, baseAlias];
@@ -900,7 +1128,7 @@
                       }
                   });
               } else {
-                  let onFunc = this.compileCondition(this._applyDateColumns(this._applyColumnCollations(join.onCond, aliases), aliases), strMap);
+                  let onFunc = this.compileCondition(this._applyDateColumns(this._applyColumnCollations(this._assertNoAmbiguousColumns(join.onCond, aliases), aliases), aliases), strMap);
                   // 入れ子ループ結合は最も暴走しやすいので、内側ループで期限を見る
                   const tickJ = this._mkTick();
                   rowPtrs.forEach(ptr => {
@@ -935,28 +1163,61 @@
               ptrKeys.push(join.table, join.alias);
           });
 
-          if (residualWhere) {
-              let whereFunc = this.compileCondition(this._applyDateColumns(this._applyColumnCollations(residualWhere, aliases), aliases), strMap);
+          // 押し下げた分は既に適用済みなので、残りだけを結合後に評価する
+          if (residualAfterJoin) {
+              let whereFunc = this.compileCondition(this._applyDateColumns(this._applyColumnCollations(this._assertNoAmbiguousColumns(residualAfterJoin, aliases), aliases), aliases), strMap);
               const tickW = this._mkTick();
               rowPtrs = rowPtrs.filter(ptr => { tickW(); return whereFunc(ptr, this.tables, aliases); });
           }
 
+          // HAVING / QUALIFY / ORDER BY の曖昧な列名も、集計の切り出しで別名へ
+          // 置き換わる前のこの時点で見る（切り出し後の文面には元の列名が残らない）
+          if (havingStr) this._assertNoAmbiguousColumns(havingStr, aliases);
+          if (qualifyStr) this._assertNoAmbiguousColumns(qualifyStr, aliases);
+          if (orderByStr) this._assertNoAmbiguousColumns(orderByStr, aliases);
+
           // SELECT 句の日付列にも目印を付ける（`hire + 30` を日数加算として畳むため）
-          let selectParts = this.splitSelectClause(this._applyDateColumns(selectClause, aliases));
+          let selectParts = this.splitSelectClause(this._applyDateColumns(this._assertNoAmbiguousColumns(selectClause, aliases), aliases));
           let windowFuncs = [];
 
           let compiledSelects = selectParts.map((part, partIdx) => {
-              const asMatch = part.match(/(.+?)\s+AS\s+([a-zA-Z0-9_]+)$/i);
-              let expr = asMatch ? asMatch[1].trim() : part.trim();
-              let alias = asMatch ? asMatch[2] : expr.replace(/^[a-zA-Z0-9_]+\./, '');
+              // 別名の切り出し。3 形態を受け付ける:
+              //   1. AS <識別子>                     … SELECT id AS x
+              //   2. AS "任意の文字列" / 'x'          … 退避済みトークン __STR_n__ を実文字列へ戻す
+              //   3. AS 省略の後置別名                … SELECT id x / SELECT COUNT(*) c
+              // 3 は SQL では一般的だが、末尾が裸の語になる構文（IS NULL / INTERVAL 1 DAY /
+              // COLLATE NOCASE 等）と紛れるため _trailingAlias で保守的に判定する
+              const asMatch = part.match(/(.+?)\s+AS\s+([a-zA-Z0-9_]+|__STR_\d+__)$/i);
+              let bareAlias = null;
+              if (!asMatch) bareAlias = this._trailingAlias(part.trim());
+              let expr = asMatch ? asMatch[1].trim() : (bareAlias ? bareAlias.expr : part.trim());
+              let alias = asMatch ? asMatch[2] : (bareAlias ? bareAlias.alias : expr.replace(/^[a-zA-Z0-9_]+\./, ''));
+              const named = !!(asMatch || bareAlias);
+              // 引用符付き別名（AS "col name"）は文字列として退避されているので実体へ戻す。
+              // 戻さないと内部トークン __STR_0__ がそのまま列名として露出する
+              const aliasStrM = named && /^__STR_(\d+)__$/.test(alias) ? alias.match(/^__STR_(\d+)__$/) : null;
+              if (aliasStrM && strMap && strMap[Number(aliasStrM[1])] !== undefined) {
+                  alias = this._unquoteLiteral(strMap[Number(aliasStrM[1])]);
+              }
               // 別名の無い定数列は式そのものが列名になるが、`SELECT id, 0` のように
               // 整数に見える名前だと JS オブジェクトのキー順序で先頭へ回り、出力列の順序が
               // SELECT の並びと食い違う。文字列定数は内部トークン __STR_n__ が露出する。
               // どちらも位置ベースの columnN へ寄せる（VALUES 文と同じ命名規則）
-              if (!asMatch && (/^-?\d+(?:\.\d+)?$/.test(alias) || /^__STR_\d+__$/.test(alias))) {
+              if (!named && (/^-?\d+(?:\.\d+)?$/.test(alias) || /^__STR_\d+__$/.test(alias))) {
                   alias = `column${partIdx + 1}`;
               }
+              // 別名の無い「式」の列名は式のテキストそのものになるが、そこに文字列
+              // リテラルが含まれると内部トークンが残る（`CONCAT(f, __STR_0__, l)` や
+              // `CASE WHEN f=__STR_0__ ...`）。列名は書いたとおりの式であるべきなので
+              // リテラルを書き戻す。上の columnN 化（別名が丸ごとトークンの場合）を
+              // 通り抜けた「トークンを含むだけ」のケースがここに来る
+              if (!named && strMap && /__STR_\d+__/.test(alias)) {
+                  alias = this._restoreStrings(alias, strMap);
+              }
               if (expr === '*') return { type: 'star' };
+              // 修飾スター `u.*` / `users.*`: その別名（表）の列だけを展開する
+              const qStarM = expr.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\s*\*$/);
+              if (qStarM) return { type: 'star', only: qStarM[1].toLowerCase() };
               // SELECT * EXCLUDE (col, ...) / * REPLACE (expr AS col, ...) — DuckDB / Snowflake。
               // 列が多い表から「ほぼ全部」を選ぶときに列挙を避けられる
               // EXCEPT は集合演算子として先に文が分割されてしまうため EXCLUDE のみ受理する
@@ -1138,6 +1399,17 @@
                       }
                   }
 
+                  // フレームを書かずに ORDER BY だけを書いた OVER 句の既定フレームは
+                  // SQL 標準では RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW。
+                  // つまり **同じ並び順の値を持つ行（ピア）はまとめて同じ値になる**。
+                  // 従来は既定が無く行単位の逐次累算（＝ROWS 相当）へ落ちていたため、
+                  // 日次売上の累計などで同日の行に途中経過が出ていた。
+                  // ORDER BY が無い場合はパーティション全体が対象（既存の分岐のまま）
+                  const FRAMED_FNS = ['SUM', 'COUNT', 'AVG', 'MIN', 'MAX', 'FIRST_VALUE', 'LAST_VALUE'];
+                  if (!frame && oFuncs.length > 0 && FRAMED_FNS.includes(funcName)) {
+                      frame = { unit: 'RANGE', start: { t: 'up' }, end: { t: 'cur' }, exclude: 'NO OTHERS', implicit: true };
+                  }
+
                   let wfId = `__wf_${partIdx}`;
                   if (wfIgnoreNulls && !['LAG', 'LEAD', 'FIRST_VALUE', 'LAST_VALUE', 'NTH_VALUE'].includes(funcName)) {
                       throw new Error(`IGNORE NULLS is not supported for ${funcName}(). Use it with LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE.`);
@@ -1211,6 +1483,36 @@
               havingStrEff = this._rewriteAggCalls(havingStrEff, compiledSelects, strMap, '__hv_');
           }
 
+          // 行が 1 つも残っていないときは、式が一度も評価されないため列名の誤りが
+          // 検出されない。空の表に対する `SELECT nosuchcol FROM t` が
+          // エラーではなく「0 件」を返していた（表にデータがある間だけ気づける＝
+          // 新しい DB や絞り込みで空になった時に typo が黙って通る）。
+          // 実データ 1 行を使わずに、添字 -1（= NULL 扱い）で一度だけ評価して
+          // 名前解決だけを走らせる。__resolve は「列が無ければ throw、
+          // あるが添字が -1 なら null」なので、名前の誤りだけが表に出る
+          if (rowPtrs.length === 0) {
+              const nullPtr = Object.create(null);
+              for (const al in aliases) nullPtr[al] = -1;
+              const validate = (fn) => {
+                  if (typeof fn !== 'function') return;
+                  try { fn(nullPtr, this.tables, aliases); }
+                  catch (e) {
+                      // 名前解決の失敗だけを伝える（型変換など値依存の失敗は無視する）
+                      if (e && e.message && /not found|is ambiguous|does not exist/i.test(e.message)) throw e;
+                  }
+              };
+              compiledSelects.forEach(sel => {
+                  // 'aggexpr' の外側の式は「集計後の疑似 1 行」（__se_N を列として持つ）に
+                  // 対して評価されるものなので、基底表の行では解決できない。
+                  // 中の集計呼び出しは別途 type:'agg' として展開されており、
+                  // その argFunc をここで検査するので typo は取り逃さない
+                  if (sel.type !== 'aggexpr') validate(sel.evalFunc);
+                  validate(sel.argFunc);
+                  validate(sel.argFunc2);
+                  (sel.argFuncs || []).forEach(validate);
+              });
+          }
+
           let isAgg = compiledSelects.some(sel => sel.type === 'agg' || sel.type === 'aggexpr');
 
           // ウィンドウ関数と GROUP BY / 集計の併用（`SUM(SUM(x)) OVER ()` で全体比を出す、
@@ -1221,7 +1523,10 @@
           let postAggWindows = null;
           if (windowFuncs.length > 0 && (isAgg || groupByStr)) {
               postAggWindows = windowFuncs.map(wf => {
-                  if (wf.frame) {
+                  // 既定フレーム（implicit）は「書かれていない」のと同じ扱いにする。
+                  // GROUP BY の結果は 1 グループ 1 行なのでピアが生じず、
+                  // RANGE ... CURRENT ROW と行単位の累積は一致する
+                  if (wf.frame && !wf.frame.implicit) {
                       throw new Error("Explicit window frames (ROWS/RANGE/GROUPS) are not supported over GROUP BY results. Use a subquery.");
                   }
                   const conv = (text) => this._rewriteAggCalls(text, compiledSelects, strMap, '__wa_').trim();
@@ -1430,13 +1735,14 @@
                                       fnRows++;
                                       const av = wf.argFunc ? wf.argFunc(pRows[fi], this.tables, aliases) : null;
                                       if (av === null || av === undefined) continue;
-                                      if (typeof av === 'number') fsum += av;
+                                      const an = LUMINA_AGG_NUM(av);
+                                      if (an !== null) fsum += an;
                                       fcnt++;
                                       if (fbest === null || (wf.funcName === 'MIN' ? av < fbest : av > fbest)) fbest = av;
                                   }
                                   if (wf.funcName === 'COUNT') val = wf.argFunc ? fcnt : fnRows;
                                   else if (wf.funcName === 'SUM') val = fcnt > 0 ? fsum : null;
-                                  else if (wf.funcName === 'AVG') val = fcnt > 0 ? Number((fsum / fcnt).toFixed(2)) : null;
+                                  else if (wf.funcName === 'AVG') val = fcnt > 0 ? fsum / fcnt : null;
                                   else val = fbest;
                               }
                           } else if (wf.funcName === 'ROW_NUMBER') {
@@ -1450,8 +1756,8 @@
                               }
                               val = wf.funcName === 'RANK' ? rank : denseRank;
                           } else if (wf.funcName === 'SUM') {
-                              let argVal = wf.argFunc ? wf.argFunc(ptr, this.tables, aliases) : 0;
-                              if (typeof argVal === 'number') sum += argVal;
+                              const argN = LUMINA_AGG_NUM(wf.argFunc ? wf.argFunc(ptr, this.tables, aliases) : 0);
+                              if (argN !== null) sum += argN;
                               val = sum;
                           } else if (wf.funcName === 'COUNT') {
                               if (!wf.argFunc) cnt++;
@@ -1461,9 +1767,9 @@
                               }
                               val = cnt;
                           } else if (wf.funcName === 'AVG') {
-                              let argVal = wf.argFunc ? wf.argFunc(ptr, this.tables, aliases) : null;
-                              if (typeof argVal === 'number') { sum += argVal; cnt++; }
-                              val = cnt > 0 ? Number((sum / cnt).toFixed(2)) : null;
+                              const argN = LUMINA_AGG_NUM(wf.argFunc ? wf.argFunc(ptr, this.tables, aliases) : null);
+                              if (argN !== null) { sum += argN; cnt++; }
+                              val = cnt > 0 ? sum / cnt : null;
                           } else if (wf.funcName === 'MIN' || wf.funcName === 'MAX') {
                               let argVal = wf.argFunc ? wf.argFunc(ptr, this.tables, aliases) : null;
                               if (argVal !== null && argVal !== undefined) {
@@ -1597,19 +1903,53 @@
                           allItems.push(txt);
                           return allItems.length - 1;
                       };
-                      this.splitSelectClause(gsM[1]).forEach(part => {
-                          const p = part.trim();
+                      // 1 要素（部分集合の 1 つ）を解釈する。GROUPING SETS の中には
+                      // ROLLUP / CUBE / 入れ子の GROUPING SETS も書ける（SQL 標準）ので、
+                      // それぞれを「集合の並び」へ展開して平らにする。
+                      // 従来は式として評価しようとして "Function 'ROLLUP' does not exist." になっていた
+                      const expandItem = (p, out) => {
+                          const nest = p.match(/^(ROLLUP|CUBE|GROUPING\s+SETS)\s*\(([\s\S]*)\)$/i);
+                          if (nest) {
+                              const kind = nest[1].toUpperCase().replace(/\s+/g, ' ');
+                              if (kind === 'GROUPING SETS') {
+                                  this.splitSelectClause(nest[2]).forEach(x => expandItem(x.trim(), out));
+                                  return;
+                              }
+                              // ROLLUP(a, b) の要素は「(a,b) をひとかたまりに見なす」書き方も許す
+                              const cols = this.splitSelectClause(nest[2]).map(x => {
+                                  const g = x.trim().match(/^\(([\s\S]*)\)$/);
+                                  return (g ? this.splitSelectClause(g[1]) : [x]).map(y => y.trim()).filter(y => y !== '');
+                              });
+                              if (cols.length === 0) throw new Error(`${kind} requires at least one grouping item.`);
+                              if (kind === 'ROLLUP') {
+                                  // 接頭辞集合: (a,b) -> {a,b}, {a}, {}
+                                  for (let n = cols.length; n >= 0; n--) {
+                                      const act = new Set();
+                                      cols.slice(0, n).forEach(grp => grp.forEach(c => act.add(idxOf(c))));
+                                      out.push(act);
+                                  }
+                              } else {
+                                  // CUBE: 2^n 個の全部分集合
+                                  for (let mask = (1 << cols.length) - 1; mask >= 0; mask--) {
+                                      const act = new Set();
+                                      cols.forEach((grp, i) => { if (mask & (1 << i)) grp.forEach(c => act.add(idxOf(c))); });
+                                      out.push(act);
+                                  }
+                              }
+                              return;
+                          }
                           const inner = p.match(/^\(([\s\S]*)\)$/);
                           if (inner) {
                               const body = inner[1].trim();
                               const act = new Set();
                               if (body !== '') this.splitSelectClause(body).forEach(c => act.add(idxOf(c.trim())));
-                              sets.push(act);
+                              out.push(act);
                           } else {
                               // 括弧なしの単項目も 1 要素集合として受理する
-                              sets.push(new Set([idxOf(p)]));
+                              out.push(new Set([idxOf(p)]));
                           }
-                      });
+                      };
+                      this.splitSelectClause(gsM[1]).forEach(part => expandItem(part.trim(), sets));
                       if (allItems.length === 0) throw new Error("GROUPING SETS requires at least one grouping item.");
                       groupByEff = allItems.join(', ');
                       groupingSetsSpec = sets;
@@ -1677,7 +2017,7 @@
 
           // HAVING の絞り込み本体。出力行（SELECT 別名・隠し集計列 __hv_ を含む）に対して評価する
           const applyHaving = (rows) => {
-              const hFunc = this.compileCondition(this._applyDateColumns(this._applyColumnCollations(havingStrEff, aliases), aliases), strMap);
+              const hFunc = this.compileCondition(this._applyDateColumns(this._applyColumnCollations(this._assertNoAmbiguousColumns(havingStrEff, aliases), aliases), aliases), strMap);
               const dummyCols = {};
               if (rows.length > 0) Object.keys(rows[0]).forEach(k => dummyCols[k.toLowerCase()] = true);
               const kept = rows.filter(row => {
@@ -1987,17 +2327,20 @@
                                   // SUM(DISTINCT) / AVG(DISTINCT): 重複値を除外して集計
                                   const seen = new Set();
                                   groupPtrs.forEach(ptr => {
-                                      let v = sel.argFunc(ptr, this.tables, aliases);
-                                      if (typeof v === 'number') seen.add(v);
+                                      const n = LUMINA_AGG_NUM(sel.argFunc(ptr, this.tables, aliases));
+                                      if (n !== null) seen.add(n);
                                   });
                                   seen.forEach(v => { sum += v; cnt++; });
                               } else {
                                   groupPtrs.forEach(ptr => {
-                                      let v = sel.argFunc(ptr, this.tables, aliases);
-                                      if (typeof v === 'number') { sum += v; cnt++; }
+                                      const n = LUMINA_AGG_NUM(sel.argFunc(ptr, this.tables, aliases));
+                                      if (n !== null) { sum += n; cnt++; }
                                   });
                               }
-                              aggRow[sel.alias] = sel.func === 'SUM' ? sum : (cnt>0 ? Number((sum/cnt).toFixed(2)) : 0);
+                              // AVG は倍精度のまま返す。以前は 2 桁へ丸めていたため
+                              // 0.000001 台の平均が 0 になり、率や単価が壊れていた。
+                              // 2 桁で欲しい場合は ROUND(AVG(x), 2) と書く
+                              aggRow[sel.alias] = sel.func === 'SUM' ? sum : (cnt>0 ? sum/cnt : 0);
                           }
                       } else if (sel.type === 'window') {
                           // 値は集計後の別パス（_applyPostAggWindows）で埋める。
@@ -2123,18 +2466,55 @@
                   });
               }
               const tickO = this._mkTick();
+              // 修飾スター `u.*` が実在の別名を指しているか（実行前に検証する。
+              // 誤記が黙って 0 列になると気づけない）
+              compiledSelects.forEach(sel => {
+                  if (sel.type === 'star' && sel.only && !aliases[sel.only]) {
+                      throw new Error(`Table or alias '${sel.only}' in '${sel.only}.*' is not in the FROM clause.`);
+                  }
+              });
+              // `*` の展開対象は「関係ごとに1つ」。ptr には実表名と別名の両方がキーとして
+              // 入っている（`FROM users u` なら users と u）ので、素の for..in で回すと
+              // 同じ表を二度展開してしまう。ptrKeys の [表名, 別名] 対から別名側だけを採る
+              const starAliases = [];
+              {
+                  const seenAl = new Set();
+                  for (let i = 1; i < ptrKeys.length; i += 2) {
+                      const a = ptrKeys[i];
+                      if (a === undefined || seenAl.has(a)) continue;
+                      seenAl.add(a); starAliases.push(a);
+                  }
+              }
               resultSet = rowPtrs.map(ptr => {
                   tickO();
                   let outRow = {};
+                  // 出力列名の重複解決。JS オブジェクトのキーは一意なので、
+                  // `SELECT u.id, p.id` や 2 表 JOIN の `SELECT *` は後の列が前の列を
+                  // 黙って上書きしていた（＝データが消える）。2 つ目以降は _1, _2 … を付ける
+                  const put = (name, value) => {
+                      let key = name;
+                      if (Object.prototype.hasOwnProperty.call(outRow, key)) {
+                          let n = 1;
+                          while (Object.prototype.hasOwnProperty.call(outRow, `${name}_${n}`)) n++;
+                          key = `${name}_${n}`;
+                      }
+                      outRow[key] = value;
+                  };
                   compiledSelects.forEach(sel => {
                       if (sel.type === 'star') {
-                          for (let alias in ptr) {
+                          for (let alias of (starAliases.length ? starAliases : Object.keys(ptr))) {
+                              if (sel.only && alias.toLowerCase() !== sel.only) continue;
                               let actualTbl = aliases[alias];
-                              if (actualTbl && this.tables[actualTbl] && ptr[alias] !== -1) {
+                              if (actualTbl && this.tables[actualTbl]) {
                                   const t = this.tables[actualTbl];
+                                  // 外部結合の未マッチ側（ptr が -1）は **NULL を並べる**。
+                                  // 従来はその表の列をまるごと出力から落としていたため、
+                                  // 同じ結果セットの中で行ごとに列が違う（＝グリッドの列が欠ける・
+                                  // 書き出した CSV の列数が揃わない）という状態になっていた
+                                  const unmatched = ptr[alias] === -1;
                                   t.getColumnNames().forEach(c => {
                                       if (sel.exclude && sel.exclude.has(c.toLowerCase())) return;
-                                      outRow[c] = t.getValue(c, ptr[alias]);
+                                      put(c, unmatched ? null : t.getValue(c, ptr[alias]));
                                   });
                               }
                           }
@@ -2146,9 +2526,9 @@
                               });
                           }
                       } else if (sel.type === 'expr') {
-                          outRow[sel.alias] = sel.evalFunc(ptr, this.tables, aliases);
+                          put(sel.alias, sel.evalFunc(ptr, this.tables, aliases));
                       } else if (sel.type === 'window') {
-                          outRow[sel.alias] = ptr[sel.wfId];
+                          put(sel.alias, ptr[sel.wfId]);
                       }
                   });
                   obAttach.forEach(a => {

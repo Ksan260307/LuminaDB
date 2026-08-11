@@ -8,7 +8,7 @@
     }
     // 結果セットの書き出し系ボタンをまとめて有効/無効にする
     function setResultExportEnabled(on) {
-      ['exportCsvBtn', 'exportJsonBtn', 'copyMdBtn', 'copyInsertBtn']
+      ['exportCsvBtn', 'exportJsonBtn', 'copyMdBtn', 'copyTsvBtn', 'copyInsertBtn']
           .forEach(id => { const el = document.getElementById(id); if (el) el.disabled = !on; });
     }
 
@@ -16,6 +16,82 @@
     function sqlSummary(sql) {
       const one = String(sql).replace(/\s+/g, ' ').trim();
       return one.length > 120 ? one.slice(0, 117) + '...' : one;
+    }
+
+    // 「結果セット」か「DML/DDL の状態行」かを 1 か所で判定する。
+    // 以前は `!res.data[0].Result` で見ていたため、`SELECT note AS Result FROM t` の
+    // ように Result という列名を持つ**本物の結果セット**が状態行と誤判定され、
+    // 書き出し・コピーの5ボタンが理由も出さずに無効化されていた。
+    // 状態行は必ず {Result, Message} の2キーだけなので、そこまで見て判定する
+    function isStatusRows(data) {
+      if (!Array.isArray(data) || data.length === 0) return false;
+      const k = Object.keys(data[0]);
+      return k.length === 2 && k.includes('Result') && k.includes('Message');
+    }
+    function isResultSet(data) {
+      return Array.isArray(data) && !isStatusRows(data);
+    }
+    window.isStatusRows = isStatusRows;
+    window.isResultSet = isResultSet;
+
+    // 複数文スクリプトの結果セット群。タブで切り替える
+    let scriptResultSets = [];
+    let scriptActiveSet = 0;
+
+    function renderResultTabs() {
+      const wrap = document.getElementById('resultTabs');
+      if (!wrap) return;
+      if (scriptResultSets.length < 2) {
+        wrap.classList.add('hidden');
+        wrap.innerHTML = '';
+        return;
+      }
+      wrap.classList.remove('hidden');
+      wrap.innerHTML = scriptResultSets.map((s, i) => {
+        const on = i === scriptActiveSet;
+        const cls = on
+            ? 'bg-white border-gray-300 border-b-white text-blue-700 font-semibold'
+            : 'bg-gray-100 border-gray-200 text-gray-600 hover:bg-gray-50';
+        return `<button type="button" data-set="${i}" title="${escapeHtml(sqlSummary(s.sql))}"`
+            + ` class="text-xs px-2.5 py-1 border rounded-t -mb-px ${cls}">`
+            + `#${i + 1} · ${escapeHtml(shortLabel(s.sql))} · ${s.data.length.toLocaleString()}</button>`;
+      }).join('');
+    }
+
+    // タブに出す短い見出し（文の種類＋対象名）
+    function shortLabel(sql) {
+      const one = String(sql).replace(/\s+/g, ' ').trim();
+      const m = one.match(/^\s*(select|with|table|values|show|describe|desc|explain|pragma)\b/i);
+      const verb = m ? m[1].toUpperCase() : one.split(/\s+/)[0].toUpperCase();
+      const t = one.match(/\bfrom\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+      return t ? `${verb} ${t[1]}` : verb;
+    }
+
+    function showResultSet(i) {
+      if (!scriptResultSets[i]) return;
+      scriptActiveSet = i;
+      const s = scriptResultSets[i];
+      currentResultData = s.data;
+      currentSort = { col: null, asc: true };
+      renderDisplay(true);
+      setResultExportEnabled(isResultSet(s.data) && s.data.length > 0);
+      els.mRows.textContent = s.data.length.toLocaleString();
+      renderResultTabs();
+    }
+    // タブは差し替わるのでイベント委譲で拾う
+    (function bindResultTabs() {
+      const wrap = document.getElementById('resultTabs');
+      if (!wrap) return;
+      wrap.addEventListener('click', (e) => {
+        const b = e.target.closest('button[data-set]');
+        if (b) showResultSet(Number(b.getAttribute('data-set')));
+      });
+    })();
+
+    function clearResultTabs() {
+      scriptResultSets = [];
+      scriptActiveSet = 0;
+      renderResultTabs();
     }
 
     // カーソル位置の 1 文だけを実行する（Ctrl+Enter）。
@@ -42,13 +118,23 @@
       currentSort = { col: null, asc: true }; // reset sort on new query
       hideSuggestions();
       pushQueryHistory(sql);
+      clearResultTabs();
 
       // ';' 区切りの複数文はスクリプトとして順次実行し、最後の結果セットを表示する
       const statements = db.splitStatements(sql);
       if (statements.length > 1) {
           const script = db.executeScript(sql);
           const errors = script.results.filter(r => r.error);
-          const lastData = [...script.results].reverse().find(r => !r.error && r.data && r.data.length > 0);
+          // 表示する結果セットは「最後の**結果セット**」。以前は
+          // `data.length > 0` の最後を探していたため、末尾の SELECT が 0 件だと
+          // 途中の別の文の結果を「答え」として出していた（0 件の DELETE の後に
+          // 状態行が出る、途中の SELECT 1 が出る等）。
+          // 結果セットが複数あるときはタブで全部見られるようにする
+          scriptResultSets = script.results
+              .filter(r => !r.error && isResultSet(r.data))
+              .map(r => ({ sql: r.sql, data: r.data }));
+          const lastData = scriptResultSets.length > 0 ? scriptResultSets[scriptResultSets.length - 1] : null;
+          scriptActiveSet = Math.max(0, scriptResultSets.length - 1);
           if (errors.length > 0) {
               // XSS対策: SQL・エラーメッセージともユーザー入力由来のためエスケープする
               els.resArea.innerHTML = `<div class="m-auto text-sm font-mono max-w-full overflow-auto p-4">`
@@ -56,19 +142,25 @@
                   + errors.map(e2 => `<div class="text-red-500 text-xs mb-1">${escapeHtml(e2.sql.slice(0, 80))} → ${escapeHtml(e2.error)}</div>`).join('')
                   + `</div>`;
               setResultExportEnabled(false);
+              clearResultTabs();
               logToConsole('error', `Script: ${script.succeeded}/${script.total} 文成功`, `${errors.length} 件のエラー: ${errors[0] ? errors[0].error : ''}`, sql);
           } else if (lastData) {
-              currentResultData = lastData.data;
-              renderDisplay(true);
-              const isObservation = lastData.data.length > 0 && !lastData.data[0].Result;
-              setResultExportEnabled(isObservation);
-              showToast(`${script.succeeded} / ${script.total} 文を実行しました（最終結果 ${lastData.data.length.toLocaleString()} 件）。`);
+              // 末尾の結果セットを既定で見せる（0 件でも「0 件だった」と分かるように出す）
+              showResultSet(scriptActiveSet);
+              const label = lastData.data.length === 0
+                  ? '最終結果 0 件'
+                  : `最終結果 ${lastData.data.length.toLocaleString()} 件`;
+              const tabs = scriptResultSets.length > 1 ? `／結果セット ${scriptResultSets.length} 個` : '';
+              showToast(`${script.succeeded} / ${script.total} 文を実行しました（${label}${tabs}）。`);
           } else {
               els.resArea.innerHTML = `<div class="m-auto text-gray-400 text-sm">${script.succeeded} / ${script.total} statements executed.</div>`;
+              clearResultTabs();
               showToast(`${script.succeeded} / ${script.total} 文を実行しました。`);
           }
-          els.mTime.textContent = '---';
-          els.mRows.textContent = String(script.total);
+          // 実行時間は各文の合計、件数は表示中の結果セットの件数（showResultSet が設定する）
+          const totalMs = script.results.reduce((a, r) => a + (Number(r.executionTime) || 0), 0);
+          els.mTime.textContent = `${totalMs.toFixed(2)} ms`;
+          if (!lastData || errors.length > 0) els.mRows.textContent = String(script.total);
           // 複数文スクリプトの結果はどの文に由来するか特定できないので編集不可にする
           setEditContext(null);
           renderTree();
@@ -88,8 +180,8 @@
         els.mTime.textContent = `${res.executionTime} ms`;
         els.mRows.textContent = res.scannedRows.toLocaleString();
         // 結果セット(SELECT等)は取得件数、DML/DDLは処理行数を表示する
-        const isResultSet = Array.isArray(res.data) && (res.data.length === 0 || !res.data[0].Result);
-        const detail = isResultSet
+        const isSet = isResultSet(res.data);
+        const detail = isSet
             ? `${res.data.length.toLocaleString()} 件取得 · ${res.executionTime} ms`
             : `${(res.scannedRows || 0).toLocaleString()} 行処理 · ${res.executionTime} ms`;
         logToConsole('query', sqlSummary(sql), detail, sql);
@@ -103,8 +195,9 @@
         setEditContext(isSelect ? sql : null);
         renderDisplay(true);
 
-        const isObservation = res.data && res.data.length > 0 && !res.data[0].Result;
-        setResultExportEnabled(isObservation);
+        // 書き出し・コピーは「行のある結果セット」でだけ有効。
+        // Result という別名の列があるだけで無効化されないよう共通判定を使う
+        setResultExportEnabled(isSet && res.data.length > 0);
 
         renderTree();
         if (!/^(select|explain)\s+/i.test(sql)) triggerAutoSave();
@@ -112,6 +205,24 @@
       renderTxnState();
     }
     document.getElementById('executeBtn').addEventListener('click', () => { saveQueryState(); runQuery(); });
+
+    // ============================================================================
+    // Explain: カーソル位置（無ければ全体）の SELECT の実行計画だけを見る。
+    // データを書き換えないので、重い UPDATE/DELETE を「先に確かめる」用途にも使える
+    // ============================================================================
+    function explainCurrent() {
+      const whole = els.query.value.trim().replace(/;$/, '').trim();
+      const stmt = (statementAtCursor(els.query.value, els.query.selectionStart) || whole).trim();
+      if (!stmt) return;
+      if (/^explain\b/i.test(stmt)) { runQuery(stmt); return; }
+      if (!/^(select|with|table|values)\b/i.test(stmt)) {
+        showToast('Explain は SELECT / WITH の文にだけ使えます。', true);
+        return;
+      }
+      runQuery(`EXPLAIN ${stmt}`);
+    }
+    const explainBtn = document.getElementById('explainBtn');
+    if (explainBtn) explainBtn.addEventListener('click', () => { saveQueryState(); explainCurrent(); });
 
     // ============================================================================
     // トランザクション操作バー
@@ -147,6 +258,34 @@
       }
       renderTxnState();
     }
+
+    // ============================================================================
+    // 実行時間の上限（1 文あたり）
+    // ブラウザ内 DB はクエリが UI スレッドを占有するため、書き間違えた結合ひとつで
+    // タブが永久に固まる。既定で上限を掛け、必要なら画面から外せるようにする。
+    // 選択はブラウザに保存する
+    // ============================================================================
+    (function initStatementTimeout() {
+      const sel = document.getElementById('stmtTimeout');
+      if (!sel) return;
+      const KEY = 'luminadb_stmt_timeout';
+      const apply = (ms) => {
+        db.statementTimeoutMs = Number(ms) || 0;
+        sel.value = String(db.statementTimeoutMs);
+      };
+      let saved = null;
+      try { saved = localStorage.getItem(KEY); } catch (e) { /* プライベートモード等 */ }
+      apply(saved !== null ? saved : sel.value);
+      sel.addEventListener('change', () => {
+        apply(sel.value);
+        try { localStorage.setItem(KEY, String(db.statementTimeoutMs)); } catch (e) { /* 保存できなくても動く */ }
+        showToast(db.statementTimeoutMs === 0
+            ? '実行時間の上限を外しました。'
+            : `実行時間の上限を ${db.statementTimeoutMs / 1000} 秒にしました。`);
+      });
+      // Clear DB などで db インスタンスが作り直されても設定を引き継ぐ
+      window.reapplyStatementTimeout = () => { db.statementTimeoutMs = Number(sel.value) || 0; };
+    })();
 
     document.getElementById('txnBeginBtn').addEventListener('click', () => runTxnCommand('BEGIN'));
     document.getElementById('txnCommitBtn').addEventListener('click', () => runTxnCommand('COMMIT'));

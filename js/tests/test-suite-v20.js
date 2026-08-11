@@ -112,7 +112,9 @@
       push('V20In lag offset2', "SELECT id, LAG(v, 2) IGNORE NULLS OVER (ORDER BY id) AS p FROM v20_gaps ORDER BY id",
         r => r.data[5].p === 10);
       push('V20In first ignore', "SELECT FIRST_VALUE(v) IGNORE NULLS OVER (ORDER BY id) AS f FROM v20_gaps LIMIT 1", r => r.data[0].f === 10);
-      push('V20In last ignore', "SELECT LAST_VALUE(v) IGNORE NULLS OVER (ORDER BY id) AS l FROM v20_gaps LIMIT 1", r => r.data[0].l === 60);
+      // v1.25: 既定フレームが RANGE ... CURRENT ROW になったので、パーティション全体を
+      // 見たい場合はフレームを明示する
+      push('V20In last ignore', "SELECT LAST_VALUE(v) IGNORE NULLS OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l FROM v20_gaps LIMIT 1", r => r.data[0].l === 60);
       push('V20In nth ignore', "SELECT NTH_VALUE(v, 2) IGNORE NULLS OVER (ORDER BY id) AS x FROM v20_gaps LIMIT 1", r => r.data[0].x === 40);
       push('V20In nth respect', "SELECT NTH_VALUE(v, 2) OVER (ORDER BY id) AS x FROM v20_gaps LIMIT 1", r => r.data[0].x === null);
       err('V20In on sum', "SELECT SUM(v) IGNORE NULLS OVER () AS x FROM v20_gaps", 'not supported');

@@ -4,7 +4,19 @@
 
 A build-free, in-memory SQL database engine that runs entirely in the browser. Open a single HTML file and you get a full SQL engine (DQL / DML / DDL), transactions, window functions, triggers, views, commercial-DB commands such as `MERGE` / `TOP` / `ON CONFLICT`, and 270+ built-in functions — with no server.
 
-> Version: **v1.22.0** / Self-contained tests: **7,772** (all passing — including 780+ security and 490+ performance tests)
+> Version: **v1.27.0** / Self-contained tests: **8,326** (all passing — including 780+ security and 490+ performance tests)
+
+> **v1.27 highlights.** A 12-dimension audit of the engine and the UI, fixing only defects that could be
+> reproduced. The common thread: no error, no warning — just lost data or a plausible wrong answer.
+> A failed `REPLACE INTO` used to keep only the delete; `TRUNCATE` ignored foreign keys entirely;
+> `ROLLBACK` did not restore `ON UPDATE CURRENT_TIMESTAMP` or generated columns (leaving a state that
+> violated its own `UNIQUE`); a failing AFTER trigger left the statement applied; `EXPLAIN DELETE`
+> **executed** the delete; `x NOT IN (SELECT ...)` returned rows when the subquery contained `NULL`;
+> `AVG` was always rounded to 2 decimals; `SUM` treated BOOLEAN and numeric strings as 0;
+> `DATE(x)` was timezone-shifted; `boolcol = 1` matched nothing while `boolcol > 0` was true;
+> and without the Tailwind CDN every modal rendered open, making the page unusable.
+> New: `SET FOREIGN_KEY_CHECKS`, and opening/saving the database as a file on disk
+> (File System Access API) with a download fallback. See the Japanese README for the full list.
 
 ---
 
@@ -236,6 +248,199 @@ window between reading the version and writing it back.
 Each table carries a `version:rowCount:capacity` fingerprint, and tables whose fingerprint is
 unchanged are not rewritten. Measured on a 60,000-row database: a full first save takes 25 ms,
 while a save after touching one small table takes **2 ms** (a no-op save is 1 ms, 0 tables written).
+
+### v1.26 — quoted identifiers, nested GROUPING SETS, complete dumps
+
+This release closes the two items v1.25 listed as unsupported, and fixes a gap in the SQL dump.
+
+```sql
+-- 1. Backticks make reserved words usable as identifiers (MySQL style)
+CREATE TABLE t (`order` INTEGER, `select` TEXT);
+SELECT `order`, `select` FROM t WHERE `order` = 1;
+-- Up to v1.25 backticks passed straight through, so a column really named `order`
+-- was created, and `col name` was truncated to `col — silently wrong either way
+CREATE TABLE t (`col name` INTEGER);   -- names that cannot be identifiers are now refused
+CREATE TABLE "my tbl" (a INT);         -- double quotes are strings; the error points at backticks
+
+-- 2. GROUPING SETS may contain ROLLUP / CUBE / nested GROUPING SETS
+SELECT a, SUM(v) FROM t GROUP BY GROUPING SETS (ROLLUP(a));
+SELECT a, b, SUM(v) FROM t GROUP BY GROUPING SETS ((a,b), ROLLUP(a));
+-- Up to v1.25 this failed with "Function 'ROLLUP' does not exist."
+```
+
+**3. The SQL dump is now a complete schema backup.** `Export SQL` emitted only tables, data, indexes,
+views and sequences — it **silently dropped triggers, user-defined functions, procedures and comments**.
+All of them are now included, indexes are written under their registered names, and implicit
+PRIMARY KEY / UNIQUE indexes are no longer duplicated. A test replays a dump into an empty database
+and checks every object came back.
+
+**UI: a right-click menu on the schema tree.** Actions that previously required hand-written SQL are now
+one click away — browse the first 100 rows, count rows, show the DDL, list columns, open the column
+profile, edit the schema, copy the table name, or drop the table. Dropping only stages the statement in
+the editor rather than running it, since it cannot be undone.
+
+### v1.25 — NULL in arithmetic, DATE vs DATETIME, default window frames
+
+This release clears the three items v1.24 explicitly left open. All three produced **wrong values without any error**.
+
+```sql
+-- 1. Arithmetic propagates NULL (up to v1.24, JS turned NULL into 0)
+SELECT amt * qty, amt - qty, -qty FROM s;   -- every one is NULL when qty is NULL
+SELECT AVG(amt*qty), MIN(amt*qty), COUNT(amt*qty) FROM s;
+--   old: 366.67 / 0 / 3   ← a NULL-derived 0 won MIN and inflated the AVG denominator
+--   new: 550    / 200 / 2
+SELECT 10 / 0, 10 % 0;    -- old: Infinity / NaN → new: NULL (as MySQL does)
+
+-- 2. DATE is date-only; DATETIME / TIMESTAMP keep the time
+SELECT CAST('2026-01-02 13:45:00' AS DATE);       -- 2026-01-02 (the time used to survive)
+SELECT CAST('2026-01-02 13:45:00' AS DATETIME);   -- 2026-01-02 13:45:00
+SELECT CAST(at AS DATE) AS d, COUNT(*) FROM events GROUP BY CAST(at AS DATE);  -- daily grouping works
+-- Comparisons use the instant rather than the string, so different spellings still match
+SELECT DATE '2026-01-02' = TIMESTAMP '2026-01-02 00:00:00';   -- true
+
+-- 3. An OVER clause with only ORDER BY defaults to RANGE ... CURRENT ROW (the standard)
+SELECT day, SUM(amt) OVER (ORDER BY day) FROM sales;
+--   old: 10, 30, 35 (row-by-row, i.e. ROWS — partial totals showed inside a day)
+--   new: 30, 30, 35 (peer rows share one value)
+-- Ask for the whole partition explicitly, as you would in any other database
+SELECT LAST_VALUE(x) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t;
+```
+
+Also fixed:
+
+```sql
+-- ON DELETE / ON UPDATE SET DEFAULT was not recognised and silently degraded to RESTRICT
+CREATE TABLE c (id INT, pid INT DEFAULT 9, FOREIGN KEY (pid) REFERENCES p(id) ON DELETE SET DEFAULT);
+DELETE FROM p WHERE id = 1;   -- c.pid returns to 9 (the delete used to be rejected)
+
+-- COMMENT ON was missing from the undo log and survived a ROLLBACK
+BEGIN; COMMENT ON TABLE t IS 'x'; ROLLBACK;   -- the previous comment is restored
+```
+
+**UI: a per-statement time limit** (30 s by default). A query holds the UI thread in a browser database,
+so one mistyped join can freeze the tab forever. Change or remove it from the transaction bar; the choice is remembered.
+
+### v1.24 — three-valued NULL logic, and a tidier data panel
+
+The heart of v1.24 is **NULL handling**. Up to v1.23 SQL expressions compiled straight to JavaScript
+operators, and JS coerces `null` to 0 in numeric contexts and makes `null === null` true — so queries
+**returned the wrong rows without raising anything**.
+
+```sql
+-- behaviour up to v1.23 → behaviour in v1.24
+SELECT * FROM t WHERE v < 100;      -- NULL rows were returned      → they are not
+SELECT * FROM t WHERE v >= 0;       -- same                          → they are not
+SELECT * FROM t WHERE v = NULL;     -- matched the NULL rows         → 0 rows (UNKNOWN)
+SELECT * FROM t WHERE v <> 10;      -- included NULL rows            → excludes them
+SELECT * FROM t WHERE NOT (v = 10); -- included NULL rows            → excludes them
+SELECT * FROM t WHERE v BETWEEN -5 AND 5;   -- NULL rows leaked in   → 0 rows
+SELECT * FROM t WHERE v NOT IN (10, NULL);  -- returned rows         → 0 rows (per the standard)
+SELECT * FROM t WHERE s NOT LIKE 'x';       -- included NULL rows    → excludes them
+SELECT NULL = NULL, 1 = NULL;               -- true, false           → NULL, NULL
+
+-- CHECK constraints are three-valued too: UNKNOWN is not a violation
+CREATE TABLE t (a INT, b INT CHECK (b > 0));
+INSERT INTO t (a) VALUES (1);   -- always failed up to v1.23 → accepted
+INSERT INTO t VALUES (2, -1);   -- a real violation is still rejected
+
+-- Anti-joins no longer collapse on NULL
+SELECT o.id FROM orders o WHERE NOT EXISTS (SELECT 1 FROM coupons c WHERE c.code = o.coupon);
+```
+
+`IS NULL`, `IS NOT NULL` and `IS UNKNOWN` are predicates rather than comparisons, so they still return booleans.
+
+Other fixes:
+
+```sql
+-- Outer joins dropped the unmatched side's columns entirely (rows with different shapes)
+SELECT * FROM a LEFT JOIN b ON a.k = b.bk;   -- unmatched rows now carry NULLs
+
+-- ALTER TABLE accepts parameterised types and dialect aliases
+ALTER TABLE t MODIFY COLUMN a VARCHAR(50);   -- was a syntax error up to v1.23
+ALTER TABLE t MODIFY COLUMN b DECIMAL(12,4);
+
+-- Table names starting with '__' are reserved (they used to be created and then silently
+-- swallowed by the internal catalog on save)
+CREATE TABLE __secret (a INT);   -- explicitly refused
+```
+
+JS API:
+
+- `LuminaDB.transaction()` given an **async** callback committed before the callback's writes ran (no atomicity, exceptions lost). It is now refused with a clear message.
+- `LuminaDB.insert()` / `upsert()` / `importJSON()` used **only the first row's keys** as the column list and silently dropped fields that appeared later. They now use the union of every row's keys.
+
+UI: the four unlabelled sidebar buttons (**Export SQL / Import SQL / Import CSV / Test Data**) are now a
+single **Data** button opening a tabbed panel that explains each operation (`Ctrl+Shift+D`). SQL import
+lists the statements that failed and why; CSV import uses the RFC 4180 parser (quoted commas and
+newlines), can create a new table from the header, can replace existing rows, and accepts drag & drop.
+
+### Fixed in v1.23 — silently wrong results
+
+v1.23 is mostly about places that **returned a wrong answer instead of raising an error**.
+
+```sql
+-- Aliases: trailing alias without AS, and quoted aliases (both used to leak a raw JS error)
+SELECT id x, COUNT(*) c FROM users GROUP BY id;
+SELECT id AS "row id", name AS "名前" FROM users;   -- the column used to be named __STR_0__
+
+-- Qualified star
+SELECT u.* FROM users u JOIN orders o ON u.id = o.user_id;
+
+-- Duplicate output names: later columns used to silently overwrite earlier ones (data was lost)
+SELECT u.name, p.name FROM users u JOIN products p ON 1=1;   -- name, name_1
+SELECT * FROM users u JOIN products p ON 1=1;                -- id, name, age, id_1, name_1, ...
+
+-- Parenthesised set-operation branches (previously a syntax error)
+(SELECT id FROM users WHERE id < 3) UNION (SELECT id FROM users WHERE id > 8);
+
+-- Scalar functions that used to return a wrong value without complaining
+SELECT LTRIM('xxhixx', 'x');        -- hixx   (the second argument was ignored)
+SELECT SUBSTRING('abcdef', -3);     -- def    (negative start positions did nothing)
+SELECT LPAD('abcdef', 3, '-');      -- abc    (longer strings were not truncated)
+SELECT HEX('あ');                    -- E38182 (UTF-16 units were squeezed into one byte)
+SELECT UNHEX(HEX('あ'));             -- あ     (the round trip was broken)
+SELECT TO_TIMESTAMP(1700000000);    -- 2023-11-14 (the argument was read as milliseconds)
+SELECT AGE(DATE '2020-01-01');      -- positive interval (the sign was inverted)
+SELECT REGEXP_SUBSTR('a1b2c3', '[0-9]', 1, 2);   -- 2 (position/occurrence were ignored)
+
+-- SHA-2 family added
+SELECT SHA256('abc'), SHA224('abc'), SHA2('abc', 256);
+
+-- Schema changes: metadata now follows a rename
+CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (b * 2), CHECK (b > 0));
+ALTER TABLE t RENAME COLUMN b TO b2;   -- generated expression, CHECK text, column order and
+                                       -- index names all follow. Previously they did not, and
+                                       -- the table became impossible to insert into.
+
+-- A composite UNIQUE INDEX constrains the tuple, not each column
+CREATE UNIQUE INDEX ux ON t (a, b2);   -- (1,2) and (1,3) can now coexist
+
+-- Unknown columns in an INSERT list are rejected (they used to be created silently)
+INSERT INTO users (id, nmae) VALUES (1, 'x');   -- Column 'nmae' not found. Did you mean 'name'?
+
+-- Multiple ALTER TABLE actions / INSERT OR <action>
+ALTER TABLE t ADD COLUMN d INT, ADD COLUMN e TEXT;
+INSERT OR REPLACE INTO t (a) VALUES (1);   -- REPLACE / IGNORE / ABORT / FAIL / ROLLBACK
+```
+
+Error messages improved too:
+
+| Input | Up to v1.22 | v1.23 |
+|-------|-------------|-------|
+| `SELECT LENGHT('abc')` | `Column 'lenght' not found.` | `Function 'LENGHT' does not exist. Did you mean 'LENGTH'?` |
+| `SELECT (1+2 FROM t` | `Unexpected token ';'. Expected ')' to end a compound expression.` (raw JS wording) | `Malformed expression: (1+2 — check for unbalanced parentheses, an unclosed quote, or a missing operand.` |
+
+UI changes in v1.23:
+
+| Feature | Problem it solves | How |
+|---------|-------------------|-----|
+| **Schema search** | With many tables the sidebar could only be scanned by eye, and columns were not searchable at all | Search box in the sidebar. Substring match on table and column names; tables matched by a column expand automatically. `Esc` clears |
+| **Resizable editor** | The editor was fixed at 128 px, so long statements showed only a few lines | Drag the divider below the editor (arrow keys work too). Double-click restores the default. The height is remembered |
+| **Explain button** | Seeing a plan meant typing `EXPLAIN` every time | `Explain` above the editor (`Ctrl+Shift+E`). Plans the statement under the cursor without modifying data |
+| **Copy TSV** | There was no way to paste results into a spreadsheet | `Copy TSV` in the result toolbar |
+| **Row selection reset** (bug) | Selecting a row and then sorting or filtering made `− Row` **delete a different row** | Selection is cleared whenever the display order changes |
+| **Exports follow the filter** (bug) | CSV / JSON / Markdown / INSERT exports ignored the active filter | Only the rows on screen are exported |
+| **CSV null handling** (bug) | Every value was quoted, so NULL and the empty string were indistinguishable | Quote only when required; NULL is an empty field, the empty string is `""` |
 
 ### Added in v1.22 — date arithmetic, hierarchical queries, analytic functions
 
@@ -644,6 +849,10 @@ The 7,000+ self-contained tests can be run two ways. The main suites are:
 | `test-suite-v22.js` | 180 | v1.17 arrays, regression aggregates, fuzzy matching, time-series generation, window extras, the compile cache, CSV import and leader election — including security checks on CSV fields/headers and array elements |
 | `test-suite-v23.js` | 203 | v1.18 precision `CAST`/`CONVERT`, updatable views and `WITH CHECK OPTION`, `INSTEAD OF` triggers, column-level `REFERENCES`, JSON access operators, `IS [NOT] TRUE/FALSE`, named constraints, DML aliases, row-constructor `IN (SELECT)`, index key ordering/expression keys, metadata views and `UNNEST` — plus the UI (result filter, cell detail, tree expansion, transaction bar, run-at-caret) |
 | `test-suite-v24.js` | 124 | v1.19 composite `FOREIGN KEY`, sequence options and `ALTER SEQUENCE`, `DEFAULT` expressions, conditional `MERGE` clauses and `NOT MATCHED BY SOURCE`, `VALUES(col)` / `ON CONFLICT ... WHERE`, view column lists, `ALTER INDEX RENAME` / `SHOW TABLE STATUS` / `WITH [NO] DATA`, nested-aggregate diagnostics — plus the UI (editable grid, copy formats, shortcuts), including a check that edited cell values are bound rather than concatenated into SQL |
+| `test-suite-v31.js` | 41 | v1.26 backtick-quoted identifiers (reserved words as column/table names, explicit errors for unusable or unterminated names, string literals untouched, errors returned rather than thrown), `ROLLUP`/`CUBE`/nesting inside `GROUPING SETS`, `exportSQL` emitting triggers, functions, procedures and comments plus index names and a replay round-trip, UI (schema-tree context menu) |
+| `test-suite-v30.js` | 68 | v1.25 arithmetic NULL propagation (`+ - *`, unary minus, precedence, exponent notation) and division by zero, `DATE` vs `DATETIME`/`TIMESTAMP` (casts, typed literals, `::`, daily `GROUP BY`, cross-spelling comparisons), default window frames (`RANGE ... CURRENT ROW`, explicit `ROWS`, `PARTITION BY`, windows over GROUP BY), `ON DELETE SET DEFAULT`, `COMMENT ON` rollback, UI (statement time limit) |
+| `test-suite-v29.js` | 82 | v1.24 three-valued NULL logic (comparisons, `NOT`, `IN`/`NOT IN`, `CHECK`, LIKE-family), `IS [NOT] NULL`/`UNKNOWN` staying predicates, NULL-filled outer-join `SELECT *`, parameterised/aliased `ALTER TABLE` types, refusal of `__`-prefixed table names, `transaction()` rejecting async callbacks, `insert()` using the union of row keys — plus the UI (Data modal consolidation, SQL import failure report, RFC 4180 CSV, table creation, replace, drag & drop) |
+| `test-suite-v28.js` | 162 | v1.23 aliases (`AS`-less and quoted), qualified stars, duplicate output-name resolution, `LTRIM`/`RTRIM` character sets, negative `SUBSTRING` offsets, `LPAD`/`RPAD` truncation, UTF-8 `HEX`/`UNHEX`, epoch-second `TO_TIMESTAMP`, `AGE` sign, `REGEXP_*` position/occurrence/match_type, `SHA2`/`SHA256`/`SHA224`, metadata following column renames and drops (generated columns, CHECK, column order, index names), composite `UNIQUE INDEX`, rejection of unknown INSERT columns, `INSERT OR <action>`, multi-action `ALTER TABLE`, parenthesised set operations, error messages — plus the UI (schema search, splitter, Explain, row selection, exports) |
 | `test-suite-v27.js` | 123 | v1.22 date arithmetic (date ± integer, date − date), Oracle hierarchical queries (`CONNECT BY`, `LEVEL`, `SYS_CONNECT_BY_PATH`, `CONNECT_BY_ROOT`, `NOCYCLE`) and `ROWNUM`, analytic functions (`RATIO_TO_REPORT`, `PERCENTILE_* OVER`, `NTH_VALUE ... FROM LAST`, `KEEP (DENSE_RANK ...)`), multi-table `TRUNCATE`, `CREATE INDEX ... INCLUDE`/`CONCURRENTLY`, generated columns via `ADD COLUMN`, `SET CONSTRAINTS`, `RETURNING` with upserts, PostgreSQL match operators — plus the UI (column profile, ER diagram) |
 | `test-suite-v26.js` | 115 | v1.21 window functions over `GROUP BY` output, column-level `COLLATE` made effective (comparison, `IN`, `BETWEEN`, `ORDER BY`, `GROUP BY`, `DISTINCT`, `UNIQUE`, index-path bypass), `ORDER BY ALL` / `GROUPING_ID`, `ALTER COLUMN ... SET DATA TYPE` / `TYPE ... USING`, `RENAME CONSTRAINT`, `INSERT ... OVERRIDING VALUE`, `JOIN LATERAL ... ON TRUE`, 1-based subscripts and slices, statement warnings and `SHOW WARNINGS` — plus the UI (editor tabs, warnings in the console) |
 | `test-suite-v25.js` | 110 | v1.20 ordered concat aggregates, window functions in `ORDER BY`, derived-table sources for `UPDATE`/`DELETE`, set-returning functions in the SELECT list, the `DIV` operator, `CREATE DOMAIN`/`TYPE AS ENUM`, users and roles, `TRUNCATE CONTINUE IDENTITY`, recursive `SEARCH`/`CYCLE`, index-backed `IN`, constant-column naming — plus the UI (row add/delete, query history), including a check that deleted-row key values are bound |

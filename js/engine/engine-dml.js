@@ -478,6 +478,8 @@
 
       // INSERT 時の FK 存在チェック（INSERT VALUES / INSERT SELECT 共用）
       _checkInsertFKs(tData, cols, valuesList) {
+          // SET FOREIGN_KEY_CHECKS = 0 のあいだは検査しない（取り込み・相互参照の逃げ道）
+          if (this.fkChecksEnabled === false) return;
           if (!tData.foreignKeys || tData.foreignKeys.length === 0) return;
           tData.foreignKeys.forEach(fk => {
               const refTbl = this.tables[fk.refTable];
@@ -640,6 +642,10 @@
           const aliases = { [table]: table };
           for (const chk of checkFns) {
               let ok; try { ok = chk.fn({ [table]: idx }, this.tables, aliases); } catch (e) { ok = false; }
+              // SQL の CHECK は「偽のときだけ」違反。UNKNOWN(NULL) は通す。
+              // 従来は NULL を偽として扱っていたため、`b INT CHECK (b > 0)` の b を
+              // 省略した INSERT が必ず失敗し、NULL 可の CHECK 列が使えなかった
+              if (ok === null || ok === undefined) continue;
               if (!ok) throw new Error(`CHECK constraint failed: '${chk.label}'`);
           }
       },
@@ -659,6 +665,8 @@
                   for (const c in changes) tData.setValue(c, idx, changes[c]);
                   for (const chk of checkFns) {
                       let ok; try { ok = chk.fn({ [table]: idx }, this.tables, aliases); } catch (e) { ok = false; }
+                      // INSERT 側と同じく UNKNOWN(NULL) は違反にしない
+                      if (ok === null || ok === undefined) continue;
                       if (!ok) { violated = chk.label; break; }
                   }
               } finally {
@@ -675,8 +683,10 @@
       _applyDeleteReferentialActions(rootTable, rootIndices) {
           const deletePlan = Object.create(null); // table -> Set(rowIdx)
           const nullPlan = Object.create(null);   // table -> Map(rowIdx -> Set(col))
+          const defaultPlan = Object.create(null); // table -> Map(rowIdx -> Map(col -> value))
           const getDel = (t) => deletePlan[t] || (deletePlan[t] = new Set());
           const getNull = (t) => nullPlan[t] || (nullPlan[t] = new Map());
+          const getDefault = (t) => defaultPlan[t] || (defaultPlan[t] = new Map());
 
           rootIndices.forEach(i => getDel(rootTable).add(i));
           const queue = [[rootTable, rootIndices]];
@@ -718,6 +728,26 @@
                               let s = nmap.get(r); if (!s) { s = new Set(); nmap.set(r, s); }
                               fkCols.forEach(c => s.add(c));
                           });
+                      } else if (action === 'SET DEFAULT') {
+                          // 既定値へ戻す。戻した値自体が親に無ければ参照が壊れるので計画段階で拒否する
+                          const hasDef = fkCols.map(c => (child.defaults || {})[c] !== undefined);
+                          const defs = fkCols.map((c, i) => hasDef[i] ? this._resolveDefaultValue(child.defaults[c]) : undefined);
+                          if (defs.some(v => v === undefined)) {
+                              const miss = fkCols[defs.findIndex(v => v === undefined)];
+                              throw new Error(`Foreign key constraint failed: ON DELETE SET DEFAULT requires a DEFAULT on ${otherName}(${miss})`);
+                          }
+                          if (!defs.every(v => v === null)) {
+                              const parent = this.tables[fk.refTable];
+                              const norm = defs.map((v, i) => this._normalizeByColType(child, fkCols[i], v));
+                              if (parent && this._fkMatchRows(parent, refCols, norm).length === 0) {
+                                  throw new Error(`Foreign key constraint failed: ON DELETE SET DEFAULT would leave '${norm.join(', ')}' unmatched in ${this._fkLabel(fk)}`);
+                              }
+                          }
+                          const dmap = getDefault(otherName);
+                          childRows.forEach(r => {
+                              let m2 = dmap.get(r); if (!m2) { m2 = new Map(); dmap.set(r, m2); }
+                              fkCols.forEach((c, i) => m2.set(c, defs[i]));
+                          });
                       } else {
                           throw new Error(`Foreign key constraint failed: Cannot delete record referenced by ${this._fkChildLabel(otherName, fk)}`);
                       }
@@ -736,6 +766,17 @@
                   cols.forEach(c => tData.setValue(c, r, null));
               });
           }
+          // 適用1b: SET DEFAULT（削除予定でない行のみ）
+          for (const t in defaultPlan) {
+              const tData = this.tables[t];
+              const dset = deletePlan[t];
+              let cowed2 = false;
+              defaultPlan[t].forEach((cols, r) => {
+                  if (dset && dset.has(r)) return;
+                  if (!cowed2) { this._cowColumns(t, 'ALL'); cowed2 = true; }
+                  cols.forEach((v, c) => tData.setValue(c, r, this._normalizeByColType(tData, c, v)));
+              });
+          }
           // 適用2: 物理削除（root 以外は COW してから）
           for (const t in deletePlan) {
               const idxs = [...deletePlan[t]];
@@ -748,10 +789,15 @@
       // UPDATE / ON DUPLICATE KEY UPDATE 共用の変更検証。
       // pending: [{ idx, changes }] を FK 存在 / NOT NULL / UNIQUE(PK) について適用前に検証する。
       // バッチ内で複数行が同じ一意値へ更新される衝突も検出する
-      _validatePendingChanges(tData, pending) {
+      // opts.skipFk: FK 存在チェックだけを飛ばす。FK ON UPDATE CASCADE の波及値を
+      // 「親を書く前に」子の CHECK / NOT NULL / UNIQUE へ通したいときに使う
+      // （親の新しい値はまだ存在しないので、FK 存在チェックだけは必ず失敗してしまう。
+      //   波及値は定義上その親を指すので、FK は検査しなくても壊れない）
+      _validatePendingChanges(tData, pending, opts) {
           // FK 存在チェック。複合 FK では「変更後の行のタプル全体」で参照先を引く必要があるため、
           // changes に無い列は現在値を使って組み立てる（idx が無い経路では検査を単一列に留める）
-          if (tData.foreignKeys && tData.foreignKeys.length > 0) {
+          if (!(opts && opts.skipFk) && this.fkChecksEnabled !== false
+              && tData.foreignKeys && tData.foreignKeys.length > 0) {
               pending.forEach(({ idx, changes }) => {
                   tData.foreignKeys.forEach(fk => {
                       const fkCols = this._fkCols(fk);
@@ -1071,6 +1117,7 @@
 
       // 削除対象行が他テーブルのFKから参照されていないか検査する (RESTRICT)
       _checkDeleteRestrict(table, tData, targetIndices) {
+          if (this.fkChecksEnabled === false) return;
           for (const otherTblName in this.tables) {
               const otherTbl = this.tables[otherTblName];
               if (!otherTbl.foreignKeys || otherTbl.foreignKeys.length === 0) continue;
@@ -1199,13 +1246,31 @@
           // REPLACE は削除で索引がずれるため対象外（呼び出し側で拒否している）
           const touched = [];
           const flush = () => {
+              // REPLACE は「既存行を消してから入れ直す」ので、入れ直しが制約で失敗すると
+              // 削除だけが残る（＝黙ってデータが消える）。削除を伴うときだけ暗黙
+              // セーブポイントで囲い、失敗時に消した行を戻す。実DBの REPLACE は
+              // 文単位で原子的で、失敗した REPLACE は表を変えない
+              let replMark = null;
               if (deleteSet.size > 0) {
                   const delIdx = [...deleteSet];
                   this._checkDeleteRestrict(table, tData, delIdx);
+                  replMark = this._stmtBegin();
+                  this._cowColumns(table, 'ALL');
                   this._removeRows(tData, delIdx);
                   replaced += delIdx.length;
                   deleteSet.clear();
               }
+              try {
+                  flushInsert();
+                  if (replMark !== null) this._stmtCommit(replMark);
+              } catch (e) {
+                  if (replMark !== null) { try { this._stmtRollback(replMark); } catch (e2) { /* 元の例外を隠さない */ } }
+                  throw e;
+              }
+          };
+
+          // 溜めた挿入だけを適用する（flush から呼ばれる。REPLACE の削除は flush 側で扱う）
+          const flushInsert = () => {
               const rows = pending.filter(Boolean).map(p => p.vals);
               pending = [];
               pendingVals = new Map();
@@ -1311,6 +1376,18 @@
           if (!tData) throw new Error(`Table '${tableName}' not found.`);
           if (valuesList.length === 0) return 0;
 
+          // 列リストに存在しない列名があれば拒否する。
+          // 従来は書き込み時に addColumn で黙って列を作っていたため、
+          // `INSERT INTO t(id, nmae) ...` のような打ち間違いがエラーにならず、
+          // スキーマに空列が増えていく（無言のスキーマドリフト）だけだった
+          if (cols && cols.length > 0) {
+              const unknown = cols.filter(c => c && !tData.cols[c]);
+              if (unknown.length > 0) {
+                  const s = this._suggestName(unknown[0], tData.getColumnNames());
+                  throw new Error(`Column '${unknown[0]}' not found in table '${tableName}'.${s ? ` Did you mean '${s}'?` : ''}`);
+              }
+          }
+
           this._cowColumns(tableName, []);
 
           const insertCols = this._applyRowDefaults(tData, cols, valuesList);
@@ -1385,7 +1462,9 @@
               }
           }
 
-          // AFTER INSERT トリガー（NEW = 実際に書き込まれたキャスト後の値）
+          // AFTER INSERT トリガー（NEW = 実際に書き込まれたキャスト後の値）。
+          // トリガーが失敗したら挿入も取り消す（文単位の原子性）。トリガーが
+          // 他の表へ書いた分は暗黙セーブポイントで巻き戻す
           if (fireInsertTriggers) {
               const afterRows = [];
               const colNames = tData.getColumnNames();
@@ -1394,7 +1473,23 @@
                   colNames.forEach(c => { nr[c] = tData.getValue(c, i); });
                   afterRows.push({ oldRow: null, newRow: nr });
               }
-              this._fireTriggers('after', 'insert', tableName, afterRows);
+              const insMark = this._stmtBegin();
+              try {
+                  this._fireTriggers('after', 'insert', tableName, afterRows);
+                  this._stmtCommit(insMark);
+              } catch (e) {
+                  try { this._stmtRollback(insMark); } catch (e2) { /* 元の例外を隠さない */ }
+                  // 自表へ書き込んだ行を取り消す（上の部分挿入ロールバックと同じ手順）
+                  tData.rowCount = startRowCount;
+                  for (const c in startPoolSizes) {
+                      if (tData.strPools[c] && tData.strPools[c].length > startPoolSizes[c]) {
+                          const removed = tData.strPools[c].splice(startPoolSizes[c]);
+                          removed.forEach(s => delete tData.strMaps[c][s]);
+                      }
+                  }
+                  if (Object.keys(tData.indices).length > 0) tData.rebuildIndices();
+                  throw e;
+              }
           }
 
           return valuesList.length;
@@ -1668,6 +1763,18 @@
               if (at === -1) return;
               valuesList.forEach(vals => { vals[at] = null; });
           };
+
+          // SQLite の競合解決句 INSERT OR <action> INTO。
+          //   REPLACE  → REPLACE INTO と同義
+          //   IGNORE   → INSERT IGNORE と同義（下の判定が拾う）
+          //   ABORT / FAIL / ROLLBACK → 「エラーで中止」＝ LuminaDB の既定動作
+          // 従来は OR IGNORE 以外すべて構文エラーだった
+          const orActM = sql.match(/^insert\s+or\s+(replace|abort|fail|rollback)\s+into\b/i);
+          if (orActM) {
+              const act = orActM[1].toLowerCase();
+              if (act === 'replace') sql = 'REPLACE INTO' + sql.slice(orActM[0].length);
+              else sql = 'INSERT INTO' + sql.slice(orActM[0].length);
+          }
 
           // 挿入モード: REPLACE INTO / INSERT (OR) IGNORE / ON DUPLICATE KEY UPDATE / ON CONFLICT
           const isReplaceStmt = /^replace\s+into\b/i.test(sql);
@@ -2045,7 +2152,14 @@
              });
 
              const affectedCols = setEvaluators.map(ev => ev.col);
-             this._cowColumns(table, affectedCols);
+             // COW は「この文が書き込み得る列すべて」を対象にする。SET 句の列だけを
+             // 退避していると、Phase 2a（ON UPDATE CURRENT_TIMESTAMP）と Phase 2b
+             // （生成列）が退避されていない列を書き換えるため、ROLLBACK で戻らない。
+             // 文字列型の列では、さらに strPools が savepoint 時点まで切り詰められる
+             // 一方で meta が残るので、切り離されたプール位置を指したまま NULL に化ける
+             this._cowColumns(table, affectedCols
+                 .concat(this.tables[table].onUpdateNowCols || [])
+                 .concat(Object.keys(this.tables[table].generatedCols || {})));
 
              const tData = this.tables[table];
              const rowCount = tData.rowCount;
@@ -2121,6 +2235,27 @@
              this._validatePendingChanges(tData, pending);
              this._validateChecksForChanges(table, pending);
 
+             // FK ON UPDATE の波及値も、適用前に子テーブルの制約を通す。
+             // 直接 UPDATE なら弾かれる値が CASCADE 経由では素通りしていた
+             // （CHECK / UNIQUE / NOT NULL とも）。ON UPDATE SET NULL 側は
+             // NOT NULL を手検査していたが、CASCADE 側に相当する検査が無かった。
+             // Phase 2 より前に置くこと — 後ろだと親の書き込みが済んだ状態で
+             // throw して、参照整合性の壊れた DB が残る
+             if (childUpdates.length > 0) {
+                 const byTable = new Map();
+                 childUpdates.forEach(u => {
+                     if (!byTable.has(u.table)) byTable.set(u.table, new Map());
+                     const rows = byTable.get(u.table);
+                     if (!rows.has(u.idx)) rows.set(u.idx, {});
+                     rows.get(u.idx)[u.col] = u.val;
+                 });
+                 for (const [tbl, rows] of byTable) {
+                     const pend = [...rows].map(([idx, changes]) => ({ idx, changes }));
+                     this._validatePendingChanges(this.tables[tbl], pend, { skipFk: true });
+                     this._validateChecksForChanges(tbl, pend);
+                 }
+             }
+
              // BEFORE UPDATE トリガー（OLD = 現値 / NEW = 変更適用後の予定値）
              const fireUpdTriggers = this._hasTriggers('update', table);
              let updOldRows = null;
@@ -2142,44 +2277,56 @@
                  if (tData.rowCount !== rcGuard) throw new Error("Trigger added/removed rows of the target table during UPDATE; this is not supported.");
              }
 
-             // Phase 2: 検証を全て通過した後にまとめて適用する
-             pending.forEach(({ idx, changes }) => {
-                 Object.keys(changes).forEach(c => {
-                     tData.setValue(c, idx, changes[c]);
+             // AFTER トリガーは「適用後」に走るので、その中で失敗すると
+             // 「文はエラーなのに変更は残る」状態になる。トリガーを持つ表に限り
+             // 適用区間を暗黙セーブポイントで囲い、途中失敗を巻き戻す。
+             // トリガーの無い表では従来どおりコピーを一切取らない（性能を保つ）
+             const stmtMark = fireUpdTriggers ? this._stmtBegin() : null;
+             if (stmtMark !== null) this._cowColumns(table, 'ALL');
+             try {
+                 // Phase 2: 検証を全て通過した後にまとめて適用する
+                 pending.forEach(({ idx, changes }) => {
+                     Object.keys(changes).forEach(c => {
+                         tData.setValue(c, idx, changes[c]);
+                     });
                  });
-             });
 
-             // Phase 2a: ON UPDATE CURRENT_TIMESTAMP の列を現在時刻へ（明示代入があればそちらを優先）
-             const touchCols = (tData.onUpdateNowCols || []).filter(c => tData.cols[c] && !setEvaluators.some(ev => ev.col === c));
-             if (touchCols.length > 0 && pending.length > 0) {
-                 const now = this._nowString();
-                 pending.forEach(({ idx }) => touchCols.forEach(c => tData.setValue(c, idx, now)));
-             }
+                 // Phase 2a: ON UPDATE CURRENT_TIMESTAMP の列を現在時刻へ（明示代入があればそちらを優先）
+                 const touchCols = (tData.onUpdateNowCols || []).filter(c => tData.cols[c] && !setEvaluators.some(ev => ev.col === c));
+                 if (touchCols.length > 0 && pending.length > 0) {
+                     const now = this._nowString();
+                     pending.forEach(({ idx }) => touchCols.forEach(c => tData.setValue(c, idx, now)));
+                 }
 
-             // Phase 2b: 生成列を再評価する（依存元の列が更新された後）
-             const updGenFns = this._compileGeneratedCols(tData, null);
-             if (updGenFns.length > 0) {
-                 targetIndices.forEach(idx => this._applyGeneratedCols(table, tData, updGenFns, idx));
-             }
+                 // Phase 2b: 生成列を再評価する（依存元の列が更新された後）
+                 const updGenFns = this._compileGeneratedCols(tData, null);
+                 if (updGenFns.length > 0) {
+                     targetIndices.forEach(idx => this._applyGeneratedCols(table, tData, updGenFns, idx));
+                 }
 
-             // Phase 3: FK ON UPDATE の子テーブル波及を適用する（子テーブルは COW してから）
-             if (childUpdates.length > 0) {
-                 const cowed = new Set();
-                 childUpdates.forEach(u => {
-                     if (!cowed.has(u.table)) { this._cowColumns(u.table, 'ALL'); cowed.add(u.table); }
-                     this.tables[u.table].setValue(u.col, u.idx, u.val);
-                 });
-             }
+                 // Phase 3: FK ON UPDATE の子テーブル波及を適用する（子テーブルは COW してから）
+                 if (childUpdates.length > 0) {
+                     const cowed = new Set();
+                     childUpdates.forEach(u => {
+                         if (!cowed.has(u.table)) { this._cowColumns(u.table, 'ALL'); cowed.add(u.table); }
+                         this.tables[u.table].setValue(u.col, u.idx, u.val);
+                     });
+                 }
 
-             // AFTER UPDATE トリガー（NEW = 適用後の実値）
-             if (fireUpdTriggers) {
-                 const colNames = tData.getColumnNames();
-                 const afterRows = pending.map(({ idx }, i) => {
-                     const nr = Object.create(null);
-                     colNames.forEach(c => { nr[c] = tData.getValue(c, idx); });
-                     return { oldRow: updOldRows[i], newRow: nr };
-                 });
-                 this._fireTriggers('after', 'update', table, afterRows);
+                 // AFTER UPDATE トリガー（NEW = 適用後の実値）
+                 if (fireUpdTriggers) {
+                     const colNames = tData.getColumnNames();
+                     const afterRows = pending.map(({ idx }, i) => {
+                         const nr = Object.create(null);
+                         colNames.forEach(c => { nr[c] = tData.getValue(c, idx); });
+                         return { oldRow: updOldRows[i], newRow: nr };
+                     });
+                     this._fireTriggers('after', 'update', table, afterRows);
+                 }
+                 if (stmtMark !== null) this._stmtCommit(stmtMark);
+             } catch (e) {
+                 if (stmtMark !== null) { try { this._stmtRollback(stmtMark); } catch (e2) { /* 元の例外を隠さない */ } }
+                 throw e;
              }
 
              affectedRows = targetIndices.length;

@@ -16,8 +16,10 @@
       const T = [];
       const push = (name, sql, check) => T.push({ name, sql, check });
       const approx = (a, b) => a != null && Math.abs(a - b) < 1e-6;
-      // エンジンの AVG は小数2桁へ丸める（_executeSelectPlan の実装に合わせる）
-      const avg2 = (arr) => arr.length ? Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2)) : 0;
+      // v1.27 で AVG は倍精度のまま返すようになった（以前は小数2桁へ丸めていた）。
+      // avgF = 素の AVG の期待値 / avg2 = ROUND(AVG(x), 2) の期待値
+      const avgF = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+      const avg2 = (arr) => arr.length ? Number(avgF(arr).toFixed(2)) : 0;
       const sum = (arr) => arr.reduce((a, b) => a + b, 0);
 
       // ------------------------------------------------------------
@@ -262,7 +264,7 @@
           r => (r.data[0].s || 0) === sum(f.map(x => x.qty)));
         push(`XL-C region avgrev ${rg}`,
           `SELECT AVG(i.qty * p.price) AS a FROM xl_item i JOIN xl_ord o ON i.oid = o.id JOIN xl_cust c ON o.cid = c.id JOIN xl_prod p ON i.pid = p.id WHERE c.region = ${sqlStr(rg)}`,
-          r => approx(r.data[0].a, avg2(f.map(x => x.rev))));
+          r => approx(r.data[0].a, avgF(f.map(x => x.rev))));
       });
       TIERS.forEach(tr => CATS.forEach(ct => {
         const f = FLAT.filter(x => x.tier === tr && x.cat === ct);
@@ -395,7 +397,7 @@
         const ids = CUST.slice(0, n);
         const mv = ids.map((_, i) => {
           const w = ids.slice(Math.max(0, i - 2), i + 1).map(c => c.credit);
-          return avg2(w);
+          return avgF(w);
         });
         T.push({ name: `XL-D moving avg3 ${n}`, fn: () => {
             const r = db.executeQuery(`SELECT AVG(credit) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS ma FROM xl_cust WHERE id <= ${n} ORDER BY id`);
@@ -448,7 +450,7 @@
       // E. 大量データに対する集計・DISTINCT・ソート
       // ============================================================
       push('XL-E total qty', "SELECT SUM(qty) AS s FROM xl_item", r => r.data[0].s === sum(ITEM.map(i => i.qty)));
-      push('XL-E avg qty', "SELECT AVG(qty) AS a FROM xl_item", r => approx(r.data[0].a, avg2(ITEM.map(i => i.qty))));
+      push('XL-E avg qty', "SELECT AVG(qty) AS a FROM xl_item", r => approx(r.data[0].a, avgF(ITEM.map(i => i.qty))));
       push('XL-E min/max qty', "SELECT MIN(qty) AS mn, MAX(qty) AS mx FROM xl_item",
         r => r.data[0].mn === Math.min(...ITEM.map(i => i.qty)) && r.data[0].mx === Math.max(...ITEM.map(i => i.qty)));
       push('XL-E distinct pid', "SELECT COUNT(DISTINCT pid) AS c FROM xl_item", r => r.data[0].c === new Set(ITEM.map(i => i.pid)).size);
@@ -465,7 +467,7 @@
         push(`XL-E qty>=${q} sum`, `SELECT SUM(qty) AS s FROM xl_item WHERE qty >= ${q}`, r => (r.data[0].s || 0) === sum(f.map(i => i.qty)));
         push(`XL-E qty>=${q} distinct pid`, `SELECT COUNT(DISTINCT pid) AS c FROM xl_item WHERE qty >= ${q}`, r => r.data[0].c === new Set(f.map(i => i.pid)).size);
         push(`XL-E qty=${q} avg`, `SELECT AVG(qty) AS a FROM xl_item WHERE qty = ${q}`,
-          r => approx(r.data[0].a, avg2(ITEM.filter(i => i.qty === q).map(i => i.qty))));
+          r => approx(r.data[0].a, avgF(ITEM.filter(i => i.qty === q).map(i => i.qty))));
       }
       // 価格帯ごとの集計
       [100, 300, 500, 800, 1200, 1600].forEach(p => {
@@ -690,7 +692,7 @@
       // 集計内包式 + HAVING + ORDER BY
       [2, 3, 4, 5].forEach(th => {
         const g = groupBy(ITEM, i => i.pid);
-        const exp = [...g.entries()].filter(([, v]) => avg2(v.map(x => x.qty)) > th).length;
+        const exp = [...g.entries()].filter(([, v]) => avgF(v.map(x => x.qty)) > th).length;
         push(`XL-G having on avg ${th}`,
           `SELECT COUNT(*) AS c FROM (SELECT pid, ROUND(AVG(qty), 2) AS a FROM xl_item GROUP BY pid HAVING AVG(qty) > ${th}) z`,
           r => r.data[0].c === exp);

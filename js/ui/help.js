@@ -611,6 +611,63 @@
         { name: "CYCLE (stops on a loop)", sql: "-- 循環するグラフでも上限エラーにならず、印を付けて止まる\n-- WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT g.b FROM g JOIN t ON g.a = t.n)\n--   CYCLE n SET is_cycle USING path\n-- SELECT n, is_cycle, path FROM t" },
         { name: "Index-backed IN", sql: "EXPLAIN SELECT * FROM {table} WHERE id IN (1, 2, 3)" }
       ]},
+      { cat: "Quoted Identifiers & Grouping Sets", cmds: [
+        { name: "予約語を列名に使う", sql: "-- バッククォートで囲むと予約語も識別子として使える\n-- CREATE TABLE t (`order` INTEGER, `select` TEXT)" },
+        { name: "バッククォートで参照する", sql: "SELECT `name`, `age` FROM {table} LIMIT 3" },
+        { name: "ダブルクォートは文字列", sql: "-- MySQL 既定と同じ。識別子にはバッククォートを使う\nSELECT \"plain text\" AS s" },
+        { name: "GROUPING SETS に ROLLUP", sql: "SELECT age, COUNT(*) AS c FROM {table} GROUP BY GROUPING SETS (ROLLUP(age))" },
+        { name: "GROUPING SETS に CUBE", sql: "SELECT age, COUNT(*) AS c FROM {table} GROUP BY GROUPING SETS (CUBE(age))" },
+        { name: "集合の組み合わせ", sql: "SELECT age, COUNT(*) AS c FROM {table} GROUP BY GROUPING SETS ((age), ())" },
+        { name: "SQL ダンプは全オブジェクトを含む", sql: "-- 表・データ・索引・ビュー・シーケンスに加えて\n-- トリガー・関数・プロシージャ・コメントも書き出される（Data → 書き出し）" }
+      ]},
+      { cat: "NULL in Arithmetic & Date Types", cmds: [
+        { name: "算術も NULL を伝播する", sql: "-- どれか一つでも NULL なら結果は NULL（0 として扱わない）\nSELECT NULL + 10, 10 - NULL, NULL * 0" },
+        { name: "集計は NULL を数えない", sql: "-- 式が NULL になった行は AVG の分母にも MIN の候補にも入らない\nSELECT AVG(price * stock), MIN(price * stock), COUNT(price * stock) FROM {table}" },
+        { name: "0 除算は NULL", sql: "SELECT 10 / 0, 10 % 0" },
+        { name: "DATE は日付だけ", sql: "SELECT CAST('2026-01-02 13:45:00' AS DATE)     -- 2026-01-02" },
+        { name: "DATETIME / TIMESTAMP は時刻も残す", sql: "SELECT CAST('2026-01-02 13:45:00' AS DATETIME) -- 2026-01-02 13:45:00" },
+        { name: "日次の集計", sql: "-- 時刻を切り捨てて 1 日にまとめる\n-- SELECT CAST(at AS DATE) AS d, COUNT(*) FROM events GROUP BY CAST(at AS DATE)" },
+        { name: "日付の比較は時刻で行う", sql: "SELECT DATE '2026-01-02' = TIMESTAMP '2026-01-02 00:00:00'   -- true" },
+        { name: "ウィンドウの既定フレーム", sql: "-- ORDER BY だけなら RANGE ... CURRENT ROW（同じ並び順の行はまとめて同じ値）\nSELECT age, SUM(age) OVER (ORDER BY age) FROM {table}" },
+        { name: "パーティション全体を見る", sql: "SELECT LAST_VALUE(name) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM {table}" },
+        { name: "ON DELETE SET DEFAULT", sql: "-- 親が消えたら子を既定値へ戻す\n-- CREATE TABLE c (pid INT DEFAULT 9, FOREIGN KEY (pid) REFERENCES p(id) ON DELETE SET DEFAULT)" }
+      ]},
+      { cat: "NULL & Three-Valued Logic", cmds: [
+        { name: "NULL 比較は UNKNOWN", sql: "-- どちらかが NULL なら結果は真でも偽でもない（WHERE は通さない）\nSELECT NULL = NULL, 1 = NULL, 1 <> NULL" },
+        { name: "範囲条件は NULL 行を拾わない", sql: "SELECT * FROM {table} WHERE age < 100     -- age が NULL の行は含まれない" },
+        { name: "NULL を調べるのは IS NULL", sql: "SELECT * FROM {table} WHERE age IS NULL" },
+        { name: "IS [NOT] UNKNOWN", sql: "SELECT (1 = 1) IS NOT UNKNOWN, (NULL) IS UNKNOWN" },
+        { name: "NOT も 3 値論理", sql: "-- NOT UNKNOWN は UNKNOWN。NULL の行は通らない\nSELECT * FROM {table} WHERE NOT (age = 25)" },
+        { name: "NULL を含む NOT IN は真にならない", sql: "SELECT * FROM {table} WHERE age NOT IN (25, NULL)   -- 常に 0 件" },
+        { name: "NOT LIKE も NULL を除く", sql: "SELECT * FROM {table} WHERE name NOT LIKE 'A%'" },
+        { name: "CHECK は UNKNOWN を通す", sql: "-- b が NULL の行は CHECK 違反にならない（SQL 標準）\n-- CREATE TABLE t (a INT, b INT CHECK (b > 0));  INSERT INTO t (a) VALUES (1)" },
+        { name: "IS DISTINCT FROM で NULL 込みの比較", sql: "SELECT * FROM {table} WHERE age IS DISTINCT FROM 25" }
+      ]},
+      { cat: "Aliases, Stars & Set Operations", cmds: [
+        { name: "Alias without AS", sql: "SELECT id x, COUNT(*) c FROM {table} GROUP BY id" },
+        { name: "Quoted alias", sql: "SELECT id AS \"row id\", name AS \"名前\" FROM {table}" },
+        { name: "Qualified star", sql: "SELECT u.* FROM {table} u" },
+        { name: "Duplicate output names", sql: "-- 同名の列は 2 つ目以降に _1, _2 … が付く（消えない）\nSELECT id, id, id FROM {table}" },
+        { name: "Parenthesised set operation", sql: "(SELECT id FROM {table} WHERE id < 3)\nUNION\n(SELECT id FROM {table} WHERE id > 8)" },
+        { name: "Parenthesised branches with ORDER BY", sql: "(SELECT id FROM {table} WHERE id < 3)\nUNION ALL\n(SELECT id FROM {table} WHERE id = 1)\nORDER BY id DESC" }
+      ]},
+      { cat: "SHA-2 & Regexp Options", cmds: [
+        { name: "SHA-256 / SHA-224", sql: "SELECT SHA256('abc'), SHA224('abc'), SHA2('abc', 256)" },
+        { name: "HEX is UTF-8", sql: "SELECT HEX('あ'), UNHEX(HEX('あ'))" },
+        { name: "REGEXP_SUBSTR occurrence", sql: "SELECT REGEXP_SUBSTR('a1b2c3', '[0-9]', 1, 2)" },
+        { name: "REGEXP_REPLACE nth match", sql: "SELECT REGEXP_REPLACE('aaa', 'a', 'b', 1, 2)" },
+        { name: "REGEXP_INSTR position", sql: "SELECT REGEXP_INSTR('a1b2', '[0-9]', 1, 2)" },
+        { name: "Case-insensitive match_type", sql: "SELECT REGEXP_LIKE('ABC', 'abc', 'i')" },
+        { name: "LTRIM / RTRIM character set", sql: "SELECT LTRIM('xxhixx', 'x'), RTRIM('xxhixx', 'x')" },
+        { name: "SUBSTRING from the end", sql: "SELECT SUBSTRING('abcdef', -3), SUBSTR('abcdef', -3, 2)" },
+        { name: "TO_TIMESTAMP (epoch seconds)", sql: "SELECT TO_TIMESTAMP(1700000000)" }
+      ]},
+      { cat: "Schema Changes", cmds: [
+        { name: "Several actions at once", sql: "ALTER TABLE {table} ADD COLUMN memo TEXT, ADD COLUMN memo2 TEXT" },
+        { name: "Composite UNIQUE index", sql: "-- 「組が一意」であって「各列が一意」ではない\nCREATE UNIQUE INDEX ux_pair ON {table} (id, name)" },
+        { name: "INSERT OR <action>", sql: "-- REPLACE / IGNORE / ABORT / FAIL / ROLLBACK\nINSERT OR REPLACE INTO {table} (id, name) VALUES (1, 'X')" },
+        { name: "Rename keeps constraints", sql: "-- 生成列・CHECK・索引名・列順すべて追随する\nALTER TABLE {table} RENAME COLUMN name TO nm" }
+      ]},
       { cat: "External API", cmds: [
         { name: "JS API", sql: "// JSコンソールから: LuminaDB.query('SELECT * FROM users WHERE id = ?', [1])" },
         { name: "JS API (Named Params)", sql: "// LuminaDB.query('SELECT * FROM users WHERE age > :min AND age < @max', { min: 24, max: 31 })" },

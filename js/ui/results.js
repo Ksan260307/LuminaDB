@@ -26,8 +26,18 @@
             return currentSort.asc ? 1 : -1;
         });
 
+        // 並べ替えで行の位置が変わるので選択を解除する。
+        // 解除しないと「− Row」が選んだのとは別の行を削除する（データ破壊）
+        clearRowSelection();
         renderDisplay(true);
     });
+
+    // 行の選択を解除する。表示順が変わる操作（並べ替え・絞り込み・再実行）の直後に
+    // 必ず呼ぶこと。選択は「絞り込み後の配列の添字」なので、順序が変われば別の行を指す
+    function clearRowSelection() {
+        selectedRowIdx = null;
+        if (typeof setRowActionsEnabled === 'function') setRowActionsEnabled();
+    }
 
     // 絞り込み後の行配列を返す。どの列でも部分一致（大文字小文字を無視）すれば残す。
     // 商用DBクライアントのグリッドフィルタと同じ「まず全部取ってから目で探す」用途
@@ -55,6 +65,12 @@
 
        // 列見出しは元データ由来（絞り込みで 0 件になっても列は保つ）
        const keys = Object.keys(currentResultData[0]);
+       // この結果は「エンジンが出した状態行」か。
+       //   - DML/DDL の結果: {Result, Message} の2キーだけ
+       //   - テストスイートの結果: {TestName, Status, Error}
+       // 状態色を塗るかどうかをここで一度だけ決め、セルの文字列内容では判定しない
+       const statusShape = (keys.length === 2 && keys.includes('Result') && keys.includes('Message'))
+           || (keys.includes('TestName') && keys.includes('Status'));
        const filtered = filteredResultData();
        if (filtered.length === 0) {
           if (reset) {
@@ -90,17 +106,25 @@
              const pos = ` data-r="${rowIdx}" data-c="${ci}"`;
              // XSS対策: セル値は必ずエスケープしてから innerHTML へ挿入する
              const esc = escapeHtml(v);
-             if(v==="Success"||v==="PASS"||(typeof v==='string' && (v.includes("inserted")||v.includes("updated")||v.includes("deleted")))){
-                 return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-green-600 font-medium">${esc}</td>`;
-             }
-             if(v==="FAIL"||(typeof v==='string' && v.includes("Assertion") && !v.includes("not found"))){
-                 return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-red-600 font-medium">${esc}</td>`;
+             // 緑/赤の「状態色」は **結果の形** で決める（statusShape）。
+             // 以前はセルの文字列に 'deleted' や 'not found' が含まれるかどうかで
+             // 塗っていたため、'record deleted by ops' のような**ただのデータ**が
+             // 成功メッセージのように緑になり、'customer not found in CRM' が
+             // エラー扱いの赤地になっていた
+             if (statusShape) {
+                 if(v==="Success"||v==="PASS"||(typeof v==='string' && (v.includes("inserted")||v.includes("updated")||v.includes("deleted")))){
+                     return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-green-600 font-medium">${esc}</td>`;
+                 }
+                 if(v==="FAIL"||(typeof v==='string' && v.includes("Assertion") && !v.includes("not found"))){
+                     return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-red-600 font-medium">${esc}</td>`;
+                 }
+                 if(typeof v==='string' && (v.includes("not found") || v.includes("Type mismatch") || v.includes("Foreign key constraint failed"))) return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-red-600 font-bold bg-red-50">${esc}</td>`;
              }
              if(typeof v==='number') return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-blue-600">${v}</td>`;
              if(typeof v==='boolean') return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-purple-600 font-semibold">${v}</td>`;
-             if(v===null) return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-gray-400 italic">null</td>`;
-             // エラーメッセージの特別なハイライト
-             if(typeof v==='string' && (v.includes("not found") || v.includes("Type mismatch") || v.includes("Foreign key constraint failed"))) return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-red-600 font-bold bg-red-50">${esc}</td>`;
+             // NULL と文字列 'null' と空文字が同じ見た目だったので区別できる印にする
+             if(v===null||v===undefined) return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-gray-400 italic">[NULL]</td>`;
+             if(v==='') return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-gray-300 italic">[empty]</td>`;
              return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-gray-700">${esc}</td>`;
           }).join('');
           return `<tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0">${tds}</tr>`;
@@ -146,8 +170,15 @@
     els.resArea.addEventListener('click', (e) => {
         const td = e.target.closest('td');
         if (!td || td.dataset.r === undefined) return;
+        // 保留中の詳細表示は、編集が始まっていても必ず取り消す。
+        // 以前は activeEditor の early return が clearTimeout より前にあったため、
+        // ダブルクリックの 1 打目で仕掛けたタイマーが生き残り、開いた編集欄の上に
+        // 詳細モーダルが被さって入力が失われていた
+        clearTimeout(cellClickTimer);
         if (activeEditor) return;   // 編集中は詳細を開かない
         const show = () => {
+            // 遅延実行の間に編集が始まっている可能性があるのでもう一度見る
+            if (activeEditor) return;
             const rows = filteredResultData();
             const row = rows[Number(td.dataset.r)];
             if (!row) return;
@@ -155,7 +186,6 @@
             const col = keys[Number(td.dataset.c)];
             openCellModal(col, row[col]);
         };
-        clearTimeout(cellClickTimer);
         // 編集可のときだけ待つ（ダブルクリックの1打目で詳細が開かないように）。
         // 読み取り専用ならダブルクリックの用途が無いので即座に開く
         if (editContext.editable) cellClickTimer = setTimeout(show, 220);
@@ -224,6 +254,8 @@
 
     function beginCellEdit(td) {
         if (!editContext.editable || activeEditor) return;
+        // 保留中のセル詳細表示を取り消す（編集欄の上にモーダルが被るのを防ぐ）
+        clearTimeout(cellClickTimer);
         const rows = filteredResultData();
         const row = rows[Number(td.dataset.r)];
         if (!row) return;
@@ -364,9 +396,13 @@
 
     // 絞り込み入力: 入力のたびに再描画する（元データは保持したまま表示だけ絞る）
     if (els.resFilter) {
-        els.resFilter.addEventListener('input', () => { resultFilter = els.resFilter.value; renderDisplay(true); });
+        els.resFilter.addEventListener('input', () => {
+            resultFilter = els.resFilter.value;
+            clearRowSelection();   // 絞り込みで添字の指す行が変わるため
+            renderDisplay(true);
+        });
         document.getElementById('resultFilterClear').addEventListener('click', () => {
-            els.resFilter.value = ''; resultFilter = ''; renderDisplay(true); els.resFilter.focus();
+            els.resFilter.value = ''; resultFilter = ''; clearRowSelection(); renderDisplay(true); els.resFilter.focus();
         });
     }
 

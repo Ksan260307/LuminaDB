@@ -4,7 +4,7 @@
 
 ブラウザだけで完結する、ビルド不要の in-memory SQL データベースエンジンです。単一の HTML ファイルを開くだけで、本格的な SQL（DQL / DML / DDL）・トランザクション・ウィンドウ関数・トリガー・ビュー・`MERGE` / `TOP` / `ON CONFLICT` などの商用 DB コマンド・270 以上の組み込み関数を、サーバーなしで実行できます。
 
-> バージョン: **v1.22.0** / 自己完結テスト **7,772 件**（全パス。うちセキュリティ 780 件超 / パフォーマンス 490 件超）
+> バージョン: **v1.27.0** / 自己完結テスト **8,326 件**（全パス。うちセキュリティ 780 件超 / パフォーマンス 490 件超）
 
 ---
 
@@ -215,6 +215,330 @@ CREATE INDEX idx_adult ON users (age) WHERE age >= 18;
 WITH c AS MATERIALIZED (SELECT id FROM users) SELECT COUNT(*) FROM c;
 EXPLAIN QUERY PLAN SELECT * FROM users WHERE id = 1;
 ```
+
+### v1.27 — 「黙って壊す・黙って誤る」箇所の一斉修正
+
+12 の観点でエンジンと画面を監査し、**再現できた欠陥だけ**を直した回です。共通しているのは
+「エラーも警告も出さないまま、データを失うか、もっともらしい誤答を返す」という性質でした。
+
+**データを失う・原子性が壊れる**
+
+| 症状 | 直した内容 |
+| --- | --- |
+| 失敗した `REPLACE INTO` が **削除だけ**を残した | 削除を伴う `REPLACE` を暗黙セーブポイントで囲み、入れ直しが失敗したら消した行を戻す |
+| `TRUNCATE` が外部キーを一切見ず、子行を親の無い状態にできた（同じ `DELETE` は拒否されるのに） | 既定 `RESTRICT` で拒否、`CASCADE` で子表も空にする。自己参照は許可 |
+| `ROLLBACK` が `ON UPDATE CURRENT_TIMESTAMP` 列と生成列を戻さず、値が消える／古い値が残って **UNIQUE 違反の状態**になった | `UPDATE` の COW 対象を「その文が書き得る全列」へ拡張 |
+| AFTER トリガーの失敗で「文はエラーなのに変更は残る」 | トリガーを持つ表に限り適用区間を暗黙セーブポイントで囲い、失敗時に巻き戻す |
+| FK `ON UPDATE CASCADE` の波及値が子表の `CHECK` / `UNIQUE` / `NOT NULL` を通らなかった | 親を書く**前**に子側を検証（`skipFk` で FK だけ除外） |
+
+**問い合わせ・型の誤り**
+
+```sql
+EXPLAIN DELETE FROM t WHERE id = 1;   -- 以前: 計画ではなく本体を実行して行が消えた → 明示エラー
+SELECT * FROM a JOIN b ON a.id = b.typo_id;  -- 以前: 0 件（LEFT なら右側全 NULL）→ 列名エラー
+SELECT CONCAT(f, ' ', l) FROM t;      -- 以前: 列名が CONCAT(f, __STR_0__, l) → 書いたとおりの式
+SELECT (SELECT a FROM t) AS s;        -- 以前: 先頭行を黙って採用 → "more than 1 row"
+SELECT a FROM t WHERE a NOT IN (SELECT b FROM u);  -- u に NULL があると行を返していた → 空（標準どおり）
+SELECT AVG(x) FROM t;                 -- 以前: 常に小数2桁（0.000001 台が 0 に）→ 倍精度のまま
+SELECT SUM(flag) FROM t;              -- BOOLEAN / 数値文字列を 0 扱い → 1/0・数値として集計
+SELECT DATE('2024-03-15 23:30:00');   -- 以前: ローカル時刻解釈で 9 時間ずれた ISO 文字列 → '2024-03-15'
+SELECT HOUR('12:34:56');              -- 以前: NULL（自分が作った TIME 値を読めなかった）→ 12
+SELECT COUNT(*) FROM t WHERE ok = 1;  -- BOOLEAN 列で 0 件（`ok > 0` は真）→ 6 つの比較演算子が一致
+SELECT CHAR_LENGTH('😀');             -- 以前: 2、SUBSTRING は文字化け → コードポイント単位
+SELECT * FROM t WHERE a IN (SELECT a, b FROM t);  -- 余分な列を黙って捨てた → 列数エラー
+SELECT * FROM t WHERE;                -- 以前: 条件無しとして全行 → 構文エラー
+SELECT * FROM t WHERE SUM(b) > 5;     -- 以前: "Column 'sum' not found." → HAVING を案内
+CREATE TABLE t (v INT CHECK (v IN (SELECT id FROM p)));  -- 定義時の結果に凍結された → 定義時に拒否
+CREATE TABLE c (y INT REFERENCES p(x));  -- x が一意でないと CASCADE が生きた子を消した → 定義時に拒否
+```
+
+**トランザクション文**
+
+```sql
+ROLLBACK WORK;         -- 以前: 拒否した上にトランザクションを開いたままにした（最悪の取り違え）
+ROLLBACK TRANSACTION;  -- 同上。どちらも受理する
+RELEASE SAVEPOINT sp1; -- sp1 より後に作った sp2 も一緒に消える（SQL 標準）
+```
+
+**ブラウザ DB として足りなかったもの**
+
+```sql
+-- 相互参照する 2 表（社員↔部署）に初回の行を入れる／一括取り込みの逃げ道。
+-- 1 に戻すとき全表を検査し直すので、不整合が黙って残ることはない（MySQL より厳しい）
+SET FOREIGN_KEY_CHECKS = 0;
+INSERT INTO dept VALUES (1, 100);
+INSERT INTO emp  VALUES (100, 1);
+SET FOREIGN_KEY_CHECKS = 1;
+```
+
+- **ディスク上のファイルとして開く / 保存する**（File System Access API）。サイドバーの
+  `Open File` / `Save` / `Save As`。IndexedDB はサイトデータを消すと失われ別端末へ持ち出せないので、
+  通常のアプリと同じ「開く→編集→上書き保存」ができる導線を追加しました。
+  未対応ブラウザ（Firefox / Safari / `file://`）ではダウンロードとファイル選択に自動で落ちます。
+
+**画面**
+
+- **Tailwind CDN が読めないと 9 個のモーダルが全部開いた状態で積まれ、操作不能**だった
+  （オフライン・社内プロキシで実測）。`.hidden` を含む最小限のフォールバックを内蔵し、
+  読み込み失敗を知らせる帯を出すようにしました。CDN が生きているときの見た目は変わりません。
+- 複数文スクリプトが**別の文の結果を「答え」として表示**していた（末尾の SELECT が 0 件だと
+  途中の結果に落ちる）。末尾の結果セットを出し、結果セットが複数あるときは**タブで全部見られる**ように。
+- `SELECT note AS Result FROM t` のように `Result` という別名の列があるだけで、
+  書き出し・コピーの 5 ボタンが理由も出さず無効化されていた（判定を結果の形に統一）。
+- 補完が `t.` の後ろで何も出さず、無関係な表の列を混ぜていた。修飾子付きはその表の列だけ、
+  修飾子なしは「この文の表の列 → 表名 → キーワード」の順に並べます。
+- 編集可セルのダブルクリックで、詳細モーダルが開いた編集欄に被さって入力が失われた。
+- セルの**文字列内容**で成功/失敗色を塗っていたため、`record deleted by ops` のようなただのデータが
+  緑に、`customer not found in CRM` が赤地になっていた。結果の形で判定するようにし、
+  `NULL` / 文字列 `'null'` / 空文字を `[NULL]` / `null` / `[empty]` で区別します。
+
+**後半（v32 で「未着手」としていた項目）**
+
+```sql
+-- 修飾なしの曖昧な列名を拒否する（MySQL 1052 / PostgreSQL / SQLite と同じ）。
+-- 従来は「最初に見つかった表」を黙って採っていた。SELECT / WHERE / ON / HAVING /
+-- QUALIFY / ORDER BY のいずれでも検出する
+SELECT SUM(amount) FROM orders o JOIN payments p ON o.id = p.id;
+--> Column 'amount' is ambiguous: it exists in orders and payments. Qualify it ...
+
+-- 組み込み関数の引数個数を検査する（従来は黙って NULL / 変な値 / 列そのものが消えた）
+SELECT ABS();      --> Incorrect parameter count ... 'ABS': got 0, expected 1
+SELECT POWER(2);   --> ... 'POWER': got 1, expected 2
+SELECT ABS(POWER(2));  -- 入れ子も個別に検査する
+-- EXTRACT(YEAR FROM d) / CAST(x AS INT) / TRIM(BOTH ' ' FROM x) のように
+-- キーワードで引数を区切る綴りは対象外（誤って弾かないため）
+
+-- 16 進リテラル。従来はこの綴りを知らず、ソーステキストがそのまま列へ入っていた
+SELECT X'48656C6C6F';        --> 'Hello'（MySQL と同じく UNHEX と同義）
+SELECT HEX(X'48656C6C6F');   --> '48656C6C6F'（往復する）
+SELECT X'4';                 --> Invalid hex literal: odd number of digits
+
+-- ALTER TABLE ADD CHECK の 3 値論理。NULL を含む行を違反と判定していたため、
+-- INSERT では通る制約を後から付けられなかった
+ALTER TABLE t ADD CONSTRAINT c CHECK (a < 100);   -- a に NULL があっても通る
+
+-- DECIMAL(p,s) / VARCHAR(n) を格納時にも適用する（従来は宣言が単なる飾りだった）
+CREATE TABLE m (price DECIMAL(10,2), code VARCHAR(3));
+INSERT INTO m VALUES (123.4567, 'abc');   --> price は 123.46（CAST と同じ丸め）
+INSERT INTO m VALUES (1, 'abcdefgh');     --> Data too long for column 'code'
+```
+
+- **EXPLAIN の充実**: 各段に行数の見積り列 `Rows` が付き、`DISTINCT` / `WINDOW` /
+  `AGGREGATE` の段が出るようになりました。派生表・CTE は内部名 `__tmp_16026` ではなく
+  `<derived table>` / `CTE 'c'` と表示され、`Details` に内部トークン `__STR_0__` が漏れません。
+
+**述語の押し下げ（この回で最大の性能改善）**
+
+`WHERE` のうち「基底表の列だけを見る条件」を、結合の**前**に適用するようになりました。
+従来は必ず結合の後に評価していたため、絞り込みが効く問い合わせでも全行を結合していました。
+
+```sql
+-- 20 万行 × 20 万行。a.id < 200 は 200 行しか通らない
+SELECT COUNT(*) FROM big a JOIN big b ON a.k = b.k WHERE a.id < 200;
+-- 変更前: 5,004ms ／ 変更後: 21ms（237 倍）
+-- 同じ意味を派生表で書いた場合（18ms）とほぼ同じになりました
+```
+
+`RIGHT` / `FULL JOIN` では未マッチ行の扱いが変わるため押し下げません。深さ 0 に `OR` がある式、
+相関サブクエリを含む条件も対象外です。`EXPLAIN` は `FILTER (pushed down)` として区別して表示します。
+押し下げの前後で結果が変わらないことは、4 種の結合 × 22 種の条件＋3 表結合・集計・DISTINCT・LIMIT の
+**98 通りを変更前のエンジンと突き合わせて 0 件差分**であることを確認しています。
+
+**そのほかこの回で見つけて直したもの**
+
+```sql
+-- 空の表（または絞り込みで空になった結果）では式が一度も評価されないため、
+-- 列名の誤りが「エラーではなく 0 件」になっていた
+SELECT nosuchcol FROM empty_table;   --> Column 'nosuchcol' not found.
+
+-- ダブルクォートは文字列リテラルなので表名にならないが、内部トークンが露出していた
+SELECT * FROM "some table";
+--> Table 'some table' not found. (Note: "..." is a string literal ... )
+
+-- ALTER TABLE ADD CHECK が NULL 行を違反と判定していた（INSERT では通るのに）
+ALTER TABLE t ADD CONSTRAINT c CHECK (a < 100);
+```
+
+**この回で意図的に残したもの**
+
+- クエリのキャンセル（実行中の停止）。エンジンは同期実行なので、真の中断には Worker 経路への
+  移行が必要です。現状の歯止めは「1 文あたりの実行時間の上限」（既定 30 秒）。
+- 空集合の `SUM` / `AVG` が `0`（標準は `NULL`）。既存の仕様として記録済みで、
+  PIVOT の空セルもこの挙動に依存しているため変更していません。
+- `X'..'` は「バイト列そのもの」ではなく `UNHEX()` と同義の文字列として扱います
+  （BLOB 型を持たないため）。ASCII 範囲では `HEX()` と往復しますが、
+  0x80 以上のバイトは UTF-8 として復号されるので、生バイトの保存には向きません。
+
+### v1.26 — 区切り識別子 / GROUPING SETS の入れ子 / ダンプの完全性
+
+v1.25 で「未対応」と書いた 2 件を片付け、あわせて SQL ダンプの欠損を直しました。
+
+```sql
+-- 1. バッククォートで囲めば予約語も識別子として使える（MySQL 形式）
+CREATE TABLE t (`order` INTEGER, `select` TEXT);
+SELECT `order`, `select` FROM t WHERE `order` = 1;
+-- v1.25 までは素通しで、`order` という名前の列が作られたり
+-- `col name` が `col で切れたりしていた（黙って壊れる）
+CREATE TABLE t (`col name` INTEGER);   -- 識別子として使えない名前は明示エラー
+CREATE TABLE "my tbl" (a INT);         -- ダブルクォートは文字列。バッククォートを使うよう案内する
+
+-- 2. GROUPING SETS の中に ROLLUP / CUBE / 入れ子の GROUPING SETS を書ける
+SELECT a, SUM(v) FROM t GROUP BY GROUPING SETS (ROLLUP(a));
+SELECT a, b, SUM(v) FROM t GROUP BY GROUPING SETS ((a,b), ROLLUP(a));
+-- v1.25 までは "Function 'ROLLUP' does not exist." になっていた
+```
+
+**3. SQL ダンプがスキーマの完全なバックアップになった。** `Export SQL` は表・データ・索引・ビュー・
+シーケンスしか書き出しておらず、**トリガー・ユーザー定義関数・プロシージャ・コメントを黙って捨てて**いました。
+これらも出力し、索引は登録した名前で書き出します（PRIMARY KEY / UNIQUE 由来の暗黙索引は重複して出しません）。
+書き出したダンプがそのまま空の DB へ流し込めることをテストで固定しています。
+
+**画面: 表の右クリックメニュー。** これまで SQL を手で書くしか到達手段の無かった操作をツリーから辿れます
+— データを見る（先頭100行）／件数を数える／DDL を表示／列の一覧／列プロファイル／スキーマを編集／表名をコピー／表を削除。
+削除だけは実行せずエディタへ下書きします（取り返しがつかないため）。
+
+### v1.25 — 算術の NULL 伝播 / 日付型の分離 / ウィンドウの既定フレーム
+
+v1.24 で「未着手」と明記した 3 件を片付けた回です。いずれも **エラーにならず値だけが違う** 種類の不具合でした。
+
+```sql
+-- 1. 算術も NULL を伝播する（v1.24 までは JS の挙動で NULL が 0 になっていた）
+SELECT amt * qty, amt - qty, -qty FROM s;   -- qty が NULL の行はすべて NULL
+SELECT AVG(amt*qty), MIN(amt*qty), COUNT(amt*qty) FROM s;
+--   旧: 366.67 / 0 / 3   ← NULL 由来の 0 が最小値に選ばれ、平均の分母にも数えられていた
+--   新: 550    / 200 / 2
+SELECT 10 / 0, 10 % 0;    -- 旧: Infinity / NaN → 新: NULL（MySQL と同じ）
+
+-- 2. DATE は「日付だけ」、DATETIME / TIMESTAMP は「日付＋時刻」
+SELECT CAST('2026-01-02 13:45:00' AS DATE);       -- 2026-01-02（旧: 時刻が残っていた）
+SELECT CAST('2026-01-02 13:45:00' AS DATETIME);   -- 2026-01-02 13:45:00
+SELECT CAST(at AS DATE) AS d, COUNT(*) FROM events GROUP BY CAST(at AS DATE);  -- 日次集計が成立する
+-- 比較は「文字列の並び」ではなく時刻で行うので、表記が違っても同じ瞬間なら一致する
+SELECT DATE '2026-01-02' = TIMESTAMP '2026-01-02 00:00:00';   -- true
+
+-- 3. ORDER BY だけを書いた OVER 句の既定フレームは RANGE ... CURRENT ROW（SQL 標準）
+SELECT day, SUM(amt) OVER (ORDER BY day) FROM sales;
+--   旧: 10, 30, 35（行単位＝ROWS 相当。同じ日の途中経過が出ていた）
+--   新: 30, 30, 35（同じ並び順の行はまとめて同じ値）
+-- パーティション全体が欲しいときはフレームを明示する（実DBと同じ作法）
+SELECT LAST_VALUE(x) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t;
+```
+
+あわせて直したもの:
+
+```sql
+-- ON DELETE / ON UPDATE SET DEFAULT が綴りを解釈されず、黙って RESTRICT に落ちていた
+CREATE TABLE c (id INT, pid INT DEFAULT 9, FOREIGN KEY (pid) REFERENCES p(id) ON DELETE SET DEFAULT);
+DELETE FROM p WHERE id = 1;   -- c.pid が 9 に戻る（旧: 削除そのものが拒否されていた）
+
+-- COMMENT ON がトランザクションの undo ログに載っておらず ROLLBACK で戻らなかった
+BEGIN; COMMENT ON TABLE t IS 'x'; ROLLBACK;   -- 元のコメントに戻る
+```
+
+**画面: 1 文あたりの実行時間の上限**（既定 30 秒）。ブラウザ内 DB はクエリが UI スレッドを占有するため、
+書き間違えた結合ひとつでタブが永久に固まります。トランザクションバー右側の「上限」で変更・解除でき、選択は保存されます。
+
+### v1.24 — NULL の 3 値論理と、データ入出力 UI の整理
+
+v1.24 の中心は **NULL の扱い**です。v1.23 まで、SQL 式は素の JavaScript 演算子へ写像されていました。
+JS は `null` を数値文脈で 0 に、等値比較で `null === null` を真にするため、**エラーを出さずに間違った行を返して**いました。
+
+```sql
+-- すべて v1.23 までの挙動 → v1.24 の挙動
+SELECT * FROM t WHERE v < 100;      -- v が NULL の行も返っていた → 返らない
+SELECT * FROM t WHERE v >= 0;       -- 同上                        → 返らない
+SELECT * FROM t WHERE v = NULL;     -- NULL 行に一致していた       → 0 件（UNKNOWN）
+SELECT * FROM t WHERE v <> 10;      -- NULL 行を含んでいた         → 含まない
+SELECT * FROM t WHERE NOT (v = 10); -- NULL 行を含んでいた         → 含まない
+SELECT * FROM t WHERE v BETWEEN -5 AND 5;   -- NULL 行が混入       → 0 件
+SELECT * FROM t WHERE v NOT IN (10, NULL);  -- 行を返していた      → 0 件（SQL 標準）
+SELECT * FROM t WHERE s NOT LIKE 'x';       -- NULL 行を含んでいた → 含まない
+SELECT NULL = NULL, 1 = NULL;               -- true, false        → NULL, NULL
+
+-- CHECK 制約も 3 値論理に。UNKNOWN は違反ではない
+CREATE TABLE t (a INT, b INT CHECK (b > 0));
+INSERT INTO t (a) VALUES (1);   -- v1.23 までは必ず失敗していた → 通る
+INSERT INTO t VALUES (2, -1);   -- 違反はこれまで通り拒否
+
+-- 反結合が NULL で潰れなくなった
+SELECT o.id FROM orders o WHERE NOT EXISTS (SELECT 1 FROM coupons c WHERE c.code = o.coupon);
+```
+
+`IS NULL` / `IS NOT NULL` / `IS UNKNOWN` は比較ではなく述語なので、これまで通り真偽を返します。
+
+その他の修正:
+
+```sql
+-- 外部結合の未マッチ行が「列ごと欠落」していた（行によって列数が違う結果セット）
+SELECT * FROM a LEFT JOIN b ON a.k = b.bk;   -- 未マッチ側は NULL で揃うようになった
+
+-- ALTER TABLE の型指定が桁付き・方言別名を受けるようになった
+ALTER TABLE t MODIFY COLUMN a VARCHAR(50);   -- v1.23 までは構文エラー
+ALTER TABLE t MODIFY COLUMN b DECIMAL(12,4);
+
+-- '__' で始まる表名は予約（作れてしまうと保存時に内部カタログと衝突して黙って消えた）
+CREATE TABLE __secret (a INT);   -- 明示的に拒否
+```
+
+JS API:
+
+- `LuminaDB.transaction()` に **async 関数**を渡すと、中の書き込みが走る前に COMMIT していた（原子性なし・例外も消える）。明示的なエラーで拒否するようにしました。
+- `LuminaDB.insert()` / `upsert()` / `importJSON()` が **先頭行のキーだけ**を列として使い、後続行にしかない項目を無警告で捨てていた。全行のキーの和集合を使います。
+
+### v1.23 で直した「黙って誤る」挙動と追加した構文（抜粋）
+
+v1.23 は新機能よりも **「エラーにならず、間違った結果を返していた箇所」** の修正が中心です。
+
+```sql
+-- 別名: AS を省いた後置別名と引用符付き別名（従来は JS の構文エラーが漏れていた）
+SELECT id x, COUNT(*) c FROM users GROUP BY id;
+SELECT id AS "row id", name AS "名前" FROM users;   -- 従来は列名が __STR_0__ になっていた
+
+-- 修飾スター
+SELECT u.* FROM users u JOIN orders o ON u.id = o.user_id;
+
+-- 出力列名の重複: 従来は後の列が前の列を黙って上書きしていた（＝データが消えていた）
+SELECT u.name, p.name FROM users u JOIN products p ON 1=1;   -- name, name_1
+SELECT * FROM users u JOIN products p ON 1=1;                -- id, name, age, id_1, name_1, ...
+
+-- 集合演算の枝を括弧で囲む書き方（従来は構文エラー）
+(SELECT id FROM users WHERE id < 3) UNION (SELECT id FROM users WHERE id > 8);
+
+-- スカラー関数の修正（いずれも従来は黙って誤った値を返していた）
+SELECT LTRIM('xxhixx', 'x');        -- hixx  （第2引数が無視されていた）
+SELECT SUBSTRING('abcdef', -3);     -- def   （負の開始位置が効かなかった）
+SELECT LPAD('abcdef', 3, '-');      -- abc   （長い文字列を切り詰めていなかった）
+SELECT HEX('あ');                    -- E38182（UTF-16 単位で 1 バイトに潰れていた）
+SELECT UNHEX(HEX('あ'));             -- あ    （往復できなかった）
+SELECT TO_TIMESTAMP(1700000000);    -- 2023-11-14（ミリ秒として解釈していた）
+SELECT AGE(DATE '2020-01-01');      -- 正の期間（符号が逆だった）
+SELECT REGEXP_SUBSTR('a1b2c3', '[0-9]', 1, 2);   -- 2（position / occurrence が無視されていた）
+
+-- SHA-2 系を追加
+SELECT SHA256('abc'), SHA224('abc'), SHA2('abc', 256);
+
+-- スキーマ変更: メタデータの取り残しを修正
+CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (b * 2), CHECK (b > 0));
+ALTER TABLE t RENAME COLUMN b TO b2;   -- 生成列の式・CHECK の式・列順・索引名がすべて追随する
+                                       -- 従来は追随せず、以後この表へ一切挿入できなくなっていた
+
+-- 複合 UNIQUE INDEX は「組が一意」（従来は「各列が一意」として (1,3) まで拒否していた）
+CREATE UNIQUE INDEX ux ON t (a, b2);
+
+-- INSERT の未知列は拒否する（従来は黙って列を作っていた＝無言のスキーマドリフト）
+INSERT INTO users (id, nmae) VALUES (1, 'x');   -- Column 'nmae' not found. Did you mean 'name'?
+
+-- ALTER TABLE の複数アクション / INSERT OR <action>
+ALTER TABLE t ADD COLUMN d INT, ADD COLUMN e TEXT;
+INSERT OR REPLACE INTO t (a) VALUES (1);   -- REPLACE / IGNORE / ABORT / FAIL / ROLLBACK
+```
+
+エラーメッセージも直しました。
+
+| 入力 | v1.22 まで | v1.23 |
+|------|-----------|-------|
+| `SELECT LENGHT('abc')` | `Column 'lenght' not found.` | `Function 'LENGHT' does not exist. Did you mean 'LENGTH'?` |
+| `SELECT (1+2 FROM t` | `Unexpected token ';'. Expected ')' to end a compound expression.`（JS の言い回し） | `Malformed expression: (1+2 — check for unbalanced parentheses, an unclosed quote, or a missing operand.` |
 
 ### v1.22 で追加した構文（抜粋）
 
@@ -609,6 +933,38 @@ LuminaDB.restoreBackup(await file.text());
 書き直しません。60,000 行の DB で実測すると、初回の全保存 25ms に対し、小さな表を 1 つ
 更新しただけの保存は **2ms**（変更なしの保存は 1ms・書き込み 0 テーブル）です。
 
+### v1.24 で整理した画面機能
+
+サイドバーにあった **Export SQL / Import SQL / Import CSV / Test Data** の 4 ボタンは、
+説明が無く・場所を取り・押すまで何が起きるか判らないものでした。**Data** の 1 ボタンに集約し、
+中身をタブ付きのパネルへ移して、各操作に「何をするか・何が要るか」を書いてあります（`Ctrl+Shift+D`）。
+
+| タブ | 内容 |
+|------|------|
+| **書き出し** | SQL ダンプ（`CREATE TABLE` + `INSERT`）／全テーブルの JSON。書き出した表数と文字数を表示 |
+| **読み込み** | SQL ファイル（`;` 区切りで順に実行）／CSV ファイル。`.sql` `.csv` のドラッグ&ドロップにも対応 |
+| **テストデータ** | 既存のダミー行生成（対象表と行数） |
+
+あわせて入出力そのものも直しました。
+
+| 項目 | v1.23 まで | v1.24 |
+|------|-----------|-------|
+| SQL インポートの失敗 | 「N / M 件実行しました」だけで、**どの文がなぜ落ちたか判らなかった** | 失敗した文とエラー内容を一覧表示 |
+| CSV パーサ | 画面独自の簡易実装で、**引用符の中の改行で行が壊れた** | API 側の RFC 4180 パーサを共用（引用符内のカンマ・改行に対応） |
+| CSV の取り込み先 | 既存の表のみ・列数の完全一致が必須 | 「＋ 新しい表を作る」でヘッダーから表を作成し型を推定。取り込み前に既存行を消すオプションも |
+
+### v1.23 で追加・修正した画面機能
+
+| 機能 | 解決する問題 | 操作 |
+|------|--------------|------|
+| **スキーマ検索** | 表が増えるとサイドバーを目で探すしかなく、列名からは辿れなかった | サイドバーの検索欄。表名・列名の部分一致で絞り込み、列に当たった表は自動で展開する。`Esc` でクリア |
+| **エディタの高さ変更** | エディタが 128px 固定で、長い SQL が数行しか見えなかった | エディタ下端の境界をドラッグ（キーボードは矢印キー）。ダブルクリックで既定へ戻す。高さはブラウザに保存される |
+| **Explain ボタン** | 実行計画を見るには毎回 `EXPLAIN` を手で付けていた | エディタ上部の `Explain`（`Ctrl+Shift+E`）。カーソル位置の文の計画だけを出し、データは書き換えない |
+| **TSV コピー** | 結果を表計算ソフトへ貼る手段が無かった | 結果ツールバーの `Copy TSV` |
+| **行選択の解除（不具合修正）** | 行を選んでから並べ替え・絞り込みをすると、`− Row` が**別の行を削除**していた | 表示順が変わる操作で選択を解除する |
+| **書き出しが絞り込みに追従（不具合修正）** | 絞り込み中でも CSV / JSON / Markdown / INSERT は絞り込み前の全行を出していた | 画面に見えている行だけを書き出す |
+| **CSV の NULL 表現（不具合修正）** | すべての値を `"..."` で囲むため NULL と空文字が区別できなかった | 引用は必要なときだけ。NULL は空欄、空文字は `""` |
+
 ### v1.22 で追加した画面機能
 
 | 機能 | 解決する問題 | 操作 |
@@ -763,6 +1119,10 @@ js/
 | `test-suite-v22.js` | 180 | v1.17 の配列・回帰集計・あいまい照合・時系列生成・ウィンドウ拡張、式キャッシュ・CSV 取り込み・リーダー選出。CSV のフィールド/ヘッダーと配列要素に対するセキュリティ検査を含む |
 | `test-suite-v23.js` | 203 | v1.18 の桁指定付き `CAST`/`CONVERT`、更新可能ビューと `WITH CHECK OPTION`、`INSTEAD OF` トリガー、列レベル `REFERENCES`、JSON アクセス演算子、`IS [NOT] TRUE/FALSE`、名前付き制約、DML の別名、行コンストラクタ `IN (SELECT)`、索引の並び順/式キー、メタデータビュー、`UNNEST`。UI（結果絞り込み・セル詳細・ツリー展開・トランザクションバー・カーソル位置の文の実行）も含む |
 | `test-suite-v24.js` | 124 | v1.19 の複合列 `FOREIGN KEY`、シーケンスのオプションと `ALTER SEQUENCE`、`DEFAULT` 式、`MERGE` の条件付き `WHEN` と `NOT MATCHED BY SOURCE`、`VALUES(col)` / `ON CONFLICT ... WHERE`、ビューの列リスト、`ALTER INDEX RENAME` / `SHOW TABLE STATUS` / `WITH [NO] DATA`、集計入れ子の診断。UI（結果グリッドの直接編集・コピー書式・ショートカット）も含み、セル編集の値がバインドされること（SQL 組み立てでないこと）を検査する |
+| `test-suite-v31.js` | 41 | v1.26 のバッククォート区切り識別子（予約語の列名・表名／不正な名前と未終端の明示エラー／文字列リテラル内は不変／例外ではなくエラー結果を返すこと）、`GROUPING SETS` 内の `ROLLUP`/`CUBE`/入れ子、`exportSQL` のトリガー・関数・プロシージャ・コメント出力と索引名・往復再生、UI（表の右クリックメニュー） |
+| `test-suite-v30.js` | 68 | v1.25 の算術 NULL 伝播（`+ - *` と単項マイナス・演算子優先順位・指数表記）と 0 除算、`DATE` と `DATETIME`/`TIMESTAMP` の分離（`CAST` / 型付きリテラル / `::` / 日次 `GROUP BY` / 表記違いの比較）、ウィンドウ関数の既定フレーム（`RANGE ... CURRENT ROW`・明示 `ROWS` との差・`PARTITION BY`・GROUP BY 結果への窓）、`ON DELETE SET DEFAULT`、`COMMENT ON` の `ROLLBACK`、UI（実行時間の上限） |
+| `test-suite-v29.js` | 82 | v1.24 の NULL 3 値論理（比較・`NOT`・`IN`/`NOT IN`・`CHECK`・`LIKE` 系）、`IS [NOT] NULL`/`UNKNOWN` が述語のままであること、外部結合 `SELECT *` の NULL 埋め、`ALTER TABLE` の桁付き型と方言別名、`__` で始まる表名の拒否、`transaction()` の async 拒否、`insert()` の列は全行の和集合。UI（Data モーダルへの集約、SQL インポートの失敗レポート、RFC4180 CSV・新規表作成・置換・ドラッグ&ドロップ）も含む |
+| `test-suite-v28.js` | 162 | v1.23 の別名（`AS` 省略・引用符付き）、修飾スター、出力列名の重複解決、`LTRIM`/`RTRIM` の文字集合、`SUBSTRING` の負の開始位置、`LPAD`/`RPAD` の切り詰め、`HEX`/`UNHEX` の UTF-8 化、`TO_TIMESTAMP` のエポック秒、`AGE` の符号、`REGEXP_*` の position/occurrence/match_type、`SHA2`/`SHA256`/`SHA224`、列の改名・削除に伴うメタデータ追随（生成列・CHECK・列順・索引名）、複合 `UNIQUE INDEX`、`INSERT` の未知列拒否、`INSERT OR <action>`、`ALTER TABLE` の複数アクション、括弧付き集合演算、エラーメッセージ。UI（スキーマ検索・スプリッタ・Explain・行選択・書き出し）も含む |
 | `test-suite-v27.js` | 123 | v1.22 の日付演算（日付 ± 数値 / 日付 − 日付）、Oracle の階層問い合わせ（`CONNECT BY` / `LEVEL` / `SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT` / `NOCYCLE`）と `ROWNUM`、分析関数（`RATIO_TO_REPORT` / `PERCENTILE_* OVER` / `NTH_VALUE ... FROM LAST` / `KEEP (DENSE_RANK ...)`）、`TRUNCATE` の複数表指定、`CREATE INDEX` の `INCLUDE`/`CONCURRENTLY`、`ADD COLUMN` の生成列、`SET CONSTRAINTS`、upsert の `RETURNING`、PostgreSQL の照合演算子。UI（列プロファイル・ER 図）も含む |
 | `test-suite-v26.js` | 115 | v1.21 の GROUP BY 結果へのウィンドウ関数、列レベル `COLLATE` の実効化（比較・`IN`・`BETWEEN`・`ORDER BY`・`GROUP BY`・`DISTINCT`・`UNIQUE`・索引経路の回避）、`ORDER BY ALL` / `GROUPING_ID`、`ALTER COLUMN ... SET DATA TYPE` / `TYPE ... USING`、`RENAME CONSTRAINT`、`INSERT ... OVERRIDING VALUE`、`JOIN LATERAL ... ON TRUE`、1 始まりの添字とスライス、文単位の警告と `SHOW WARNINGS`。UI（エディタタブ、警告のコンソール出力）も含む |
 | `test-suite-v25.js` | 110 | v1.20 の連結系集計の引数内 `ORDER BY`、`ORDER BY` のウィンドウ関数、`UPDATE`/`DELETE` の派生表ソース、SELECT 句の集合返し関数、`DIV` 演算子、`CREATE DOMAIN`/`TYPE AS ENUM`、ユーザー・ロール、`TRUNCATE CONTINUE IDENTITY`、再帰CTE の `SEARCH`/`CYCLE`、`IN` のインデックス活用、定数列の命名。UI（行追加・削除、クエリ履歴パネル）も含み、行削除のキー値がバインドされることを検査する |

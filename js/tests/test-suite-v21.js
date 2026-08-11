@@ -20,7 +20,9 @@
       // ------------------------------------------------------------
       // 0. フィクスチャ
       // ------------------------------------------------------------
-      push('V21Fx src', "CREATE TABLE v21_src (id INTEGER PRIMARY KEY, nm TEXT, v INTEGER)", r => !r.error);
+      // (id, v) にも UNIQUE を張る: v1.27 から複合 FK の参照先には
+      // それに対応する PRIMARY KEY / UNIQUE が必要（V21Fk multi column が参照する）
+      push('V21Fx src', "CREATE TABLE v21_src (id INTEGER PRIMARY KEY, nm TEXT, v INTEGER, UNIQUE (id, v))", r => !r.error);
       push('V21Fx src rows', "INSERT INTO v21_src VALUES (1,'a',10),(2,'b',20),(3,'c',30),(4,'d',40)", r => !r.error);
       push('V21Fx out', "CREATE TABLE v21_out (k TEXT, v INTEGER)", r => !r.error);
       push('V21Fx ev', "CREATE TABLE v21_ev (id INTEGER, ts TIMESTAMP, amt INTEGER)", r => !r.error);
