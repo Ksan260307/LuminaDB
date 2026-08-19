@@ -149,8 +149,13 @@
         const r = db.executeQuery("SELECT reg, SUM(SUM(amt)) OVER (ORDER BY reg) AS run FROM v30_g GROUP BY reg ORDER BY reg");
         return !r.error && r.data[0].run === 30 && r.data[1].run === 35;
       });
-      err('V30Wf explicit frames over group by are still refused',
-          "SELECT reg, SUM(SUM(amt)) OVER (ORDER BY reg ROWS UNBOUNDED PRECEDING) AS run FROM v30_g GROUP BY reg", 'not supported over GROUP BY');
+      // v1.29: ROWS フレームは集計後の行にも使える（RANGE / GROUPS は引き続き不可）
+      fn('V30Wf a rows frame over group by works', () => {
+        const r = db.executeQuery("SELECT reg, SUM(SUM(amt)) OVER (ORDER BY reg ROWS UNBOUNDED PRECEDING) AS run FROM v30_g GROUP BY reg ORDER BY reg");
+        return !r.error && r.data[0].run === 30 && r.data[1].run === 35;
+      });
+      err('V30Wf range frames over group by are still refused',
+          "SELECT reg, SUM(SUM(amt)) OVER (ORDER BY reg RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS run FROM v30_g GROUP BY reg", 'not supported over GROUP BY');
 
       // ============================================================
       // 4. FOREIGN KEY の SET DEFAULT

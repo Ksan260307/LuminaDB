@@ -1,6 +1,6 @@
 # LuminaDB テスト実行
 
-LuminaDB は 2000 件超の自己完結テスト（`js/tests/test-suite*.js`）を持つ。実行経路は2つ。
+LuminaDB は 30,000 件超の自己完結テスト（`js/tests/test-suite*.js`）を持つ。実行経路は2つ。
 
 ## 1. 実ブラウザ・ヘッドレステスト（推奨・高信頼）
 

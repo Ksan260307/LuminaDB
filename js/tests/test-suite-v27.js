@@ -140,9 +140,12 @@
         // h の最小値 1 は 2 行あるので、その両方から MAX を取る
         return one("SELECT MAX(v) KEEP (DENSE_RANK FIRST ORDER BY h) AS k FROM v27_tie") === 30;
       });
-      err('V27An window nested in a function', "SELECT ROUND(SUM(sal) OVER (), 2) AS r FROM v27_emp", "cannot be nested inside");
-      // 選択項目の「途中」に書いた形は、以前は素の JS 構文エラーになっていた
-      err('V27An window inside an expression', "SELECT ROUND(RATIO_TO_REPORT(sal) OVER () * 100, 1) AS r FROM v27_emp", "cannot be nested inside");
+      // v1.28: ウィンドウ呼び出しを隠し列へ切り出すようにしたので、関数の中に入れた形も
+      // 式の途中に書いた形も評価できる（以前はどちらもエラーだった）
+      push('V27An window nested in a function', "SELECT ROUND(SUM(sal) OVER (), 2) AS r FROM v27_emp",
+        r => r.data.length === 5 && r.data.every(x => x.r === 400));
+      push('V27An window inside an expression', "SELECT ROUND(RATIO_TO_REPORT(sal) OVER () * 100, 1) AS r FROM v27_emp",
+        r => r.data.length === 5 && r.data[0].r === 25);
       push('V27An window through a subquery works', "SELECT ROUND(r * 100, 1) AS pct FROM (SELECT RATIO_TO_REPORT(sal) OVER () AS r FROM v27_emp) q ORDER BY pct DESC LIMIT 1",
         r => r.data[0].pct === 25);
       err('V27An unknown window fn still rejected', "SELECT NOPE_FN(sal) OVER () AS v FROM v27_emp", "not supported as a window function");

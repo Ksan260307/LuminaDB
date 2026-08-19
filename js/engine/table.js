@@ -94,6 +94,18 @@
         // 10^sc の乗算だと 1.005*100 が 100.49999... になる（1.005 が二進で表せない）ため、
         // 指数表記の文字列を経由して小数点を移す — engine-expression の __round_scale と
         // 同じ手順で、CAST と格納で結果が食い違わないようにしている
+        // 宣言された型名を検査用の正準名へ寄せる。colTypes には書かれたままの綴りを
+        // 残す（DESCRIBE で見せるため）が、値の検査はここで揃える。
+        // 従来は綴りをそのまま比較していたので `INTEGER` の列だけが型検査を受け、
+        // `INT` / `BIGINT` / `SMALLINT` の列は小数も文字列も素通しだった。
+        // `TEXT` 以外の文字列型に '' を入れると NULL になるという食い違いもあった。
+        // 日付系は DATE と DATETIME / TIMESTAMP で保持する情報が違うので分けたままにする
+        static _canonType(t) {
+            if (!t) return 'ANY';
+            const k = String(t).toUpperCase().replace(/\s*\([^)]*\)\s*$/, '').replace(/\s+/g, ' ').trim();
+            return Table.TYPE_KINDS[k] || k;
+        }
+
         static _roundScale(n, sc) {
             const str = String(n);
             if (str.indexOf('e') !== -1 || str.indexOf('E') !== -1) {
@@ -266,7 +278,7 @@
             const c = this.cols[col];
             if (!c) return;
             this.version++;   // 差分保存用の変更世代（整数 1 加算のみ）
-            const expectedType = this.colTypes[col] || 'ANY';
+            const expectedType = Table._canonType(this.colTypes[col]);
 
             // Type Checking & Casting
             if (val === null || val === undefined || (val === '' && expectedType !== 'TEXT' && expectedType !== 'ANY')) {
@@ -281,7 +293,10 @@
                 }
             } else if (expectedType === 'FLOAT') {
                 if (typeof val === 'number') {
-                    if (isNaN(val)) throw new Error(`Type mismatch: Cannot cast '${val}' to FLOAT for column '${col}'`);
+                    // NaN だけでなく ±Infinity も拒む。1e309 のような桁あふれを黙って
+                    // 受け入れると Infinity が格納され、読み出しても比較しても
+                    // 実DBには無い値が出てくる（INTEGER 側は既に弾いている）
+                    if (!isFinite(val)) throw new Error(`Type mismatch: Cannot cast '${val}' to FLOAT for column '${col}'`);
                 } else if (typeof val === 'string' && /^-?\d+(\.\d+)?$/.test(val.trim())) {
                     val = parseFloat(val);
                 } else {
@@ -317,6 +332,12 @@
                     val = d;
                 } else {
                     throw new Error(`Type mismatch: Cannot cast '${val}' to DATE for column '${col}'`);
+                }
+                // DATE と宣言した列は日付だけを持つ。時刻付きの値を入れると
+                // そのまま保持され、同じ日が時刻ごとに別の値として扱われていた
+                // （GROUP BY / DISTINCT / 等値比較が日単位にならない）
+                if (/^DATE$/i.test(expectedType) && val instanceof Date && !isNaN(val.getTime())) {
+                    val = new Date(Date.UTC(val.getUTCFullYear(), val.getUTCMonth(), val.getUTCDate()));
                 }
             } else if (expectedType === 'TEXT') {
                 val = typeof val === 'object' ? JSON.stringify(val) : String(val);
@@ -398,8 +419,12 @@
             if (type === 1) return this.cols[col].num[idx];
             if (type === 3) return this.cols[col].num[idx] === 1;
             if (type === 4) {
-                let d = new Date(this.cols[col].num[idx]);
-                return d.toISOString().replace('T', ' ').slice(0, 19);
+                const iso = new Date(this.cols[col].num[idx]).toISOString();
+                // DATE と宣言した列は日付だけを返す（DATETIME / TIMESTAMP は時刻も返す）。
+                // 従来は常に 'YYYY-MM-DD HH:MM:SS' を返しており、CAST(x AS DATE) が
+                // 日付だけを返すのと食い違っていた（同じ日付が二通りの綴りで出る）
+                return /^DATE$/i.test(this.colTypes[col] || '') ? iso.slice(0, 10)
+                                                                : iso.replace('T', ' ').slice(0, 19);
             }
             return this.strPools[col][meta & 0xFFFFFF];
         }
@@ -576,3 +601,23 @@
             this.rebuildIndices();
         }
     }
+
+    // 列の宣言型 -> 検査用の正準名（_canonType が引く）
+    Table.TYPE_KINDS = {
+        'INT': 'INTEGER', 'INTEGER': 'INTEGER', 'SMALLINT': 'INTEGER', 'BIGINT': 'INTEGER',
+        'TINYINT': 'INTEGER', 'MEDIUMINT': 'INTEGER', 'INT2': 'INTEGER', 'INT4': 'INTEGER',
+        'INT8': 'INTEGER', 'SERIAL': 'INTEGER', 'BIGSERIAL': 'INTEGER',
+        'SIGNED': 'INTEGER', 'UNSIGNED': 'INTEGER',
+        'FLOAT': 'FLOAT', 'REAL': 'FLOAT', 'DOUBLE': 'FLOAT', 'DOUBLE PRECISION': 'FLOAT',
+        'BINARY_FLOAT': 'FLOAT', 'BINARY_DOUBLE': 'FLOAT',
+        // DECIMAL 系は桁の丸めを colTypeSpec 側で行うため、値の検査は FLOAT と同じでよい
+        'DECIMAL': 'FLOAT', 'NUMERIC': 'FLOAT', 'DEC': 'FLOAT', 'NUMBER': 'FLOAT',
+        'MONEY': 'FLOAT', 'SMALLMONEY': 'FLOAT',
+        'TEXT': 'TEXT', 'VARCHAR': 'TEXT', 'CHAR': 'TEXT', 'CHARACTER': 'TEXT',
+        'CHARACTER VARYING': 'TEXT', 'VARCHAR2': 'TEXT', 'NVARCHAR': 'TEXT', 'NVARCHAR2': 'TEXT',
+        'NCHAR': 'TEXT', 'STRING': 'TEXT', 'CLOB': 'TEXT', 'NCLOB': 'TEXT',
+        'LONGTEXT': 'TEXT', 'MEDIUMTEXT': 'TEXT', 'TINYTEXT': 'TEXT',
+        'BOOL': 'BOOLEAN', 'BOOLEAN': 'BOOLEAN',
+        'DATE': 'DATE'
+        // DATETIME / TIMESTAMP / TIME は文字列のまま保持する（現行の挙動を変えない）
+    };

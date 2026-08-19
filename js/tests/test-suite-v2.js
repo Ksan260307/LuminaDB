@@ -168,9 +168,11 @@
           check: r => !r.error && r.data.length >= 1 && r.data[0].rn === 1 },
         { name: "V2Win: Window Over Bare Aggregate", sql: "SELECT COUNT(*) AS c, ROW_NUMBER() OVER() AS rn FROM v2win",
           check: r => !r.error && r.data.length === 1 && r.data[0].rn === 1 },
-        // 集計後のウィンドウに明示フレームは付けられない（サブクエリを案内する）
-        { name: "V2Win: Explicit Frame Over Group By Rejected", sql: "SELECT grp, SUM(SUM(id)) OVER (ROWS UNBOUNDED PRECEDING) AS s FROM v2win GROUP BY grp",
-          isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Explicit window frames') },
+        // v1.29: 集計後のウィンドウにも ROWS フレームを付けられる（RANGE / GROUPS は不可）
+        { name: "V2Win: Rows Frame Over Group By", sql: "SELECT grp, SUM(SUM(id)) OVER (ORDER BY grp ROWS UNBOUNDED PRECEDING) AS s FROM v2win GROUP BY grp ORDER BY grp",
+          check: r => !r.error && r.data.length === 2 && r.data[0].s === 10 && r.data[1].s === 15 },
+        { name: "V2Win: Range Frame Over Group By Rejected", sql: "SELECT grp, SUM(SUM(id)) OVER (ORDER BY grp RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM v2win GROUP BY grp",
+          isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('not supported over GROUP BY results') },
         { name: "V2Win: Cleanup", sql: "DROP TABLE v2win", check: r => r.data[0].Result === "Success" },
 
         // ============================================================

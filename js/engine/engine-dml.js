@@ -948,6 +948,23 @@
               for (const tg of list) {
                   for (const row of rows) {
                       for (const stmt of tg.statements) {
+                          // BEFORE トリガーの `SET NEW.col = <式>` は「これから書く行」への代入。
+                          // 通常の文として実行すると左辺まで現在値へ置換され、
+                          // `SET NULL = 'x'` のような無意味な文になって黙って捨てられていた
+                          const setNew = String(stmt).match(
+                              /^\s*set\s+new\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([\s\S]+?)\s*;?\s*$/i);
+                          if (setNew && timing === 'before') {
+                              if (!row.newRow) throw new Error(`Trigger '${tg.name}': NEW is not available in a ${timing} ${event} trigger.`);
+                              const col = setNew[1].toLowerCase();
+                              if (!(col in row.newRow)) throw new Error(`Trigger '${tg.name}': unknown column 'NEW.${setNew[1]}'.`);
+                              const exprSql = this._substituteTriggerRefs(`SELECT ${setNew[2]} AS __tgv`, row);
+                              const savedCorr2 = this._corrSubs;
+                              let er;
+                              try { er = this.executeQuery(exprSql); } finally { this._corrSubs = savedCorr2; }
+                              if (er.error) throw new Error(`Trigger '${tg.name}': ${er.error}`);
+                              row.newRow[col] = (er.data && er.data.length) ? er.data[0].__tgv : null;
+                              continue;
+                          }
                           const sql = this._substituteTriggerRefs(stmt, row);
                           // 外側の文が保持する相関レジストリをトリガー文の実行から保護する
                           const savedCorr = this._corrSubs;
@@ -1407,7 +1424,23 @@
                   insertCols.forEach((c, i) => { nr[c] = vals[i] === undefined ? null : vals[i]; });
                   return { oldRow: null, newRow: nr };
               });
+              const tgSnaps = beforeRows.map(r => Object.assign(Object.create(null), r.newRow));
               this._fireTriggers('before', 'insert', tableName, beforeRows);
+              // BEFORE トリガーが NEW.col を書き換えていたら、その値を実際に挿入する。
+              // 変わった列だけを反映する（全列を書き戻すと、既定値を持つ未指定列が
+              // NULL で上書きされてしまう）
+              beforeRows.forEach((r, i) => {
+                  for (const c in r.newRow) {
+                      if (r.newRow[c] === tgSnaps[i][c]) continue;
+                      let at = insertCols.indexOf(c);
+                      if (at === -1) {
+                          insertCols.push(c);
+                          at = insertCols.length - 1;
+                          valuesList.forEach((vl, k) => { vl[at] = tgSnaps[k][c]; });
+                      }
+                      valuesList[i][at] = r.newRow[c];
+                  }
+              });
           }
 
           // INSERT で値を指定しない既存列には明示的に NULL を書き込む。
@@ -2272,7 +2305,14 @@
                      return { oldRow: updOldRows[i], newRow: nr };
                  });
                  const rcGuard = tData.rowCount;
+                 const tgSnaps = beforeRows.map(r => Object.assign(Object.create(null), r.newRow));
                  this._fireTriggers('before', 'update', table, beforeRows);
+                 // BEFORE トリガーが NEW.col を書き換えていたら、その列も更新対象に加える
+                 beforeRows.forEach((r, i) => {
+                     for (const c in r.newRow) {
+                         if (r.newRow[c] !== tgSnaps[i][c]) pending[i].changes[c] = r.newRow[c];
+                     }
+                 });
                  // 行の追加/削除はインデックスを狂わせるため禁止（同一テーブルの setValue は許容）
                  if (tData.rowCount !== rcGuard) throw new Error("Trigger added/removed rows of the target table during UPDATE; this is not supported.");
              }

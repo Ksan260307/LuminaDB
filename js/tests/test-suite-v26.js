@@ -66,7 +66,10 @@
         r => r.data.length === 2 && r.data[0].s === 40);
       push('V26Win non-agg window still works', "SELECT amt, SUM(amt) OVER (ORDER BY id) AS run FROM v26_s ORDER BY id",
         r => r.data[3].run === 100);
-      err('V26Win explicit frame over groups rejected', "SELECT reg, SUM(SUM(amt)) OVER (ORDER BY reg ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS r FROM v26_s GROUP BY reg", "Explicit window frames");
+      // v1.29: ROWS フレームは集計後の行にも使える（RANGE / GROUPS は引き続き不可）
+      push('V26Win rows frame over groups works', "SELECT reg, SUM(SUM(amt)) OVER (ORDER BY reg ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS r FROM v26_s GROUP BY reg ORDER BY reg",
+        r => !r.error && r.data.length === 2 && r.data[0].r === 40 && r.data[1].r === 100);
+      err('V26Win range frame over groups rejected', "SELECT reg, SUM(SUM(amt)) OVER (ORDER BY reg RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS r FROM v26_s GROUP BY reg", "not supported over GROUP BY results");
       err('V26Win nested aggregate rejected', "SELECT MAX(SUM(amt)) AS m FROM v26_s GROUP BY reg", "cannot be nested");
 
       // ============================================================

@@ -81,8 +81,38 @@
           return { token: `__CORRSC_${k}__`, consumeExists: false };
       },
 
+      // FROM / JOIN の直後の括弧の中が「枝を括弧で包んだ集合演算」
+      // （FROM ((SELECT ...) UNION (SELECT ...)) t）なら、枝の括弧を外して
+      // 素の形へ均す。均さないと内側の (SELECT ...) が先に見つかって
+      // スカラーサブクエリとして畳まれ、「1 行より多い」と誤ったエラーになる
+      _flattenDerivedSetOps(sql) {
+          if (sql.indexOf('(') === -1) return sql;
+          let out = sql;
+          for (let guard = 0; guard < 20; guard++) {
+              let changed = false;
+              const re = /\b(?:from|join)\s*\(/gi;
+              let m;
+              while ((m = re.exec(out)) !== null) {
+                  const openAt = m.index + m[0].length - 1;
+                  const close = this._scanBalanced(out, openAt);
+                  if (close === -1) break;
+                  const inner = out.slice(openAt + 1, close).trim();
+                  if (!/^\(\s*(?:select|with)\b/i.test(inner)) continue;
+                  const segs = this._splitUnion(inner);
+                  if (segs.length < 2) continue;
+                  const flat = segs.map((s, i) => (i === 0 ? '' : s.op + ' ') + s.sql).join(' ').trim();
+                  if (flat === inner) continue;
+                  out = out.slice(0, openAt + 1) + flat + out.slice(close);
+                  changed = true;
+                  break;
+              }
+              if (!changed) break;
+          }
+          return out;
+      },
+
       expandSubqueries(sql, strMap) {
-          let expandedSql = sql;
+          let expandedSql = this._flattenDerivedSetOps(sql);
           let expansions = 0;
           while(true) {
               let match = this.findInnerSubquery(expandedSql);
@@ -170,7 +200,8 @@
                       colNames = alM[2].split(',').map(c => c.trim().toLowerCase());
                       after = ` ${alM[1]}` + after.slice(alM[0].length);
                   }
-                  this._materializeRows(tmpName, subResult.data, colNames);
+                  // 0 件でも列だけは作る（列が消えると外側から参照できなくなる）
+                  this._materializeRows(tmpName, subResult.data, colNames || subResult.columns || null);
                   expandedSql = expandedSql.slice(0, match.start) + tmpName + after;
               } else {
                   // スカラーサブクエリ: 2 行以上返したら黙って先頭行を使うのではなくエラーにする。
@@ -705,6 +736,12 @@
                       }
                   }
               } else {
+                  // NULL の境界は Number(null) === 0 になり「空の系列」として黙って通る。
+                  // 桁あふれした値（1e400）は式評価の段階で NULL へ揃うようになったので、
+                  // ここで NULL を弾かないと「有限でない」検査が働かなくなる
+                  if (vals.some(v => v === null || v === undefined)) {
+                      throw new Error("GENERATE_SERIES arguments must be finite numbers (a NULL or out-of-range bound is not allowed).");
+                  }
                   const nums = vals.map(Number);
                   const start = nums[0], stop = nums[1], step = nums.length === 3 ? nums[2] : 1;
                   if (!isFinite(start) || !isFinite(stop) || !isFinite(step)) throw new Error("GENERATE_SERIES arguments must be finite numbers.");
@@ -972,6 +1009,26 @@
       _expandOneApply(sql, strMap) {
           const km = sql.match(/\b(?:(CROSS|OUTER)\s+APPLY|(?:(left|right|full|inner|cross)\s+(?:outer\s+)?)?(?:join\s+)?LATERAL)\s+/i);
           if (!km) return sql;
+          // APPLY が括弧の内側（派生表やサブクエリの中）に書かれている場合は、
+          // その内側だけを先に展開する。文全体を「左側クエリ」として組み立てると
+          // 途中で切れた SQL になり、原因の判らない構文エラーになっていた
+          {
+              const openStack = [];
+              const head = sql.slice(0, km.index);
+              for (let i = 0; i < head.length; i++) {
+                  if (head[i] === '(') openStack.push(i);
+                  else if (head[i] === ')') openStack.pop();
+              }
+              if (openStack.length > 0) {
+                  const openIdx = openStack[openStack.length - 1];
+                  const close = this._scanBalanced(sql, openIdx);
+                  if (close === -1) return sql;
+                  const innerText = sql.slice(openIdx + 1, close);
+                  const expanded = this._expandOneApply(innerText, strMap);
+                  if (expanded === innerText) return sql;
+                  return sql.slice(0, openIdx + 1) + expanded + sql.slice(close);
+              }
+          }
           // JOIN LATERAL: LEFT JOIN LATERAL は OUTER APPLY 相当、それ以外は CROSS APPLY 相当
           const joinKw = km[2] ? km[2].toLowerCase() : null;
           if (joinKw === 'right' || joinKw === 'full') {
@@ -1016,42 +1073,81 @@
           const before = sql.slice(0, km.index).trim().replace(/,\s*$/, '');
           if (!/^select\b/i.test(before)) throw new Error("APPLY / LATERAL must follow a SELECT ... FROM clause.");
           const leftSql = before.replace(/^select\s+(?:distinct\s+)?[\s\S]*?\s+from\s+/i, 'SELECT * FROM ');
-          const leftRes = this.executeQuery(leftSql, true, strMap);
+          let leftRes = this.executeQuery(leftSql, true, strMap);
+          // 左側が派生表 `FROM (SELECT ...) z` の形だと、内部実行では FROM の
+          // サブクエリ展開が走らず構文エラーになる。前段の展開を通してもう一度試す
+          if (leftRes.error) leftRes = this.executeQuery(leftSql, false, strMap);
           if (leftRes.error) throw new Error("APPLY left side failed: " + leftRes.error);
           const leftRows = leftRes.data;
 
-          // 左表の別名（相関参照 a.col の解決に使う）
-          const leftFromM = before.match(/\bfrom\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:as\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?/i);
-          const leftAlias = leftFromM ? (leftFromM[2] || leftFromM[1]).toLowerCase() : null;
-          const leftTable = leftFromM ? leftFromM[1].toLowerCase() : null;
+          // 左表の別名（相関参照 a.col の解決に使う）。
+          // `FROM (SELECT ...) z` のように派生表が左側に来る形も拾う
+          let leftAlias = null, leftTable = null;
+          const fromKw = before.match(/\bfrom\s+/i);
+          if (fromKw && before[fromKw.index + fromKw[0].length] === '(') {
+              const openAt = fromKw.index + fromKw[0].length;
+              const closeAt = this._scanBalanced(before, openAt);
+              if (closeAt !== -1) {
+                  const am = before.slice(closeAt + 1).match(/^\s*(?:as\s+)?([a-zA-Z_][a-zA-Z0-9_]*)/i);
+                  if (am && !this._isClauseKeyword(am[1])) leftAlias = am[1].toLowerCase();
+              }
+          } else {
+              const leftFromM = before.match(/\bfrom\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:as\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?/i);
+              if (leftFromM) {
+                  leftAlias = (leftFromM[2] || leftFromM[1]).toLowerCase();
+                  leftTable = leftFromM[1].toLowerCase();
+              }
+          }
 
           const innerRaw = rightText.startsWith('(') ? rightText.slice(1, -1).trim() : `SELECT * FROM ${rightText}`;
           const outRows = [];
           let rightCols = null;
+          // 右側の列名が左側とぶつかったら別名を付けて両方残す。
+          // 上書きすると `x CROSS APPLY (...k) y` のように同じ列名を返す APPLY を
+          // 続けたとき、先の値が黙って後の値に置き換わる
+          const leftColSet = new Set(leftRows.length > 0 ? Object.keys(leftRows[0]).map(c => c.toLowerCase()) : []);
+          let rightMap = null;
           for (const lrow of leftRows) {
               const lc = {};
               for (const k in lrow) lc[k.toLowerCase()] = lrow[k];
               // 相関参照（<alias>.col / 素の列名）を左行の値リテラルへ差し替える
               let q = innerRaw;
-              if (leftAlias) q = q.replace(new RegExp('\\b' + leftAlias + '\\.([a-zA-Z0-9_]+)\\b', 'gi'), (mm, c) => this._literalOf(lc[c.toLowerCase()]));
-              if (leftTable && leftTable !== leftAlias) q = q.replace(new RegExp('\\b' + leftTable + '\\.([a-zA-Z0-9_]+)\\b', 'gi'), (mm, c) => this._literalOf(lc[c.toLowerCase()]));
-              const rres = this.executeQuery(q);
+              // 差し込む値は、文字列なら strMap 側へ退避してトークンで置く
+              // （本文はまだ退避済みの状態なので、生のリテラルを混ぜない）
+              const litTok = (v) => {
+                  const lit = this._literalOf(v);
+                  if (strMap && lit.charAt(0) === "'") { strMap.push(lit); return `__STR_${strMap.length - 1}__`; }
+                  return lit;
+              };
+              if (leftAlias) q = q.replace(new RegExp('\\b' + leftAlias + '\\.([a-zA-Z0-9_]+)\\b', 'gi'), (mm, c) => litTok(lc[c.toLowerCase()]));
+              if (leftTable && leftTable !== leftAlias) q = q.replace(new RegExp('\\b' + leftTable + '\\.([a-zA-Z0-9_]+)\\b', 'gi'), (mm, c) => litTok(lc[c.toLowerCase()]));
+              // strMap を渡さないと本文の文字列リテラル（__STR_n__）が復元されず、
+              // 条件が実行時エラーになって「0 行」という誤答になっていた
+              const rres = this.executeQuery(q, false, strMap);
               if (rres.error) throw new Error("APPLY subquery failed: " + rres.error);
-              if (rres.data.length > 0 && !rightCols) rightCols = Object.keys(rres.data[0]);
+              if (rres.data.length > 0 && !rightCols) {
+                  rightCols = Object.keys(rres.data[0]);
+                  rightMap = new Map();
+                  rightCols.forEach(c => rightMap.set(c,
+                      leftColSet.has(c.toLowerCase()) ? `${rightAlias || 'apply'}_${c}` : c));
+              }
               if (rres.data.length === 0) {
                   if (kind === 'OUTER') outRows.push({ ...lrow, __apply_null: 1 });
                   continue;
               }
               rres.data.forEach(rr => {
                   const merged = { ...lrow };
-                  for (const k in rr) merged[k] = rr[k];
+                  for (const k in rr) merged[(rightMap && rightMap.get(k)) || k] = rr[k];
                   outRows.push(merged);
               });
           }
           // OUTER APPLY の非マッチ行は右側列を NULL で補う
           const leftCols = leftRows.length > 0 ? Object.keys(leftRows[0]) : [];
           const allCols = [...leftCols];
-          (rightCols || []).forEach(c => { if (!allCols.includes(c)) allCols.push(c); });
+          (rightCols || []).forEach(c => {
+              const o = (rightMap && rightMap.get(c)) || c;
+              if (!allCols.includes(o)) allCols.push(o);
+          });
           const norm = outRows.map(r => {
               const o = {};
               allCols.forEach(c => { o[c] = r[c] === undefined ? null : r[c]; });
@@ -1065,11 +1161,21 @@
           // 実体化後は列名がフラットになるため、左右の別名修飾子は取り除く
           const selHead = before.match(/^select\s+(distinct\s+)?([\s\S]*?)\s+from\s+/i);
           const distinctTxt = selHead && selHead[1] ? 'DISTINCT ' : '';
+          // 実体化後は列名がフラットになるので右側の別名修飾子は落とす。
+          // 左側の別名は実体化テーブルに付け直すので **残す** — 落とすと、後ろに
+          // もう 1 つ APPLY が続く形でその相関参照（g.code）が裸の列名になり、
+          // 内側の表に無い名前として弾かれていた
           const stripQual = (txt) => {
               let s = txt;
-              [leftAlias, leftTable, rightAlias].forEach(a => {
-                  if (a) s = s.replace(new RegExp('\\b' + a + '\\.', 'gi'), '');
-              });
+              // 右側は「別名.列」を実体化後の列名へ読み替える（衝突時は別名を付けた名前）
+              if (rightAlias) {
+                  s = s.replace(new RegExp('\\b' + rightAlias + '\\.([a-zA-Z0-9_]+)\\b', 'gi'), (m, c) => {
+                      if (!rightMap) return c;
+                      for (const [k, v] of rightMap) if (k.toLowerCase() === c.toLowerCase()) return v;
+                      return c;
+                  });
+              }
+              if (leftTable && leftTable !== leftAlias) s = s.replace(new RegExp('\\b' + leftTable + '\\.', 'gi'), '');
               return s;
           };
           const selList = stripQual(selHead ? selHead[2] : '*');
@@ -1080,7 +1186,7 @@
               const wM = rest.match(/^(\s*)where\s+/i);
               rest = wM ? `${wM[1]}WHERE (${cond}) AND ${rest.slice(wM[0].length)}` : ` WHERE (${cond})${rest}`;
           }
-          return `SELECT ${distinctTxt}${selList} FROM ${tmpName}${rest}`;
+          return `SELECT ${distinctTxt}${selList} FROM ${tmpName}${leftAlias ? ' ' + leftAlias : ''}${rest}`;
       },
 
       // 再帰CTE (WITH RECURSIVE): アンカー部の行を初期作業集合とし、再帰部を
@@ -1290,7 +1396,8 @@
                   body = this.expandSubqueries(this.expandRelationalOps(this.expandTableFunctions(this.expandViews(this.expandInfoSchema(body), strMap), strMap), strMap), strMap);
                   const res = this.executeQuery(body, true, strMap);
                   if (res.error) throw new Error(`CTE '${name}': ${res.error}`);
-                  this._materializeRows(tmpName, res.data, colNames);
+                  // 0 件の CTE でも列は残す（`WITH e AS (SELECT v ... WHERE 偽) SELECT SUM(v) FROM e`）
+                  this._materializeRows(tmpName, res.data, colNames || res.columns || null);
               }
               cteMap[name] = tmpName;
 

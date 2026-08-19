@@ -571,10 +571,12 @@
             const v = db.executeQuery("SELECT COUNT(*) AS c FROM bx_types WHERE f = 1e308 OR f = -1e308");
             return !r.error && v.data[0].c === 2;
         }},
-        { name: "XBnd: Float Overflow To Infinity", fn: () => {
+        // v1.30: 桁あふれした浮動小数は INTEGER と同じく受け入れずに拒む。
+        // 従来は Infinity が格納され、実DBには存在しない値が読み出されていた
+        { name: "XBnd: Float Overflow Rejected", fn: () => {
             const r = db.executeQuery("INSERT INTO bx_types (f) VALUES (1e309)");
-            const v = db.executeQuery("SELECT f FROM bx_types WHERE f > 1e308");
-            return !r.error && v.data.length === 1 && v.data[0].f === Infinity;
+            const v = db.executeQuery("SELECT COUNT(*) AS c FROM bx_types WHERE f > 1e308");
+            return !!r.error && r.error.includes('Type mismatch') && v.data[0].c === 0;
         }},
         { name: "XBnd: Integer Overflow Rejected", sql: "INSERT INTO bx_types (i) VALUES (1e309)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
         { name: "XBnd: Empty String Into Integer Is Null", fn: () => {
@@ -591,7 +593,9 @@
         { name: "XBnd: Negative Divide By Zero Is Null", sql: "SELECT -10 / 0 AS v", check: r => r.data[0].v === null },
         { name: "XBnd: Zero Divide Zero Is Null", sql: "SELECT 0 / 0 AS v", check: r => r.data[0].v === null },
         { name: "XBnd: Modulo By Zero Is Null", sql: "SELECT 10 % 0 AS v", check: r => r.data[0].v === null },
-        { name: "XBnd: Mod By Zero NaN", sql: "SELECT MOD(10, 0) AS v", check: r => typeof r.data[0].v === 'number' && isNaN(r.data[0].v) },
+        // v1.30: MOD() も % 演算子と揃えて NULL を返す。v1.25 で演算子側だけ直っており、
+        // 同じ計算が書き方によって NULL と NaN に分かれていた
+        { name: "XBnd: Mod By Zero Is Null", sql: "SELECT MOD(10, 0) AS v", check: r => r.data[0].v === null },
         { name: "XBnd: Mod Negative Operands", sql: "SELECT MOD(-7, 3) AS a, MOD(7, -3) AS b", check: r => r.data[0].a === -1 && r.data[0].b === 1 },
         // v1.1: ROUND は MySQL 互換の「ゼロから遠い方向」丸めへ変更（JS Math.round の
         // 負数切り上げ挙動 ROUND(-2.5)=-2 は SQL として直感に反するため）
@@ -665,7 +669,17 @@
         { name: "XBnd: DateTime With Seconds", sql: "INSERT INTO bx_date (id, d) VALUES (6, '2026-07-11 12:34:56')", check: r => r.data[0].Message.includes('1') },
         { name: "XBnd: DateTime Millis Accepted", sql: "INSERT INTO bx_date (id, d) VALUES (7, '2026-01-01 00:00:00.123')", check: r => r.data[0].Message.includes('1') },
         { name: "XBnd: Date Part Extraction", sql: "SELECT YEAR(d) AS y, MONTH(d) AS m, DAY(d) AS dy FROM bx_date WHERE id = 1", check: r => r.data[0].y === 2024 && r.data[0].m === 2 && r.data[0].dy === 29 },
-        { name: "XBnd: Time Part Extraction", sql: "SELECT HOUR(d) AS h, MINUTE(d) AS mi, SECOND(d) AS se FROM bx_date WHERE id = 6", check: r => r.data[0].h === 12 && r.data[0].mi === 34 && r.data[0].se === 56 },
+        // v1.30: DATE と宣言した列は日付だけを保つ（時刻付きの値を入れても切り落とす）。
+        // 時刻まで持たせたい場合は TIMESTAMP / DATETIME を使う
+        { name: "XBnd: A DATE Column Drops The Time Part", sql: "SELECT HOUR(d) AS h, MINUTE(d) AS mi, SECOND(d) AS se FROM bx_date WHERE id = 6", check: r => r.data[0].h === 0 && r.data[0].mi === 0 && r.data[0].se === 0 },
+        { name: "XBnd: A DATE Column Keeps The Date Part", sql: "SELECT CAST(d AS TEXT) AS d FROM bx_date WHERE id = 6", check: r => r.data[0].d === '2026-07-11' },
+        { name: "XBnd: A TIMESTAMP Column Keeps The Time Part", fn: () => {
+            db.executeQuery("CREATE TABLE bx_ts (id INTEGER, d TIMESTAMP)");
+            db.executeQuery("INSERT INTO bx_ts VALUES (1, '2026-07-11 12:34:56')");
+            const r = db.executeQuery("SELECT HOUR(d) AS h, MINUTE(d) AS mi FROM bx_ts");
+            db.executeQuery("DROP TABLE bx_ts");
+            return r.data[0].h === 12 && r.data[0].mi === 34;
+        }},
         { name: "XBnd: Date String Comparison", sql: "SELECT COUNT(*) AS c FROM bx_date WHERE d >= '2024-01-01'", check: r => r.data[0].c === 4 },
         { name: "XBnd: DateDiff Across Leap Day", sql: "SELECT DATEDIFF('2024-03-01', '2024-02-28') AS a, DATEDIFF('2023-03-01', '2023-02-28') AS b", check: r => r.data[0].a === 2 && r.data[0].b === 1 },
         { name: "XBnd: Date Cleanup", sql: "DROP TABLE bx_date", check: r => r.data[0].Result === "Success" },

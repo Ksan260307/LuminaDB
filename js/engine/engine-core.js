@@ -3,7 +3,7 @@
     // 各機能メソッドは engine-*.js で prototype 拡張として定義される
     // ============================================================================
     // エンジンバージョン（VERSION() 関数 / SHOW STATUS / 外部APIが参照する）
-    var LUMINA_VERSION = '1.27.0';
+    var LUMINA_VERSION = '1.30.0';
 
     class DatabaseEngine {
       constructor() {
@@ -334,12 +334,27 @@
         }
 
         let resultSet = [];
+        let outColumns = null;      // 0 件のときの出力列名（派生表の実体化に使う）
         let affectedRows = 0;
 
         try {
           // WITH 句 (CTE): 各CTEを一時テーブルへ実体化し、本体クエリに書き換える
           if (!isSubquery && /^with\s/i.test(sql)) {
               sql = this._expandCTEs(sql, strMap);
+          } else if (!isSubquery) {
+              // CREATE TABLE ... AS WITH ... SELECT（CTE 付き CTAS）。
+              // 先頭が WITH でないと展開されず、CTE の括弧がスカラーサブクエリとして
+              // 畳まれて「1 行より多い」と誤ったエラーになっていた
+              const ctasWith = sql.match(
+                  /^(create\s+(?:(?:global|local)\s+)?(?:temp(?:orary)?\s+)?table\s+(?:if\s+not\s+exists\s+)?[a-zA-Z0-9_]+\s+(?:as\s+)?)(with\s[\s\S]+)$/i);
+              if (ctasWith) sql = ctasWith[1] + this._expandCTEs(ctasWith[2], strMap);
+              // INSERT INTO t [(cols)] WITH ... SELECT ...（CTE を INSERT の後ろに書く形）。
+              // 展開しないと CTE の括弧がスカラーサブクエリとして畳まれ、
+              // 「1 行より多い」という的外れなエラーになっていた。
+              // 先頭に WITH を置く書き方は上の分岐で既に処理される
+              const insWith = sql.match(
+                  /^((?:insert|replace)\s+(?:or\s+\w+\s+)?into\s+[a-zA-Z0-9_]+\s*(?:\([^()]*\)\s*)?)(with\s[\s\S]+)$/i);
+              if (insWith) sql = insWith[1] + this._expandCTEs(insWith[2], strMap);
           }
 
           // CREATE VIEW / PROCEDURE / TRIGGER の本体は定義として保存するため事前展開しない。
@@ -353,7 +368,9 @@
           // 集合演算の枝を括弧で包む書き方 `(SELECT ...) UNION (SELECT ...)` や、
           // 文全体を括弧で包んだ `(SELECT ...)` を括弧無しの等価な形へ正規化する。
           // サブクエリ展開より前に行うこと（後だと枝が派生表として実体化されてしまう）
-          if (!isSubquery && /^\(\s*(?:select|with)\b/i.test(sql)) {
+          // 派生表の中身（isSubquery）でも同じ正規化が要る。除いていたため
+          // `FROM ((SELECT ...) UNION (SELECT ...)) t` が構文エラーになっていた
+          if (/^\(\s*(?:select|with)\b/i.test(sql)) {
               const segs0 = this._splitUnion(sql);
               sql = segs0.map((s2, i) => (i === 0 ? '' : s2.op + ' ') + s2.sql).join(' ').trim();
           }
@@ -379,10 +396,11 @@
           // 「定義した瞬間の結果」へ畳み込んでしまう。畳み込まれた式はそのまま
           // スキーマへ保存されるので、後から親表が変わっても追従せず、
           // 正しい行を拒否し・不正な行を通す（両方向に誤る）。実DBはどれも
-          // 定義時に拒否するので、こちらも拒否する。CTAS の AS SELECT は対象外
+          // 定義時に拒否するので、こちらも拒否する。CTAS の AS SELECT / AS WITH は対象外
           if (!isSubquery
               && /^create\s+(?:global\s+|local\s+)?(?:temp(?:orary)?\s+)?table\b/i.test(sql)
               && !/\bas\s+select\b/i.test(sql)
+              && !/\bas\s+with\b/i.test(sql)
               && /\(\s*select\b/i.test(sql)) {
               throw new Error("A CHECK constraint or DEFAULT expression cannot contain a subquery. Use a FOREIGN KEY constraint or a trigger instead.");
           }
@@ -456,6 +474,8 @@
              }
              resultSet = res.data;
              affectedRows = res.affectedRows;
+             // 0 件でも出力列名を伝える（派生表として実体化するときに要る）
+             if (res.columns) outColumns = res.columns;
           }
           else if (/^(insert|replace)\b/i.test(sql)) {
              // 対象がビューなら基底表への書き換え経路（更新可能ビュー）へ回す
@@ -642,6 +662,7 @@
           executionTime: Math.max(0.01, executionTime).toFixed(2),
           scannedRows: affectedRows
         };
+        if (outColumns && (!resultSet || resultSet.length === 0)) out.columns = outColumns;
         // SHOW WARNINGS 自身の結果には（読み取った）警告を重ねて付けない
         if (!this._isShowWarnings && this._warnings && this._warnings.length > 0) out.warnings = this._warnings.slice();
         return out;

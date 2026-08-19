@@ -63,7 +63,10 @@
         { name: "V7Fn: DATE_TRUNC Week Monday", sql: "SELECT DATE_TRUNC('week', '2026-07-17') AS d", check: r => r.data[0].d === '2026-07-13 00:00:00' },
         { name: "V7Fn: DATE_TRUNC Quarter And Hour", sql: "SELECT DATE_TRUNC('quarter', '2026-08-15') AS q, DATE_TRUNC('hour', '2026-07-17 10:30:45') AS h", check: r =>
             r.data[0].q === '2026-07-01 00:00:00' && r.data[0].h === '2026-07-17 10:00:00' },
-        { name: "V7Fn: DATE_TRUNC Bad Unit NULL", sql: "SELECT DATE_TRUNC('fortnight', '2026-07-17') AS d", check: r => r.data[0].d === null },
+        // 旧: 単位名が誤っていても黙って NULL を返していた（値が無いのか綴り違いか区別できない）。
+        // v1.30 から誤りとして知らせる
+        { name: "V7Fn: DATE_TRUNC Bad Unit Rejected", sql: "SELECT DATE_TRUNC('fortnight', '2026-07-17') AS d",
+          isErrorExpected: true, check: r => !!r.error && r.error.includes("Unsupported date unit 'fortnight'") },
         { name: "V7Fn: TYPEOF All Types", sql: "SELECT TYPEOF(1) AS a, TYPEOF(1.5) AS b, TYPEOF('x') AS c, TYPEOF(NULL) AS d, TYPEOF(TRUE) AS e", check: r =>
             r.data[0].a === 'integer' && r.data[0].b === 'real' && r.data[0].c === 'text' && r.data[0].d === 'null' && r.data[0].e === 'boolean' },
         { name: "V7Fn: IIF Alias Of IF", sql: "SELECT IIF(2 > 1, 'y', 'n') AS a, IIF(1 > 2, 'y', 'n') AS b", check: r => r.data[0].a === 'y' && r.data[0].b === 'n' },

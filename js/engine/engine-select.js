@@ -5,6 +5,14 @@
     // 集計関数名の一覧（先頭一致判定・式中判定・書き換えで共用）
     const LUMINA_AGG_NAMES = 'COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|REGR_SLOPE|REGR_INTERCEPT|REGR_COUNT|REGR_R2|REGR_AVGX|REGR_AVGY|REGR_SXX|REGR_SYY|REGR_SXY|MODE|ANY_VALUE|GROUPING_ID|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG';
 
+    // 引数をちょうど 1 個だけ取る集計。余分な引数はカンマ式として最後の値だけが
+    // 使われ「黙って別の答え」になるので、コンパイル時に弾く
+    const LUMINA_ONE_ARG_AGGS = new Set([
+        'SUM', 'AVG', 'MIN', 'MAX', 'COUNT_IF', 'ARRAY_AGG', 'JSON_ARRAYAGG',
+        'STDDEV', 'STDDEV_POP', 'STDDEV_SAMP', 'VARIANCE', 'VAR_POP', 'VAR_SAMP',
+        'MEDIAN', 'BIT_AND', 'BIT_OR', 'BIT_XOR', 'BOOL_AND', 'BOOL_OR', 'ANY_VALUE'
+    ]);
+
     // OVER (...) を付けて使える関数。ここに無い名前は評価側の分岐に当たらず
     // 黙って NULL になるため、コンパイル時に弾くための照合表として持つ
     const LUMINA_WINDOW_FN_NAMES = new Set([
@@ -115,6 +123,19 @@
                           : String(this.compileCondition(pp[1], strMap)({}, {}, {}));
                   }
                   func = 'GROUP_CONCAT';
+              } else if (func === 'GROUP_CONCAT') {
+                  // GROUP_CONCAT(expr [, 'sep']): SQLite 形の第2引数も区切り文字として受ける
+                  // （MySQL の SEPARATOR 構文は上で切り出し済み）。素通しすると
+                  // 「a, '|'」がカンマ式として評価され、区切り文字そのものが連結されてしまう
+                  const pp = this.splitSelectClause(argExpr);
+                  if (pp.length > 2) throw new Error("GROUP_CONCAT takes 1 or 2 arguments (expr [, separator]).");
+                  argFunc = this.compileCondition(pp[0], strMap);
+                  if (pp.length === 2) {
+                      const sepTok = pp[1].trim().match(/^__STR_(\d+)__$/);
+                      separator = sepTok
+                          ? this._unquoteLiteral(strMap[Number(sepTok[1])])
+                          : String(this.compileCondition(pp[1], strMap)({}, {}, {}));
+                  }
               } else if (func === 'STRING_AGG') {
                   // STRING_AGG(expr, 'sep'): 区切り文字を第2引数で受ける GROUP_CONCAT の別名
                   const pp = this.splitSelectClause(argExpr);
@@ -138,10 +159,138 @@
                   argFuncs = this.splitSelectClause(argExpr).map(p => this.compileCondition(p, strMap));
                   argFunc = argFuncs[0];
               } else {
+                  // 1 引数しか取らない集計に余分な引数を渡したら止める。
+                  // 素通しするとカンマ式として最後の値だけが使われ、黙って別の答えになる
+                  // COUNT は DISTINCT 付きのときだけ複数列を取れる。DISTINCT 無しの
+                  // COUNT(a, b) は余分な引数が黙って捨てられていた
+                  if (LUMINA_ONE_ARG_AGGS.has(func) || func === 'COUNT') {
+                      const pp = this.splitSelectClause(argExpr);
+                      if (pp.length > 1) {
+                          throw new Error(`${func} takes exactly 1 argument but ${pp.length} were given.`);
+                      }
+                  }
                   argFunc = this.compileCondition(argExpr, strMap);
               }
           }
           return { type: 'agg', func, argFunc, argFunc2, argFuncs, distinct: isDistinctAgg, separator, orderSpecs, alias, filterFunc, keep: keepSpec || null };
+      },
+
+      // 式全体がちょうど 1 つの集計呼び出しか（括弧の対応で厳密に見る）
+      _isWholeAggCall(expr) {
+          const h = expr.match(new RegExp('^(' + LUMINA_AGG_NAMES + ')\\s*\\(', 'i'));
+          if (!h) return false;
+          let d = 0;
+          for (let i = h[0].length - 1; i < expr.length; i++) {
+              if (expr[i] === '(') d++;
+              else if (expr[i] === ')') { d--; if (d === 0) return i === expr.length - 1; }
+          }
+          return false;
+      },
+
+      // 末尾の FILTER (WHERE ...) を切り出す。正規表現の貪欲マッチだと
+      // `COUNT(*) FILTER (WHERE g='a') + COUNT(*)` の条件部が
+      // "g='a') + COUNT(*" のように壊れるため、括弧の対応で境界を決める
+      _splitTrailingFilter(expr) {
+          const re = /\bFILTER\s*\(/gi;
+          let m;
+          while ((m = re.exec(expr)) !== null) {
+              const open = m.index + m[0].length - 1;
+              let d = 0, close = -1;
+              for (let i = open; i < expr.length; i++) {
+                  if (expr[i] === '(') d++;
+                  else if (expr[i] === ')') { d--; if (d === 0) { close = i; break; } }
+              }
+              if (close === -1) return null;
+              if (expr.slice(close + 1).trim() !== '') continue;   // 末尾に無いなら別の FILTER
+              const wm = expr.slice(open + 1, close).trim().match(/^WHERE\s+([\s\S]+)$/i);
+              if (!wm) return null;
+              return { head: expr.slice(0, m.index).trim(), cond: wm[1].trim() };
+          }
+          return null;
+      },
+
+      // 式の一部に書かれたウィンドウ呼び出しを取り出す。
+      //   'val - LAG(val) OVER (ORDER BY id)'
+      //     -> { outer: 'val - __WCALL_0__', calls: ['LAG(val) OVER (ORDER BY id)'] }
+      // 呼び出しの先頭は OVER から左へ「引数の括弧」を辿って関数名まで戻して決める
+      // （FILTER (WHERE ...) / IGNORE NULLS / FROM FIRST|LAST を挟む形も同じ経路）。
+      // 取り出せない形は null を返し、呼び出し元が従来どおりのエラーにする
+      _extractWindowCalls(expr) {
+          const calls = [];
+          let s = expr;
+          for (let guard = 0; guard < 64; guard++) {
+              const om = s.match(/\bOVER\s*\(/i);
+              if (!om) break;
+              const overAt = om.index;
+              // 左へ戻って呼び出しの開始位置を決める
+              let j = overAt - 1;
+              const skipWs = () => { while (j >= 0 && /\s/.test(s[j])) j--; };
+              skipWs();
+              const before = () => s.slice(0, j + 1);
+              let m = before().match(/(?:IGNORE|RESPECT)\s+NULLS$/i);
+              if (m) { j = m.index - 1; skipWs(); }
+              m = before().match(/FROM\s+(?:FIRST|LAST)$/i);
+              if (m) { j = m.index - 1; skipWs(); }
+              let start = -1;
+              for (let hop = 0; hop < 4; hop++) {
+                  if (s[j] !== ')') return null;
+                  let depth = 0, k = j;
+                  for (; k >= 0; k--) {
+                      if (s[k] === ')') depth++;
+                      else if (s[k] === '(') { depth--; if (depth === 0) break; }
+                  }
+                  if (k < 0) return null;
+                  const nm = s.slice(0, k).match(/([a-zA-Z_][a-zA-Z0-9_]*)\s*$/);
+                  if (!nm) return null;
+                  if (nm[1].toUpperCase() === 'FILTER') { j = nm.index - 1; skipWs(); continue; }
+                  start = nm.index;
+                  break;
+              }
+              if (start < 0) return null;
+              // OVER (...) の閉じ括弧を探す
+              const openAt = overAt + om[0].length - 1;
+              let depth2 = 0, end = -1;
+              for (let k = openAt; k < s.length; k++) {
+                  if (s[k] === '(') depth2++;
+                  else if (s[k] === ')') { depth2--; if (depth2 === 0) { end = k; break; } }
+              }
+              if (end < 0) return null;
+              const token = `__WCALL_${calls.length}__`;
+              calls.push(s.slice(start, end + 1).trim());
+              s = s.slice(0, start) + token + s.slice(end + 1);
+          }
+          if (calls.length === 0) return null;
+          if (/\bOVER\s*\(/i.test(s)) return null;
+          return { outer: s.trim(), calls };
+      },
+
+      // GROUP BY の結果行は「SELECT の別名」でしか列を持たない。集計後に評価する式
+      // （OVER (PARTITION BY / ORDER BY ...) の中身）が元の列名で書かれていると
+      // 解決できないので、別名へ読み替える。
+      //   SELECT grp AS g, ROW_NUMBER() OVER (ORDER BY grp) ... GROUP BY grp
+      _aliasBareCols(text, compiledSelects, strMap) {
+          if (!text) return text;
+          // 別名を付け替えた「素の列」だけを対象にする（式や集計は対象外）
+          const map = new Map();
+          (compiledSelects || []).forEach(cs => {
+              if (!cs || !cs.alias || typeof cs.rawExpr !== 'string') return;
+              const src = cs.rawExpr.trim();
+              if (!/^[a-zA-Z_][a-zA-Z0-9_]*(\s*\.\s*[a-zA-Z_][a-zA-Z0-9_]*)?$/.test(src)) return;
+              const bare = src.replace(/^[a-zA-Z0-9_]+\s*\.\s*/, '').toLowerCase();
+              if (bare === String(cs.alias).toLowerCase()) return;   // 読み替え不要
+              if (!map.has(bare)) map.set(bare, cs.alias);
+          });
+          if (map.size === 0) return text;
+          const sm = [];
+          let s = this._maskStrings(text, sm);
+          s = s.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*\s*\.\s*)?([a-zA-Z_][a-zA-Z0-9_]*)\b(\s*\()?/g,
+              (m, qual, name, call) => {
+                  if (call) return m;                                  // 関数呼び出しは触らない
+                  if (/^__/.test(name)) return m;                      // 内部トークン
+                  const to = map.get(name.toLowerCase());
+                  return to === undefined ? m : to;
+              });
+          return this._restoreStrings(s, sm);
       },
 
       // 集計内 ORDER BY 用: {v, ord:[...]} ペア配列を並べ替える
@@ -167,10 +316,15 @@
       // 対応する集計記述子を compiledSelects へ追加する。
       // HAVING COUNT(*) > 1 / ORDER BY SUM(x) DESC のような直接集計参照を可能にする
       _rewriteAggCalls(str, compiledSelects, strMap, prefix) {
-          // 引数は2段の括弧ネストまで対応（HAVING SUM(ROUND(ABS(x), 2)) 等）
-          return str.replace(/\b(COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|REGR_SLOPE|REGR_INTERCEPT|REGR_COUNT|REGR_R2|REGR_AVGX|REGR_AVGY|REGR_SXX|REGR_SYY|REGR_SXY|MODE|ANY_VALUE|GROUPING_ID|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG)\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))*)\)/gi, (m, fn, arg) => {
+          // 引数は2段の括弧ネストまで対応（HAVING SUM(ROUND(ABS(x), 2)) 等）。
+          // 直後に続く FILTER (WHERE ...) も同じ集計の一部として取り込む。取り込まないと
+          // ROUND(AVG(x) FILTER (WHERE c), 2) の FILTER が式の側に取り残されて壊れる
+          const NEST = '(?:[^()]|\\((?:[^()]|\\([^()]*\\))*\\))*';
+          const re = new RegExp('\\b(' + LUMINA_AGG_NAMES + ')\\s*\\((' + NEST + ')\\)' +
+                                '(?:\\s*FILTER\\s*\\(\\s*WHERE\\s+(' + NEST + ')\\))?', 'gi');
+          return str.replace(re, (m, fn, arg, filt) => {
               const alias = `${prefix}${compiledSelects.length}`;
-              compiledSelects.push(this._compileAggSelect(fn.toUpperCase(), arg, strMap, alias));
+              compiledSelects.push(this._compileAggSelect(fn.toUpperCase(), arg, strMap, alias, filt || null));
               return ` ${alias} `;
           });
       },
@@ -209,6 +363,7 @@
 
           specs.forEach(w => {
             const argFn = w.argExpr ? this.compileCondition(w.argExpr, strMap) : null;
+            const defFn = w.argDefaultExpr ? this.compileCondition(w.argDefaultExpr, strMap) : null;
             const partFns = w.partExprs.map(e => this.compileCondition(e, strMap));
             const ordFns = w.orderSpecs.map(o => ({ fn: this.compileCondition(o.expr, strMap), desc: o.desc }));
 
@@ -264,7 +419,8 @@
                         }
                         case 'LAG': case 'LEAD': {
                             const t = w.funcName === 'LAG' ? i - w.argOffset : i + w.argOffset;
-                            out = (t >= 0 && t < n && argFn) ? evalOn(argFn, entries[t].row) : null;
+                            out = (t >= 0 && t < n && argFn) ? evalOn(argFn, entries[t].row)
+                                : (defFn ? evalOn(defFn, e.row) : null);
                             break;
                         }
                         case 'FIRST_VALUE': out = argFn ? evalOn(argFn, entries[0].row) : null; break;
@@ -276,6 +432,36 @@
                             break;
                         }
                         case 'SUM': case 'AVG': case 'COUNT': case 'MIN': case 'MAX': {
+                            if (w.frame) {
+                                // 明示 ROWS フレーム: 現在行からの相対位置で切り出して数える
+                                const bnd = (b, dflt) => {
+                                    if (!b) return dflt;
+                                    if (b.t === 'up') return 0;
+                                    if (b.t === 'uf') return n - 1;
+                                    if (b.t === 'cur') return i;
+                                    if (b.t === 'pre') return i - b.n;
+                                    if (b.t === 'fol') return i + b.n;
+                                    return dflt;
+                                };
+                                const lo = Math.max(0, bnd(w.frame.start, 0));
+                                const hi = Math.min(n - 1, bnd(w.frame.end, i));
+                                let fsum = 0, fcnt = 0, fbest = null;
+                                for (let k2 = lo; k2 <= hi; k2++) {
+                                    const v2 = argFn ? evalOn(argFn, entries[k2].row) : 1;
+                                    if (!argFn) { fcnt++; continue; }
+                                    if (v2 === null || v2 === undefined) continue;
+                                    fcnt++;
+                                    const n2 = LUMINA_AGG_NUM(v2);
+                                    if (n2 !== null) fsum += n2;
+                                    if (fbest === null) fbest = v2;
+                                    else if (w.funcName === 'MIN' ? v2 < fbest : v2 > fbest) fbest = v2;
+                                }
+                                if (w.funcName === 'COUNT') out = fcnt;
+                                else if (w.funcName === 'SUM') out = fcnt > 0 ? fsum : null;
+                                else if (w.funcName === 'AVG') out = fcnt > 0 ? fsum / fcnt : null;
+                                else out = fbest;
+                                break;
+                            }
                             if (ordFns.length === 0) {
                                 // フレーム無し＝パーティション全体をまとめて評価する
                                 if (i === 0) {
@@ -404,11 +590,35 @@
               }
           }
 
+          // OVER (...) の中身を丸ごと退避する。中の ORDER BY が文全体の ORDER BY として
+          // 切り出されるのを防ぐため。
+          // 正規表現で括弧を数えると入れ子の深さぶんだけ場合分けが要り、
+          // 従来の書き方は 1 段までしか数えられなかった。そのため
+          // `OVER (PARTITION BY CONCAT(a, CAST(x AS TEXT)) ORDER BY id)` のように
+          // 2 段以上入れ子になると途中で切れ、式が壊れたまま先へ流れていた
           let overMap = [];
-          tempSql = tempSql.replace(/\bOVER\s*\((?:[^)(]+|\([^)(]*\))*\)/gi, (m) => {
-              overMap.push(m);
-              return `__OVER_${overMap.length - 1}__`;
-          });
+          {
+              let out = '', i = 0;
+              const re = /\bOVER\s*\(/gi;
+              while (i < tempSql.length) {
+                  re.lastIndex = i;
+                  const m = re.exec(tempSql);
+                  if (!m) { out += tempSql.slice(i); break; }
+                  const open = m.index + m[0].length - 1;
+                  let d = 0, j = open, close = -1;
+                  for (; j < tempSql.length; j++) {
+                      const ch = tempSql[j];
+                      if (ch === '(') d++;
+                      else if (ch === ')') { d--; if (d === 0) { close = j; break; } }
+                  }
+                  if (close === -1) { out += tempSql.slice(i); break; }
+                  out += tempSql.slice(i, m.index);
+                  overMap.push(tempSql.slice(m.index, close + 1));
+                  out += `__OVER_${overMap.length - 1}__`;
+                  i = close + 1;
+              }
+              tempSql = out;
+          }
 
           // 集計関数内の ORDER BY（GROUP_CONCAT(x ORDER BY y) 等）が文全体の ORDER BY
           // 抽出に誤マッチしないよう、呼び出し全体を退避する（2段の括弧ネストまで）
@@ -614,7 +824,10 @@
           // 「集計後の行に対する式」へ均す。単独のウィンドウ項目はそのまま通す
           if (/__OVER_\d+__/.test(selectClause)
               && (groupByStr || new RegExp('\\b(?:' + LUMINA_AGG_NAMES + ')\\s*\\(', 'i').test(selectClause))) {
-              const WCALL = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\(((?:[^()]|\([^()]*\))*)\)\s*(__OVER_\d+__)/;
+              // FILTER (WHERE ...) / IGNORE NULLS の修飾を呼び出しの一部として飲み込む。
+              // 飲み込まないと `SUM(x) FILTER (WHERE c) __OVER_0__` の 'FILTER' が
+              // ウィンドウ関数名として切り出されてしまう
+              const WCALL = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\(((?:[^()]|\([^()]*\))*)\)((?:\s+FILTER\s*\(\s*WHERE\s+(?:[^()]|\([^()]*\))*\))?(?:\s+(?:IGNORE|RESPECT)\s+NULLS)?)\s*(__OVER_\d+__)/;
               // 「項目そのものが1つのウィンドウ式」かの判定は実際の検出と同じ形にする
               // （FILTER (WHERE ...) や IGNORE NULLS の修飾を含んだ形も単独項目とみなす）
               const SOLE_WINDOW = /^[A-Za-z_][A-Za-z0-9_]*\s*\((?:[^()]|\([^()]*\))*\)(?:\s+FILTER\s*\(\s*WHERE\s+(?:[^()]|\([^()]*\))*\))?(?:\s+(?:IGNORE|RESPECT)\s+NULLS)?\s*__OVER_\d+__$/i;
@@ -631,9 +844,9 @@
                   if (SOLE_WINDOW.test(body)) return item;
                   // ウィンドウ呼び出しを外した残りに集計が無いなら、通常のウィンドウ経路で足りる
                   if (!AGGCALL.test(body.replace(new RegExp(WCALL.source, 'g'), ' '))) return item;
-                  const replaced = body.replace(new RegExp(WCALL.source, 'g'), (m, fn, args, over) => {
+                  const replaced = body.replace(new RegExp(WCALL.source, 'g'), (m, fn, args, mods, over) => {
                       const hidden = `__wx_${wi++}`;
-                      extra.push(`${fn}(${args}) ${over} AS ${hidden}`);
+                      extra.push(`${fn}(${args})${mods || ''} ${over} AS ${hidden}`);
                       return hidden;
                   });
                   return replaced + tailAlias;
@@ -1170,17 +1383,33 @@
               rowPtrs = rowPtrs.filter(ptr => { tickW(); return whereFunc(ptr, this.tables, aliases); });
           }
 
-          // HAVING / QUALIFY / ORDER BY の曖昧な列名も、集計の切り出しで別名へ
-          // 置き換わる前のこの時点で見る（切り出し後の文面には元の列名が残らない）
-          if (havingStr) this._assertNoAmbiguousColumns(havingStr, aliases);
-          if (qualifyStr) this._assertNoAmbiguousColumns(qualifyStr, aliases);
-          if (orderByStr) this._assertNoAmbiguousColumns(orderByStr, aliases);
+          // SELECT 句の出力名（別名）を集める。別名は「出力の名前」であって列参照では
+          // ないので、曖昧列の検査からは外す。外さないと
+          //   SELECT a.id AS id FROM a JOIN b ... ORDER BY id
+          // のように、結合先と同名の別名を付けただけで「曖昧」と言われていた
+          const selOutNames = new Set();
+          const selExprsOnly = this.splitSelectClause(selectClause).map(p => {
+              const item = p.trim();
+              const am = item.match(/^([\s\S]+?)\s+AS\s+([a-zA-Z0-9_]+|__STR_\d+__)$/i);
+              if (am) { selOutNames.add(am[2].toLowerCase()); return am[1]; }
+              const ba = this._trailingAlias(item);
+              if (ba) { selOutNames.add(String(ba.alias).toLowerCase()); return ba.expr; }
+              return item;
+          });
 
+          // HAVING / QUALIFY / ORDER BY の曖昧な列名も、集計の切り出しで別名へ
+          // 置き換わる前のこの時点で見る（切り出し後の文面には元の列名が残らない）。
+          // これらの句は出力名でも解決できるので、別名は検査対象から外す
+          if (havingStr) this._assertNoAmbiguousColumns(havingStr, aliases, selOutNames);
+          if (qualifyStr) this._assertNoAmbiguousColumns(qualifyStr, aliases, selOutNames);
+          if (orderByStr) this._assertNoAmbiguousColumns(orderByStr, aliases, selOutNames);
+
+          this._assertNoAmbiguousColumns(selExprsOnly.join(', '), aliases);
           // SELECT 句の日付列にも目印を付ける（`hire + 30` を日数加算として畳むため）
-          let selectParts = this.splitSelectClause(this._applyDateColumns(this._assertNoAmbiguousColumns(selectClause, aliases), aliases));
+          let selectParts = this.splitSelectClause(this._applyDateColumns(selectClause, aliases));
           let windowFuncs = [];
 
-          let compiledSelects = selectParts.map((part, partIdx) => {
+          const compileSelectPart = (part, partIdx) => {
               // 別名の切り出し。3 形態を受け付ける:
               //   1. AS <識別子>                     … SELECT id AS x
               //   2. AS "任意の文字列" / 'x'          … 退避済みトークン __STR_n__ を実文字列へ戻す
@@ -1237,6 +1466,15 @@
                   return { type: 'star', exclude: new Set(inner.map(c => c.replace(/^[a-zA-Z0-9_]+\./, '').toLowerCase())) };
               }
 
+              // 式の一部にウィンドウ呼び出しが混じっている項目は、ここで切り分ける。
+              // 下の wfMatch は「項目全体がちょうど 1 つのウィンドウ呼び出し」を前提とした
+              // 正規表現なので、混じった形を渡すと OVER 句の中身を取り違える
+              // （`LAG(v) OVER (ORDER BY id) + LEAD(v) OVER (ORDER BY id)` が 1 つの呼び出しに見える）
+              if (/\bOVER\s*\(/i.test(expr)) {
+                  const wxProbe = this._extractWindowCalls(expr);
+                  if (wxProbe && wxProbe.outer !== '__WCALL_0__') return { type: 'winexpr', alias, rawExpr: expr };
+              }
+
               // ウィンドウ関数の FILTER: AGG(x) FILTER (WHERE cond) OVER (...)。
               // 条件に合わない行を NULL 扱いにすれば、既存のウィンドウ集計がそのまま使える
               // （SUM/AVG/MIN/MAX/COUNT はいずれも NULL を無視する実装のため）。
@@ -1265,10 +1503,20 @@
                   expr = expr.slice(0, keepM.index).trim();
               }
 
-              // 集計の FILTER (WHERE cond) 句を切り出す（末尾）
+              // 集計の FILTER (WHERE cond) 句を切り出す（末尾）。
+              // 貪欲マッチなので `COALESCE(SUM(x) FILTER (WHERE c), -1)` のように
+              // 式の途中にある FILTER まで飲み込みうる。切り出した前半の括弧が
+              // 閉じていなければ「項目そのものの FILTER」ではないので触らない
+              // （その形は集計内包式として _rewriteAggCalls が扱う）
               let filterExpr = null;
-              const filterM = wfFilterExpr ? null : expr.match(/\s+FILTER\s*\(\s*WHERE\s+([\s\S]+)\)\s*$/i);
-              if (filterM) { filterExpr = filterM[1].trim(); expr = expr.slice(0, filterM.index).trim(); }
+              const filterM = wfFilterExpr ? null : this._splitTrailingFilter(expr);
+              // 前半がちょうど 1 つの集計呼び出しのときだけ「この項目自身の FILTER」。
+              // それ以外（ROUND(AVG(x) FILTER (...), 2) や 1 + COUNT(*) FILTER (...)）は
+              // 集計内包式として _rewriteAggCalls にまとめて扱わせる
+              if (filterM && this._isWholeAggCall(filterM.head)) {
+                  filterExpr = filterM.cond;
+                  expr = filterM.head;
+              }
 
               // IGNORE NULLS / RESPECT NULLS（SQL標準・Oracle・BigQuery）:
               // LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE で NULL 行を読み飛ばす
@@ -1309,6 +1557,18 @@
                   }
                   // LAG(expr, offset) / LEAD(expr, offset) のようにカンマ区切り引数を許容
                   let argParts = argStr ? this.splitSelectClause(argStr) : [];
+                  // 引数が要るウィンドウ関数の引数落ちを弾く。NTILE() は黙って
+                  // 「全行が第1バケット」という誤りになり、NTH_VALUE(x) は NULL になっていた
+                  const WIN_ARITY = { NTILE: [1, 1], NTH_VALUE: [2, 2], LAG: [1, 3], LEAD: [1, 3],
+                                      FIRST_VALUE: [1, 1], LAST_VALUE: [1, 1] };
+                  const wa = WIN_ARITY[funcName];
+                  if (wa) {
+                      const n = argParts.filter(p => String(p).trim() !== '').length;
+                      if (n < wa[0] || n > wa[1]) {
+                          throw new Error(`${funcName} takes ${wa[0] === wa[1] ? wa[0] : wa[0] + ' to ' + wa[1]} `
+                              + `argument(s) but ${n} were given.`);
+                      }
+                  }
                   let firstArg = argParts[0] && argParts[0] !== '*' ? argParts[0] : null;
                   // 引数に集計呼び出しが入る形（`SUM(SUM(x)) OVER ()`）は集計後に評価するので、
                   // ここでコンパイルしてはいけない（`COUNT(*)` が JS の構文エラーになる）。
@@ -1317,6 +1577,11 @@
                   let argFunc = (firstArg && !argHasAgg) ? this.compileCondition(firstArg, strMap) : null;
                   let argOffset = argParts.length > 1 ? parseInt(argParts[1], 10) : 1;
                   if (isNaN(argOffset)) argOffset = 1;
+                  // LAG/LEAD の第3引数は「行が無かったときに返す既定値」。式として評価する
+                  // （書かれていなければ NULL）。無視すると範囲外の行が黙って NULL になる
+                  const argDefaultExpr = (funcName === 'LAG' || funcName === 'LEAD') && argParts.length > 2
+                      ? argParts[2].trim() : null;
+                  const argDefaultFunc = argDefaultExpr ? this.compileCondition(argDefaultExpr, strMap) : null;
                   // PERCENTILE_CONT(e, p) / PERCENTILE_DISC(e, p) は WITHIN GROUP の正規化後の形。
                   // 第2引数が分位点なので、行オフセットではなくそちらとして読む
                   let percentileP = 0.5;
@@ -1382,9 +1647,16 @@
                   // PARTITION BY / ORDER BY にも集計呼び出しが来得るので、同じ理由で先送りする
                   const hasAggIn = (t) => new RegExp('\\b(?:' + LUMINA_AGG_NAMES + ')\\s*\\(', 'i').test(t);
                   let pFuncs = partitionCols.map(c => hasAggIn(c) ? null : this.compileCondition(c, strMap));
+                  // OVER (ORDER BY ...) の各項目は「式 [ASC|DESC] [NULLS FIRST|LAST]」。
+                  // 空白で切って先頭語を式と見なしていたため、空白を含む式
+                  // （CAST(x AS TEXT) / CASE ... END / a + b）が途中で切れて
+                  // 「括弧が閉じていない」という的外れなエラーになっていた
                   let oFuncs = orderCols.map(s => {
-                      let p = s.trim().split(/\s+/);
-                      return { eval: hasAggIn(p[0]) ? null : this.compileCondition(p[0], strMap), desc: p[1] && p[1].toUpperCase() === 'DESC' };
+                      const m = String(s).trim().match(
+                          /^([\s\S]+?)(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?$/i);
+                      const body = (m ? m[1] : String(s)).trim();
+                      const desc = !!(m && m[2] && m[2].toUpperCase() === 'DESC');
+                      return { eval: hasAggIn(body) ? null : this.compileCondition(body, strMap), desc };
                   });
 
                   // RANGE / GROUPS はピア判定に ORDER BY を要する。数値オフセット指定は
@@ -1425,7 +1697,8 @@
                   }
                   // 集計と併用された場合は「集計後の行」に対して評価し直すため、
                   // 引数・PARTITION BY・ORDER BY の原文も保持しておく
-                  windowFuncs.push({ wfId, funcName, argFunc, argOffset, percentileP, nthFromLast, pFuncs, oFuncs, frame, ignoreNulls: wfIgnoreNulls,
+                  windowFuncs.push({ wfId, funcName, argFunc, argOffset, argDefaultFunc, argDefaultExpr,
+                      percentileP, nthFromLast, pFuncs, oFuncs, frame, ignoreNulls: wfIgnoreNulls,
                       srcArg: firstArg, srcPartition: partitionCols.slice(),
                       srcOrder: orderCols.map(s => {
                           const p = s.trim();
@@ -1452,10 +1725,12 @@
                   }
               }
               if (filterExpr) throw new Error("FILTER (WHERE ...) is only supported on aggregate functions.");
-              // ここまで来て OVER が残っているのは「式の途中にウィンドウ関数を書いた」形。
-              // 素通しすると JS の構文エラーか、集計内包式として OVER を落とした誤った値になる
+              // ここまで来て OVER が残っているのは「式の途中にウィンドウ関数を書いた」形
+              // （val - LAG(val) OVER (ORDER BY id) など）。ウィンドウ呼び出しを隠し列へ
+              // 切り出し、外側の式はその値と元の列を使って行ごとに評価する（type: 'winexpr'）。
+              // 実際の切り出しは compiledSelects が揃ったあとの後段で行う
               if (/\bOVER\s*\(/i.test(expr) || /__OVER_\d+__/.test(expr)) {
-                  throw new Error("A window function must be the whole select item (optionally with an alias). Compute it in a subquery, then apply the surrounding expression to the result.");
+                  return { type: 'winexpr', alias, rawExpr: expr };
               }
               // 集計を内包した式（ROUND(AVG(x), 2) / 100.0 * SUM(a) / SUM(b) 等）は
               // 「集計そのもの」ではないので、集計を隠し列へ切り出したうえで
@@ -1467,7 +1742,39 @@
               }
               let evalFunc = this.compileCondition(expr, strMap);
               return { type: 'expr', evalFunc, alias, rawExpr: expr };
-          });
+          };
+          let compiledSelects = selectParts.map(compileSelectPart);
+
+          // ウィンドウ内包式: 式の一部に書かれたウィンドウ呼び出しを別の項目として
+          // コンパイルし（windowFuncs へ登録され、行ポインタに値が載る）、外側の式は
+          // その値を疑似列 __wf_N として参照する形へ書き換える。
+          // 集計と混ざった形（SUM(x) - LAG(SUM(x)) OVER ()）は評価の段が違うので従来どおり断る
+          const WINEXPR_MSG = "A window function must be the whole select item (optionally with an alias). " +
+              "Compute it in a subquery, then apply the surrounding expression to the result.";
+          const winExprSels = compiledSelects.filter(s => s.type === 'winexpr');
+          if (winExprSels.length > 0) {
+              if (groupByStr || compiledSelects.some(s => s.type === 'agg' || s.type === 'aggexpr')) {
+                  throw new Error(WINEXPR_MSG);
+              }
+              let extraIdx = selectParts.length;
+              winExprSels.forEach(sel => {
+                  const ex = this._extractWindowCalls(sel.rawExpr);
+                  if (!ex) throw new Error(WINEXPR_MSG);
+                  // ウィンドウ呼び出しを抜いたあとにも集計が残るなら、評価の段が違うので断る
+                  if (AGG_ANYWHERE.test(ex.outer)) throw new Error(WINEXPR_MSG);
+                  let outer = ex.outer;
+                  sel.wfIds = [];
+                  ex.calls.forEach((callText, i) => {
+                      const idx = extraIdx++;
+                      const compiled = compileSelectPart(callText, idx);   // windowFuncs への登録が目的
+                      if (!compiled || compiled.type !== 'window') throw new Error(WINEXPR_MSG);
+                      sel.wfIds.push(compiled.wfId);
+                      outer = outer.split(`__WCALL_${i}__`).join(compiled.wfId);
+                  });
+                  sel.evalStr = outer;
+                  sel.evalFunc = this.compileCondition(outer, strMap);
+              });
+          }
 
           // 集計内包式: 集計呼び出しを隠し列 __se_N へ書き換え、残った式を
           // 集計後の行（__se_N を列として持つ）に対して評価する文字列として保持する
@@ -1506,7 +1813,8 @@
                   // 対して評価されるものなので、基底表の行では解決できない。
                   // 中の集計呼び出しは別途 type:'agg' として展開されており、
                   // その argFunc をここで検査するので typo は取り逃さない
-                  if (sel.type !== 'aggexpr') validate(sel.evalFunc);
+                  // 'winexpr' の外側の式も疑似列 __wf_N を参照するので同じ理由で外す
+                  if (sel.type !== 'aggexpr' && sel.type !== 'winexpr') validate(sel.evalFunc);
                   validate(sel.argFunc);
                   validate(sel.argFunc2);
                   (sel.argFuncs || []).forEach(validate);
@@ -1525,16 +1833,23 @@
               postAggWindows = windowFuncs.map(wf => {
                   // 既定フレーム（implicit）は「書かれていない」のと同じ扱いにする。
                   // GROUP BY の結果は 1 グループ 1 行なのでピアが生じず、
-                  // RANGE ... CURRENT ROW と行単位の累積は一致する
-                  if (wf.frame && !wf.frame.implicit) {
-                      throw new Error("Explicit window frames (ROWS/RANGE/GROUPS) are not supported over GROUP BY results. Use a subquery.");
+                  // RANGE ... CURRENT ROW と行単位の累積は一致する。
+                  // 明示フレームは ROWS（EXCLUDE 無し）だけ受ける — 行の並びだけで決まるので
+                  // 集計後の行に対しても同じ意味になる。RANGE / GROUPS はピア判定が要るので断る
+                  if (wf.frame && !wf.frame.implicit &&
+                      (wf.frame.unit !== 'ROWS' || (wf.frame.exclude && wf.frame.exclude !== 'NO OTHERS'))) {
+                      throw new Error("RANGE / GROUPS window frames are not supported over GROUP BY results " +
+                                      "(ROWS frames are). Compute it in a subquery.");
                   }
-                  const conv = (text) => this._rewriteAggCalls(text, compiledSelects, strMap, '__wa_').trim();
+                  const conv = (text) => this._aliasBareCols(
+                      this._rewriteAggCalls(text, compiledSelects, strMap, '__wa_').trim(), compiledSelects, strMap);
                   const outSel = compiledSelects.find(cs => cs.type === 'window' && cs.wfId === wf.wfId);
                   return {
                       wfId: wf.wfId, alias: outSel ? outSel.alias : wf.wfId, funcName: wf.funcName,
                       argExpr: wf.srcArg ? conv(wf.srcArg) : null,
                       argOffset: wf.argOffset,
+                      frame: (wf.frame && !wf.frame.implicit) ? wf.frame : null,
+                      argDefaultExpr: wf.argDefaultExpr ? conv(wf.argDefaultExpr) : null,
                       ignoreNulls: wf.ignoreNulls,
                       partExprs: (wf.srcPartition || []).map(conv),
                       orderSpecs: (wf.srcOrder || []).map(o => ({ expr: conv(o.expr), desc: o.desc }))
@@ -1779,13 +2094,15 @@
                               val = best;
                           } else if (wf.funcName === 'LAG' || wf.funcName === 'LEAD') {
                               const back = wf.funcName === 'LAG';
+                              // 対象行がパーティションの外なら第3引数の既定値（無ければ NULL）
+                              const outOfRange = () => wf.argDefaultFunc ? wf.argDefaultFunc(ptr, this.tables, aliases) : null;
                               if (wf.ignoreNulls && wf.argFunc) {
                                   // NULL 行を数えずに argOffset 件ぶん遡る / 進む
                                   let need = wf.argOffset, i2 = idx;
-                                  val = null;
+                                  val = outOfRange();
                                   while (need > 0) {
                                       i2 = back ? i2 - 1 : i2 + 1;
-                                      if (i2 < 0 || i2 >= pRows.length) { val = null; break; }
+                                      if (i2 < 0 || i2 >= pRows.length) { val = outOfRange(); break; }
                                       const cand = wf.argFunc(pRows[i2], this.tables, aliases);
                                       if (cand === null || cand === undefined) continue;
                                       need--;
@@ -1795,7 +2112,7 @@
                                   const tIdx = back ? idx - wf.argOffset : idx + wf.argOffset;
                                   val = (tIdx >= 0 && tIdx < pRows.length && wf.argFunc)
                                       ? wf.argFunc(pRows[tIdx], this.tables, aliases)
-                                      : null;
+                                      : outOfRange();
                               }
                           } else if (wf.funcName === 'NTILE') {
                               // NTILE(n): パーティションを n 個のバケットへ等分割（先頭側を大きく）
@@ -1920,7 +2237,10 @@
                                   const g = x.trim().match(/^\(([\s\S]*)\)$/);
                                   return (g ? this.splitSelectClause(g[1]) : [x]).map(y => y.trim()).filter(y => y !== '');
                               });
-                              if (cols.length === 0) throw new Error(`${kind} requires at least one grouping item.`);
+                              // ROLLUP() / CUBE() のように中身が空の形は無効（GROUPING SETS (()) とは別）
+                              if (cols.length === 0 || cols.every(g => g.length === 0)) {
+                                  throw new Error(`${kind} requires at least one grouping item.`);
+                              }
                               if (kind === 'ROLLUP') {
                                   // 接頭辞集合: (a,b) -> {a,b}, {a}, {}
                                   for (let n = cols.length; n >= 0; n--) {
@@ -1950,9 +2270,16 @@
                           }
                       };
                       this.splitSelectClause(gsM[1]).forEach(part => expandItem(part.trim(), sets));
-                      if (allItems.length === 0) throw new Error("GROUPING SETS requires at least one grouping item.");
-                      groupByEff = allItems.join(', ');
-                      groupingSetsSpec = sets;
+                      if (sets.length === 0) throw new Error("GROUPING SETS requires at least one grouping item.");
+                      if (allItems.length === 0) {
+                          // GROUPING SETS (()) だけ = 空のグループ化キー。
+                          // 全行をひとまとめにした 1 行（総計）と同じなので GROUP BY を外す
+                          groupByEff = null;
+                          groupingSetsSpec = null;
+                      } else {
+                          groupByEff = allItems.join(', ');
+                          groupingSetsSpec = sets;
+                      }
                   }
               }
           }
@@ -2529,6 +2856,18 @@
                           put(sel.alias, sel.evalFunc(ptr, this.tables, aliases));
                       } else if (sel.type === 'window') {
                           put(sel.alias, ptr[sel.wfId]);
+                      } else if (sel.type === 'winexpr') {
+                          // ウィンドウの結果を疑似表 __winvals の列として見せ、
+                          // 外側の式が元の列と一緒に参照できるようにする
+                          const vals = Object.create(null), cols = Object.create(null);
+                          sel.wfIds.forEach(id => { vals[id] = ptr[id]; cols[id] = true; });
+                          const ptrs2 = Object.assign(Object.create(null), ptr);
+                          ptrs2['__winvals'] = 0;
+                          const dbs2 = Object.assign(Object.create(null), this.tables);
+                          dbs2['__winvals'] = { cols, getValue: (c) => vals[c] };
+                          const als2 = Object.assign(Object.create(null), aliases);
+                          als2['__winvals'] = '__winvals';
+                          put(sel.alias, sel.evalFunc(ptrs2, dbs2, als2));
                       }
                   });
                   obAttach.forEach(a => {
@@ -2613,6 +2952,15 @@
                       const colName = item.expr.replace(/^[a-zA-Z0-9_]+\./, '');
                       const actualKey = Object.keys(resultSet[0]).find(k => k.toLowerCase() === colName.toLowerCase());
                       if (actualKey) return { col: actualKey, desc: item.desc, nulls: item.nulls, coll: outColls[actualKey.toLowerCase()] || this._collationOfExpr(item.expr, aliases) };
+                      // 出力名が別名で置き換わっている場合（SELECT region AS k ... ORDER BY region）。
+                      // GROUP BY 後の行には元の列が残っていないので、SELECT 句の元の式が
+                      // 同じ列を指している項目の別名へ読み替える
+                      const bySrc = compiledSelects.find(cs => cs.alias && typeof cs.rawExpr === 'string' &&
+                          cs.rawExpr.replace(/^[a-zA-Z0-9_]+\./, '').toLowerCase() === colName.toLowerCase());
+                      if (bySrc) {
+                          const aliasKey = Object.keys(resultSet[0]).find(k => k.toLowerCase() === String(bySrc.alias).toLowerCase());
+                          if (aliasKey) return { col: aliasKey, desc: item.desc, nulls: item.nulls, coll: outColls[aliasKey.toLowerCase()] || this._collationOfExpr(item.expr, aliases) };
+                      }
                   }
                   // 行ポインタ段階で評価済みの式（未選択列を含む）
                   if (item.attachKey) return { col: item.attachKey, desc: item.desc, nulls: item.nulls, coll: this._collationOfExpr(item.expr, aliases) };
@@ -2729,6 +3077,28 @@
               if (hidden.length > 0) resultSet.forEach(row => hidden.forEach(k => { delete row[k]; }));
           }
 
-          return { data: resultSet, affectedRows: resultSet.length };
+          // 0 件でも「どんな列を返す問い合わせだったか」を伝える。派生表として
+          // 実体化するとき、行が無いと列まで消えて `SELECT SUM(v) FROM (... WHERE 偽) t` が
+          // 「列 v が無い」になっていた
+          let outCols = resultSet.length > 0 ? Object.keys(resultSet[0]) : null;
+          if (!outCols) {
+              outCols = [];
+              compiledSelects.forEach(sel => {
+                  if (sel.type === 'star') {
+                      for (const al of Object.keys(aliases)) {
+                          if (sel.only && al.toLowerCase() !== sel.only) continue;
+                          const tb = this.tables[aliases[al]];
+                          if (!tb) continue;
+                          tb.getColumnNames().forEach(c => {
+                              if (sel.exclude && sel.exclude.has(c.toLowerCase())) return;
+                              if (!outCols.includes(c)) outCols.push(c);
+                          });
+                      }
+                  } else if (sel.alias && !outCols.includes(sel.alias)) {
+                      outCols.push(sel.alias);
+                  }
+              });
+          }
+          return { data: resultSet, affectedRows: resultSet.length, columns: outCols };
       }
     });

@@ -1947,7 +1947,9 @@
           const res = this.executeQuery(selectSql, true, strMap);
           if (res.error) throw new Error(res.error);
           this._logCreateTable(newName);
-          this._materializeRows(newName, res.data);
+          // 0 行でも列名は伝える（列の無い表ができるのを防ぐ）
+          this._materializeRows(newName, res.data,
+              (!res.data || res.data.length === 0) ? (res.columns || null) : null);
           return { data: [{ Result: "Success", Message: `Table '${newName}' created with ${res.data.length} rows.` }], affectedRows: res.data.length };
       },
 
@@ -2461,7 +2463,8 @@
              }
 
              // CREATE TABLE ... [AS] SELECT (CTAS): SELECT 結果からテーブルを作成（AS は省略可）
-             const ctasM = sql.match(/^create\s+(?:(?:global|local)\s+)?(temp(?:orary)?\s+)?table\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+(?:as\s+)?(select\s[\s\S]+?)(\s+with\s+(?:no\s+)?data)?$/i);
+             // 本体は SELECT のほか WITH ... SELECT（CTE 付き）も受ける
+             const ctasM = sql.match(/^create\s+(?:(?:global|local)\s+)?(temp(?:orary)?\s+)?table\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+(?:as\s+)?((?:select|with)\s[\s\S]+?)(\s+with\s+(?:no\s+)?data)?$/i);
              if (ctasM) {
                 const isTempFlag = !!ctasM[1];
                 const ifNotExists = !!ctasM[2];
@@ -2480,6 +2483,10 @@
                 const t = new Table();
                 if (withNoData && subRes.data && subRes.data.length > 0) {
                     Object.keys(subRes.data[0]).forEach(k => t.addColumn(k));
+                } else if ((!subRes.data || subRes.data.length === 0) && subRes.columns) {
+                    // 0 行でも列は作る。従来は列すら無い表ができてしまい、
+                    // 直後の SELECT が「列が見つからない」で落ちていた
+                    subRes.columns.forEach(k => t.addColumn(k));
                 } else if (subRes.data && subRes.data.length > 0) {
                     const keys = Object.keys(subRes.data[0]);
                     keys.forEach(k => t.addColumn(k));
@@ -2757,6 +2764,16 @@
 
                 const aiCols = colDefs.filter(c => c.autoInc);
                 if (aiCols.length > 1) throw new Error("Multiple AUTO_INCREMENT columns are not allowed.");
+                // 同じ列名を二度書いても addColumn が二度目を黙って捨てるため、
+                // 宣言した列数より少ない表が「成功」で作られていた
+                {
+                    const seen = Object.create(null);
+                    for (const cd of colDefs) {
+                        const k = String(cd.name).toLowerCase();
+                        if (seen[k]) throw new Error(`Duplicate column name '${cd.name}'.`);
+                        seen[k] = true;
+                    }
+                }
 
                 const t = new Table();
                 colDefs.forEach(cd => t.addColumn(cd.name, cd.type));

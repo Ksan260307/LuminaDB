@@ -54,7 +54,10 @@
       push('V23Cast pg operator with modifier', "SELECT 3.14159::numeric(6,2) AS s", r => r.data[0].s === 3.14);
       push('V23Cast inside aggregate', "SELECT SUM(CAST(age AS DECIMAL(10,2))) AS s FROM users", r => r.data[0].s === 291);
       push('V23Cast null stays null', "SELECT CAST(NULL AS DECIMAL(10,2)) AS s", r => r.data[0].s === null);
-      push('V23Cast unknown type passthrough', "SELECT CAST(7 AS WIDGET) AS s", r => r.data[0].s === 7);
+      // v1.30: 知らない型名は素通しせず拒否する。素通しだと CAST(x AS INTEGR) の
+      // ような綴り違いが「変換したつもり」で成功してしまう
+      T.push({ name: 'V23Cast unknown type rejected', sql: "SELECT CAST(7 AS WIDGET) AS s",
+               isErrorExpected: true, check: r => !!r.error && r.error.includes("Unknown type 'WIDGET'") });
 
       // ============================================================
       // 2. IS [NOT] TRUE / FALSE
