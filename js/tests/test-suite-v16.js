@@ -13,9 +13,8 @@
     //   test-suite.js の tests 配列へ getV16Tests() のスプレッドで合流する
     // ============================================================================
     function getV16Tests() {
-      const T = [];
-      const push = (name, sql, check) => T.push({ name, sql, check });
-      const approx = (a, b) => a != null && Math.abs(a - b) < 1e-6;
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, check: push, approx } = makeTestKit('V16');
       // v1.27 で AVG は倍精度のまま返すようになった（以前は小数2桁へ丸めていた）。
       // avgF = 素の AVG の期待値 / avg2 = ROUND(AVG(x), 2) の期待値
       const avgF = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;

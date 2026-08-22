@@ -53,10 +53,10 @@
             // u1: amount 1+1=2 / u2: 2 / u5: 注文なし → 本エンジンの SUM は空集合で 0 を返す
             return !r.error && v.data[0].total === 2 && v.data[1].total === 2 && v.data[2].total === 0;
         }},
-        { name: "V3Corr: Correlated In From Rejected", sql: "SELECT * FROM (SELECT o.user_id FROM orders o WHERE o.user_id = users.id) t", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('not supported in FROM/JOIN') },
-        { name: "V3Corr: Nested Correlated Rejected", sql: "SELECT COUNT(*) AS c FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND EXISTS (SELECT 1 FROM products p WHERE p.id = o.product_id))", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Nested correlated') },
-        { name: "V3Corr: Ambiguous Self Compare Still Rejected", sql: "SELECT 1 AS x WHERE EXISTS (SELECT 1 FROM users WHERE id = id)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('ambiguous') },
-        { name: "V3Corr: Correlated In Having Rejected", sql: "SELECT age, COUNT(*) AS c FROM users GROUP BY age HAVING (SELECT MAX(o.amount) FROM orders o WHERE o.user_id = age) > 0", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("V3Corr: Correlated In From Rejected", "SELECT * FROM (SELECT o.user_id FROM orders o WHERE o.user_id = users.id) t", 'not supported in FROM/JOIN'),
+        errCase("V3Corr: Nested Correlated Rejected", "SELECT COUNT(*) AS c FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND EXISTS (SELECT 1 FROM products p WHERE p.id = o.product_id))", 'Nested correlated'),
+        errCase("V3Corr: Ambiguous Self Compare Still Rejected", "SELECT 1 AS x WHERE EXISTS (SELECT 1 FROM users WHERE id = id)", 'ambiguous'),
+        errCase("V3Corr: Correlated In Having Rejected", "SELECT age, COUNT(*) AS c FROM users GROUP BY age HAVING (SELECT MAX(o.amount) FROM orders o WHERE o.user_id = age) > 0"),
         { name: "V3Corr: Comma Join Inside Subquery Not Correlated", sql: "SELECT COUNT(*) AS c FROM users WHERE id IN (SELECT o.user_id FROM orders o, products p WHERE o.product_id = p.id)", check: r => r.data[0].c === 4 },
         { name: "V3Corr: Multiple Refs Same Row", sql: "SELECT COUNT(*) AS c FROM orders o1 WHERE EXISTS (SELECT 1 FROM orders o2 WHERE o2.user_id = o1.user_id AND o2.order_id <> o1.order_id)", check: r => r.data[0].c === 2 },
 
@@ -79,10 +79,10 @@
             db.executeQuery("DROP TABLE v3edge");
             return !r.error && r.data[0].c === 2;
         }},
-        { name: "V3Rec: Union All Runaway Capped", sql: "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n FROM r) SELECT COUNT(*) AS c FROM r", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('exceeded 500 iterations') },
+        errCase("V3Rec: Union All Runaway Capped", "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n FROM r) SELECT COUNT(*) AS c FROM r", 'exceeded 500 iterations'),
         { name: "V3Rec: Column Realignment", sql: "WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT seq.n + 1 AS other FROM seq WHERE seq.n < 3) SELECT MAX(n) AS m FROM seq", check: r => r.data[0].m === 3 },
         { name: "V3Rec: Anchor Only No Self Ref", sql: "WITH RECURSIVE x AS (SELECT 42 AS v) SELECT v FROM x", check: r => r.data[0].v === 42 },
-        { name: "V3Rec: Missing Anchor Rejected", sql: "WITH RECURSIVE r AS (SELECT n + 1 AS n FROM r) SELECT * FROM r", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('anchor') },
+        errCase("V3Rec: Missing Anchor Rejected", "WITH RECURSIVE r AS (SELECT n + 1 AS n FROM r) SELECT * FROM r", 'anchor'),
         { name: "V3Rec: Join With Main Query", sql: "WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq WHERE n < 3) SELECT COUNT(*) AS c FROM users u JOIN seq s ON u.id = s.n", check: r => r.data[0].c === 3 },
         { name: "V3Rec: Non-Recursive WITH Unaffected", sql: "WITH a AS (SELECT id FROM users WHERE id <= 3) SELECT COUNT(*) AS c FROM a", check: r => r.data[0].c === 3 },
 
@@ -131,7 +131,7 @@
             db.executeQuery("DROP TABLE v3gb");
             return !r.error && r.data.length === 2 && r.data[0].k === 'x1' && r.data[0].c === 2 && r.data[1].k === 'y2' && r.data[1].c === 1;
         }},
-        { name: "V3Grp: Ordinal Out Of Range Rejected", sql: "SELECT age FROM users GROUP BY 5", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('out of range') },
+        errCase("V3Grp: Ordinal Out Of Range Rejected", "SELECT age FROM users GROUP BY 5", 'out of range'),
         { name: "V3Grp: Real Column Preferred Over Alias", sql: "SELECT age AS name, COUNT(*) AS c FROM users GROUP BY name", check: r => r.data.length === 10 },
 
         // ============================================================
@@ -219,10 +219,10 @@
         // ============================================================
         { name: "V3Cmp: Create With Composite PK", sql: "CREATE TABLE v3cmp (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b))", check: r => r.data[0].Result === "Success" },
         { name: "V3Cmp: Distinct Tuples Insert OK", sql: "INSERT INTO v3cmp (a, b, v) VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z')", check: r => r.data[0].Message.includes('3') },
-        { name: "V3Cmp: Duplicate Tuple Rejected", sql: "INSERT INTO v3cmp (a, b, v) VALUES (1, 2, 'dup')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('PRIMARY KEY constraint failed') },
-        { name: "V3Cmp: NULL In Composite PK Rejected", sql: "INSERT INTO v3cmp (a, b, v) VALUES (3, NULL, 'n')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('NOT NULL') },
-        { name: "V3Cmp: Batch Internal Duplicate Rejected", sql: "INSERT INTO v3cmp (a, b, v) VALUES (5, 5, 'p'), (5, 5, 'q')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('constraint failed') },
-        { name: "V3Cmp: Update Into Conflict Rejected", sql: "UPDATE v3cmp SET b = 2 WHERE a = 1 AND b = 1", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('PRIMARY KEY constraint failed') },
+        errCase("V3Cmp: Duplicate Tuple Rejected", "INSERT INTO v3cmp (a, b, v) VALUES (1, 2, 'dup')", 'PRIMARY KEY constraint failed'),
+        errCase("V3Cmp: NULL In Composite PK Rejected", "INSERT INTO v3cmp (a, b, v) VALUES (3, NULL, 'n')", 'NOT NULL'),
+        errCase("V3Cmp: Batch Internal Duplicate Rejected", "INSERT INTO v3cmp (a, b, v) VALUES (5, 5, 'p'), (5, 5, 'q')", 'constraint failed'),
+        errCase("V3Cmp: Update Into Conflict Rejected", "UPDATE v3cmp SET b = 2 WHERE a = 1 AND b = 1", 'PRIMARY KEY constraint failed'),
         { name: "V3Cmp: Update To Free Slot OK", sql: "UPDATE v3cmp SET b = 9 WHERE a = 2 AND b = 1", check: r => r.data[0].Message.includes('1 rows updated') },
         { name: "V3Cmp: REPLACE On Composite Conflict", fn: () => {
             const r = db.executeQuery("REPLACE INTO v3cmp (a, b, v) VALUES (1, 2, 'replaced')");

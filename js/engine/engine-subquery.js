@@ -1,6 +1,10 @@
     // ============================================================================
     // [DatabaseEngine Subquery] - サブクエリ / ビュー展開 / UNION 処理
     // ============================================================================
+    // 派生表の直後に来ても「別名」ではない語（句のキーワード）。
+    // これを別名と読むと、続く括弧を派生表の列リストと取り違える
+    const LUMINA_NOT_ALIAS_AFTER_FROM = /^(where|group|order|having|limit|offset|union|intersect|except|minus|join|inner|left|right|full|cross|natural|on|using|qualify|window|fetch|for|returning|set|values|pivot|unpivot|apply|lateral)$/i;
+
     Object.assign(DatabaseEngine.prototype, {
 
       findInnerSubquery(sql) {
@@ -30,10 +34,22 @@
               'and', 'or', 'not', 'in', 'exists', 'between', 'like', 'is', 'null', 'true', 'false',
               'case', 'when', 'then', 'else', 'end', 'distinct', 'by', 'asc', 'desc', 'over', 'partition']);
           const defined = new Set();
+          // 句の区切りではない FROM（`IS [NOT] DISTINCT FROM` / `EXTRACT(YEAR FROM x)` /
+          // `SUBSTRING(s FROM n FOR m)` / `TRIM(BOTH ' ' FROM s)` / `NTH_VALUE(...) FROM LAST`）を
+          // 空白へ均してから走査する。均さないと直後の識別子を「定義済みの表」と誤認し、
+          // `WHERE x.v IS NOT DISTINCT FROM e.v` の e が定義済み扱いになって
+          // 相関サブクエリが非相関として実行され、「列 e.v が見つかりません」になっていた。
+          // 長さを変えない置換なので、後段の位置計算には影響しない
+          const blank = (mm) => ' '.repeat(mm.length);
+          const scanSql = String(subSql)
+              .replace(/\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\b/gi, blank)
+              .replace(/\b(?:EXTRACT|SUBSTRING|SUBSTR|TRIM|OVERLAY|POSITION)\s*\((?:[^()]|\([^()]*\))*\)/gi,
+                       (call) => call.replace(/\bFROM\b/gi, blank))
+              .replace(/\)\s+FROM\s+(?:FIRST|LAST)\b/gi, blank);
           // FROM 直後のカンマ区切り（暗黙の直積結合）も定義済みテーブルとして扱う
           const fromRe = /\b(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?((?:\s*,\s*[a-zA-Z0-9_]+(?:\s+(?:AS\s+)?[a-zA-Z_][a-zA-Z0-9_]*)?)*)/gi;
           let m;
-          while ((m = fromRe.exec(subSql))) {
+          while ((m = fromRe.exec(scanSql))) {
               defined.add(m[1].toLowerCase());
               if (m[2] && !keywords.has(m[2].toLowerCase())) defined.add(m[2].toLowerCase());
               if (m[3]) {
@@ -196,7 +212,12 @@
                   let after = expandedSql.slice(match.end + 1);
                   let colNames = null;
                   const alM = after.match(/^\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\)/i);
-                  if (alM) {
+                  // 別名になり得ない語（句のキーワード）を別名と取り違えないこと。
+                  // ビューを展開した `FROM (SELECT ...) WHERE (g, v) IN (...)` で
+                  // 'WHERE' を別名・`(g, v)` を列リストと読んで壊れていた
+                  if (alM && LUMINA_NOT_ALIAS_AFTER_FROM.test(alM[1])) {
+                      // 別名ではないので触らない
+                  } else if (alM) {
                       colNames = alM[2].split(',').map(c => c.trim().toLowerCase());
                       after = ` ${alM[1]}` + after.slice(alM[0].length);
                   }
@@ -282,7 +303,7 @@
               let after = sql.slice(close + 1);
               let alias = null, colNames = null;
               const alM = after.match(/^\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\))?/i);
-              if (alM) {
+              if (alM && !LUMINA_NOT_ALIAS_AFTER_FROM.test(alM[1])) {
                   alias = alM[1];
                   if (alM[2]) colNames = alM[2].split(',').map(c => c.trim().toLowerCase());
                   after = after.slice(alM[0].length);
@@ -481,7 +502,7 @@
           if (!cbCond) throw new Error("Syntax Error in CONNECT BY.");
 
           // 「PRIOR <列> = <列>」を 1 本取り出し、残りは候補行だけで判定できるフィルタにする
-          const parts = this._splitTopLevelAnd(cbCond).map(p => p.replace(/^\((.*)\)$/s, '$1'));
+          const parts = this._splitConnectByAnd(cbCond).map(p => p.replace(/^\((.*)\)$/s, '$1'));
           let priorCol = null, childCol = null;
           const extra = [];
           parts.forEach(p => {
@@ -635,8 +656,14 @@
           return `SELECT ${sel} FROM ${tmpName}${rest.replace(/\s+/g, ' ').trimEnd()}`;
       },
 
-      // AND で区切られたトップレベルの条件へ分割する（括弧の内側は保護する）
-      _splitTopLevelAnd(text) {
+      // CONNECT BY の条件を AND で区切る（括弧の内側は保護する）。
+      // かつて `_splitTopLevelAnd` という名前で定義しており、engine-expression.js の
+      // 同名メソッドを**後から読み込まれる側として上書き**していた。そのため述語の
+      // 押し下げが「深さ 0 の OR があれば分割しない」という保護を失い、
+      //   WHERE 基底表の条件 AND 結合先の条件 OR 別条件
+      // で基底表の条件だけが結合前に適用されて行が黙って消えていた。
+      // 用途ごとに名前を分けてある（こちらは CONNECT BY 専用）
+      _splitConnectByAnd(text) {
           const out = [];
           let depth = 0, start = 0;
           const s = text;
@@ -1331,6 +1358,39 @@
           // FROM/JOIN の CTE 参照を一時テーブルへ置換する。明示エイリアスが無い場合は
           // CTE名をエイリアスとして付与し、`cte名.列` の修飾参照を解決可能にする
           const followKeywords = new Set(['where', 'group', 'order', 'limit', 'offset', 'having', 'join', 'left', 'right', 'inner', 'cross', 'on', 'union', 'intersect', 'except', 'set']);
+          // FROM 句をカンマで並べる書き方（`FROM t, cte c`）でも CTE を解決する。
+          // FROM の次に来る句キーワードまでを FROM 句とみなし、その範囲のカンマ区切り
+          // 項目だけを置換する（SELECT 句や GROUP BY のカンマには反応しない）。
+          // 以前は `FROM|JOIN` の直後だけを見ていたため、カンマ結合で書くと
+          // 「Join Table 'a' not found」になっていた
+          const clauseEnd = /^\s+(where|group|having|order|limit|offset|union|intersect|except|window|qualify|join|left|right|inner|cross|natural|full|set|returning|using|on)\b/i;
+          const replaceCommaRefs = (text) => {
+              const names = Object.keys(cteMap);
+              if (names.length === 0) return text;
+              const itemRe = new RegExp(`(,\\s*)(${names.join('|')})\\b(\\s+(?:AS\\s+)?([a-zA-Z0-9_]+))?`, 'gi');
+              const fromRe = /\bFROM\s+/gi;
+              let out = '', last = 0, m;
+              while ((m = fromRe.exec(text)) !== null) {
+                  const start = m.index + m[0].length;
+                  let d = 0, j = start;
+                  for (; j < text.length; j++) {
+                      const c = text[j];
+                      if (c === '(') { d++; continue; }
+                      if (c === ')') { if (d === 0) break; d--; continue; }
+                      if (d === 0 && /\s/.test(c) && clauseEnd.test(text.slice(j))) break;
+                  }
+                  out += text.slice(last, start) + text.slice(start, j).replace(itemRe,
+                      (mm, comma, name, aliasPart, aliasWord) => {
+                          const tmp = cteMap[name.toLowerCase()];
+                          if (!tmp) return mm;
+                          if (aliasWord && !followKeywords.has(aliasWord.toLowerCase())) return `${comma}${tmp}${aliasPart}`;
+                          return `${comma}${tmp} ${name}${aliasPart || ''}`;
+                      });
+                  last = j;
+                  fromRe.lastIndex = j;
+              }
+              return out + text.slice(last);
+          };
           const replaceRefs = (text) => {
               for (const n in cteMap) {
                   text = text.replace(new RegExp(`\\b(FROM|JOIN)\\s+${n}\\b(\\s+(?:AS\\s+)?([a-zA-Z0-9_]+))?`, 'gi'), (m, kw, aliasPart, aliasWord) => {
@@ -1340,7 +1400,7 @@
                       return `${kw} ${cteMap[n]} ${n}${aliasPart || ''}`;
                   });
               }
-              return text;
+              return replaceCommaRefs(text);
           };
           while (true) {
               // 列リスト付きの WITH name(col1, col2) AS ( ... ) にも対応する。

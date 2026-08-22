@@ -5,15 +5,16 @@
     // SHOW FUNCTIONS 用の関数レジストリ（カテゴリ -> 空白区切りの関数名）。
     // エンジンへ関数を追加したらここにも登録する
     const LUMINA_FN_REGISTRY = {
-        'String': 'UPPER LOWER LENGTH LEN CHAR_LENGTH CHARACTER_LENGTH OCTET_LENGTH BIT_LENGTH CONCAT CONCAT_WS SUBSTRING SUBSTR MID SUBSTRING_INDEX LEFT RIGHT LPAD RPAD TRIM LTRIM RTRIM REPLACE REPLICATE REVERSE REPEAT INSTR STRPOS LOCATE POSITION CHARINDEX PATINDEX ASCII CHAR CHR SPACE STRCMP ELT FIELD INITCAP UCASE LCASE FORMAT HEX UNHEX BIN OCT CONV QUOTE QUOTENAME QUOTE_IDENT QUOTE_LITERAL SPLIT_PART TRANSLATE INSERT STUFF OVERLAY PARSENAME SOUNDEX STARTS_WITH ENDS_WITH',
+        'String': 'UPPER LOWER LENGTH LEN CHAR_LENGTH CHARACTER_LENGTH OCTET_LENGTH BIT_LENGTH CONCAT CONCAT_WS SUBSTRING SUBSTR MID SUBSTRING_INDEX LEFT RIGHT LPAD RPAD TRIM LTRIM RTRIM REPLACE REPLICATE REVERSE REPEAT INSTR STRPOS LOCATE POSITION CHARINDEX PATINDEX ASCII CHAR CHR SPACE STRCMP ELT FIELD INITCAP UCASE LCASE FORMAT HEX UNHEX BIN OCT CONV QUOTE QUOTENAME QUOTE_IDENT QUOTE_LITERAL SPLIT_PART TRANSLATE INSERT STUFF OVERLAY PARSENAME SOUNDEX STARTS_WITH ENDS_WITH BTRIM ENCODE ORD UNISTR CONTAINS',
         'Regexp': 'REGEXP_REPLACE REGEXP_SUBSTR REGEXP_LIKE REGEXP_COUNT REGEXP_INSTR',
         'Numeric': 'ABS CEIL CEILING FLOOR ROUND TRUNCATE TRUNC MOD REMAINDER SIGN POWER POW SQUARE SQRT CBRT EXP LN LOG LOG10 LOG2 PI RAND RANDOM SIN COS TAN COT SINH COSH TANH ASIN ACOS ATAN ATAN2 DEGREES RADIANS GREATEST LEAST GCD LCM FACTORIAL WIDTH_BUCKET NANVL BITAND BITOR BITXOR BITNOT SHIFTLEFT SHIFTRIGHT ISNUMERIC BIT_COUNT CRC32 FORMAT_BYTES',
-        'Date & Time': 'NOW CURRENT_TIMESTAMP SYSDATE SYSTIMESTAMP GETDATE GETUTCDATE SYSDATETIME SYSUTCDATETIME UTC_TIMESTAMP CURDATE CURRENT_DATE UTC_DATE CURTIME CURRENT_TIME DATE TIME YEAR MONTH DAY DAYOFMONTH HOUR MINUTE SECOND DAYOFWEEK DAYOFYEAR WEEKDAY WEEK WEEKOFYEAR QUARTER MONTHNAME DAYNAME LAST_DAY EOMONTH NEXT_DAY DATEDIFF DATEADD DATEPART DATENAME DATE_ADD DATE_SUB ADD_MONTHS MONTHS_BETWEEN ADDDATE SUBDATE EXTRACT DATE_PART TIMESTAMPDIFF TIMESTAMPADD DATE_FORMAT STR_TO_DATE UNIX_TIMESTAMP FROM_UNIXTIME SEC_TO_TIME TIME_TO_SEC MAKEDATE MAKETIME MAKE_DATE MAKE_TIMESTAMP TO_DAYS FROM_DAYS DATE_TRUNC',
-        'JSON': 'JSON_EXTRACT JSON_VALUE JSON_ARRAY JSON_OBJECT JSON_LENGTH JSON_KEYS JSON_VALID JSON_TYPE JSON_CONTAINS JSON_CONTAINS_PATH JSON_SET JSON_INSERT JSON_REPLACE JSON_REMOVE JSON_PRETTY JSON_QUOTE JSON_UNQUOTE JSON_ARRAY_APPEND JSON_ARRAY_INSERT JSON_MERGE_PATCH JSON_DEPTH',
+        'Date & Time': 'NOW CURRENT_TIMESTAMP SYSDATE SYSTIMESTAMP GETDATE GETUTCDATE SYSDATETIME SYSUTCDATETIME UTC_TIMESTAMP CURDATE CURRENT_DATE UTC_DATE CURTIME CURRENT_TIME DATE TIME YEAR MONTH DAY DAYOFMONTH HOUR MINUTE SECOND DAYOFWEEK DAYOFYEAR WEEKDAY WEEK WEEKOFYEAR QUARTER MONTHNAME DAYNAME LAST_DAY EOMONTH NEXT_DAY DATEDIFF DATEADD DATEPART DATENAME DATE_ADD DATE_SUB ADD_MONTHS MONTHS_BETWEEN ADDDATE SUBDATE EXTRACT DATE_PART TIMESTAMPDIFF TIMESTAMPADD DATE_FORMAT STR_TO_DATE UNIX_TIMESTAMP FROM_UNIXTIME SEC_TO_TIME TIME_TO_SEC MAKEDATE MAKETIME MAKE_DATE MAKE_TIMESTAMP TO_DAYS FROM_DAYS DATE_TRUNC LOCALTIME LOCALTIMESTAMP TIMEDIFF YEARWEEK PERIOD_ADD PERIOD_DIFF JULIAN_DAY JULIANDAY CONVERT_TZ',
+        'JSON': 'JSON_EXTRACT JSON_VALUE JSON_ARRAY JSON_OBJECT JSON_LENGTH JSON_KEYS JSON_VALID JSON_TYPE JSON_CONTAINS JSON_CONTAINS_PATH JSON_SET JSON_INSERT JSON_REPLACE JSON_REMOVE JSON_PRETTY JSON_QUOTE JSON_UNQUOTE JSON_ARRAY_APPEND JSON_ARRAY_INSERT JSON_MERGE_PATCH JSON_DEPTH JSON_SEARCH JSON_MERGE_PRESERVE',
+        'Array': 'ARRAY_LENGTH ARRAY_POSITION ARRAY_CONTAINS ARRAY_APPEND ARRAY_PREPEND ARRAY_REMOVE ARRAY_TO_STRING STRING_TO_ARRAY ARRAY_DISTINCT ARRAY_CAT ARRAY_REVERSE',
         'Null & Flow': 'COALESCE IFNULL ISNULL NVL NVL2 ZEROIFNULL NULLIFZERO NULLIF DECODE CHOOSE IF IIF CASE CAST CONVERT TRY_CAST TRY_CONVERT',
         'Conversion': 'CAST CONVERT TRY_CAST TRY_CONVERT TO_NUMBER TO_CHAR TO_HEX TO_DATE TO_TIMESTAMP',
         'Encoding & Hash': 'MD5 SHA1 SHA2 SHA256 SHA224 TO_BASE64 FROM_BASE64 INET_ATON INET_NTOA',
-        'Aggregate': 'COUNT SUM AVG MAX MIN GROUP_CONCAT STRING_AGG LISTAGG ARRAY_AGG STDDEV STDDEV_POP STDDEV_SAMP VARIANCE VAR_POP VAR_SAMP MEDIAN BIT_AND BIT_OR BIT_XOR BOOL_AND BOOL_OR CORR COVAR_POP COVAR_SAMP ANY_VALUE JSON_ARRAYAGG JSON_OBJECTAGG MIN_BY MAX_BY COUNT_IF PERCENTILE_CONT PERCENTILE_DISC GROUPING',
+        'Aggregate': 'COUNT SUM AVG MAX MIN GROUP_CONCAT STRING_AGG LISTAGG ARRAY_AGG STDDEV STDDEV_POP STDDEV_SAMP VARIANCE VAR_POP VAR_SAMP MEDIAN BIT_AND BIT_OR BIT_XOR BOOL_AND BOOL_OR CORR COVAR_POP COVAR_SAMP ANY_VALUE JSON_ARRAYAGG JSON_OBJECTAGG MIN_BY MAX_BY COUNT_IF PERCENTILE_CONT PERCENTILE_DISC GROUPING EVERY PRODUCT APPROX_COUNT_DISTINCT',
         'Window': 'ROW_NUMBER RANK DENSE_RANK LAG LEAD NTILE FIRST_VALUE LAST_VALUE NTH_VALUE PERCENT_RANK CUME_DIST',
         'Sequence': 'NEXTVAL CURRVAL SETVAL',
         'Meta': 'UUID NEWID SYS_GUID VERSION DATABASE CURRENT_SCHEMA SCHEMA_NAME USER CURRENT_USER SESSION_USER SYSTEM_USER SUSER_NAME LAST_INSERT_ID TYPEOF'
@@ -825,6 +826,34 @@
               this.prepared[name] = text;
               return { data: [{ Result: 'Success', Message: `Statement '${name}' prepared.` }], affectedRows: 0 };
           }
+          // EXECUTE IMMEDIATE '<sql>' [USING v1, ...]（Oracle / PostgreSQL / SQL標準）:
+          // PREPARE を挟まずにその場で組み立てた SQL を実行する
+          m = sql.match(/^execute\s+immediate\s+__STR_(\d+)__(?:\s+using\s+([\s\S]+))?$/i);
+          if (m) {
+              if (!strMap) throw new Error("Syntax Error in EXECUTE IMMEDIATE. Use EXECUTE IMMEDIATE '<sql>' [USING v1, ...].");
+              const text = this._unquoteLiteral(strMap[Number(m[1])]);
+              if (text.trim() === '') throw new Error("EXECUTE IMMEDIATE: the statement text is empty.");
+              let vals = [];
+              if (m[2]) {
+                  vals = this.splitSelectClause(m[2]).map(p => {
+                      const v = this.compileCondition(p.trim(), strMap)({}, this.tables, {});
+                      return v === undefined ? null : v;
+                  });
+              }
+              const bound = this._bindPlaceholders(text, vals);
+              this._execDepth = (this._execDepth || 0) + 1;
+              try {
+                  if (this._execDepth > 8) throw new Error("EXECUTE nesting depth limit (8) exceeded.");
+                  const r = this.executeQuery(bound);
+                  if (r.error) throw new Error(`EXECUTE IMMEDIATE: ${r.error}`);
+                  return { data: r.data, affectedRows: r.scannedRows || 0 };
+              } finally {
+                  this._execDepth--;
+              }
+          }
+          if (/^execute\s+immediate\b/i.test(sql)) {
+              throw new Error("EXECUTE IMMEDIATE takes a quoted SQL string: EXECUTE IMMEDIATE '<sql>' [USING v1, ...].");
+          }
           m = sql.match(/^execute\s+([a-zA-Z0-9_]+)(?:\s+using\s+([\s\S]+))?$/i);
           if (m) {
               const name = m[1].toLowerCase();
@@ -1261,16 +1290,80 @@
               ];
               return { data, affectedRows: data.length };
           }
-          // SHOW COLUMNS FROM t は DESCRIBE のエイリアス
-          const colM = sql.trim().match(/^show\s+columns\s+from\s+([a-zA-Z0-9_]+)$/i);
+          // SHOW COLUMNS FROM t [LIKE 'pat'] は DESCRIBE のエイリアス（LIKE は列名で絞る）
+          const colM = sql.trim().match(/^show\s+(?:full\s+)?columns\s+(?:from|in)\s+([a-zA-Z0-9_]+)(?:\s+like\s+__STR_(\d+)__)?$/i);
           if (colM) {
-              return this._executeDescribe(`DESCRIBE ${colM[1]}`);
+              const res = this._executeDescribe(`DESCRIBE ${colM[1]}`);
+              if (colM[2] === undefined) return res;
+              if (!strMap) throw new Error("Syntax Error in SHOW COLUMNS.");
+              const pat = this._unquoteLiteral(strMap[Number(colM[2])]);
+              const re = new RegExp('^' + pat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
+              const data = res.data.filter(r => re.test(String(r.Column === undefined ? '' : r.Column)));
+              return { data, affectedRows: data.length };
           }
-          throw new Error("Syntax Error in SHOW. Use SHOW TABLES [LIKE 'pat'] / VIEWS / PROCEDURES / TRIGGERS [FROM table] / FUNCTIONS [LIKE 'pat'] / VARIABLES / SEQUENCES / PREPARED / CHECKS [FROM table] / INDEXES [FROM table] / COLUMNS FROM <table> / STATUS / CREATE TABLE <name> / CREATE VIEW <name> / CREATE PROCEDURE <name>.");
+          // SHOW ENGINES（MySQL）: 単一のインメモリエンジンだけを持つ
+          if (/^show\s+engines$/i.test(sql.trim())) {
+              const data = [{ Engine: 'LUMINA', Support: 'DEFAULT', Comment: 'In-memory columnar tables (the only engine)', Transactions: 'YES', Savepoints: 'YES' }];
+              return { data, affectedRows: data.length };
+          }
+          // SHOW CREATE INDEX <name>: インデックスの定義を再構成して返す
+          const ciM = sql.trim().match(/^show\s+create\s+index\s+([a-zA-Z0-9_]+)$/i);
+          if (ciM) {
+              const iname = ciM[1].toLowerCase();
+              const ix = (this.indexNames || {})[iname];
+              if (!ix) {
+                  const s2 = this._suggestName(iname, Object.keys(this.indexNames || {}));
+                  throw new Error(`Index '${iname}' not found.${s2 ? ` Did you mean '${s2}'?` : ''} Use SHOW INDEXES [FROM <table>] to list them.`);
+              }
+              const keys = (ix.keys && ix.keys.length)
+                  ? ix.keys.map(k => `${k.expr ? `(${k.expr})` : k.col}${k.dir === 'DESC' ? ' DESC' : ''}`)
+                  : (ix.cols || []);
+              return {
+                  data: [{ Index: iname, Table: ix.table, CreateIndex: `CREATE ${ix.unique ? 'UNIQUE ' : ''}INDEX ${iname} ON ${ix.table} (${keys.join(', ')})` }],
+                  affectedRows: 1
+              };
+          }
+          throw new Error("Syntax Error in SHOW. Use SHOW TABLES [LIKE 'pat'] / VIEWS / PROCEDURES / TRIGGERS [FROM table] / FUNCTIONS [LIKE 'pat'] / VARIABLES / SEQUENCES / PREPARED / CHECKS [FROM table] / INDEXES [FROM table] / COLUMNS FROM <table> [LIKE 'pat'] / ENGINES / STATUS / CREATE TABLE <name> / CREATE VIEW <name> / CREATE INDEX <name> / CREATE PROCEDURE <name>.");
       },
 
       // CHECK TABLE <t>: 全制約の整合性検査 / ANALYZE TABLE <t>: 列ごとの統計レポート
       _executeTableMaintenance(sql) {
+          // CHECKSUM TABLE t[, t2 ...]（MySQL）: 内容から決定的なチェックサムを出す。
+          // 同じ内容なら同じ値になるので、取り込み前後の突き合わせに使える
+          let cs = sql.trim().replace(/;$/, '').match(/^checksum\s+table\s+([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)(?:\s+(?:quick|extended))?$/i);
+          if (cs) {
+              const data = cs[1].split(',').map(s => s.trim().toLowerCase()).map(name => {
+                  const t = this.tables[name];
+                  if (!t) throw this._tableNotFound(name);
+                  const cols = t.getColumnNames();
+                  // FNV-1a（32bit）。列名と全セルを型付きで畳み込む
+                  let h = 0x811c9dc5;
+                  const feed = (str) => {
+                      for (let i = 0; i < str.length; i++) {
+                          h ^= str.charCodeAt(i);
+                          h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+                      }
+                  };
+                  feed(cols.join(''));
+                  for (let r = 0; r < t.rowCount; r++) {
+                      for (let c = 0; c < cols.length; c++) {
+                          const v = t.getValue(cols[c], r);
+                          feed('' + (v === null || v === undefined ? ' ' : (typeof v) + ':' + String(v)));
+                      }
+                  }
+                  return { Table: name, Checksum: h >>> 0, Rows: t.rowCount };
+              });
+              return { data, affectedRows: data.length };
+          }
+          // REPAIR TABLE t（MySQL）: 壊れ得るファイル構造を持たないので受理のみ
+          const rp = sql.trim().replace(/;$/, '').match(/^repair\s+table\s+([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)(?:\s+(?:quick|extended|use_frm))?$/i);
+          if (rp) {
+              const data = rp[1].split(',').map(s => s.trim().toLowerCase()).map(name => {
+                  if (!this.tables[name]) throw this._tableNotFound(name);
+                  return { Table: name, Op: 'repair', Msg_type: 'status', Msg_text: 'OK (no-op: LuminaDB tables live in memory and cannot be corrupted on disk; use CHECK TABLE to verify constraints).' };
+              });
+              return { data, affectedRows: data.length };
+          }
           let m = sql.match(/^check\s+table\s+([a-zA-Z0-9_]+)$/i);
           if (m) {
               const name = m[1].toLowerCase();
@@ -1383,8 +1476,17 @@
 
       // DESCRIBE / DESC name: テーブルのカラム定義（ビューなら定義SQL）を返す
       _executeDescribe(sql) {
-          const m = sql.match(/^(?:describe|desc)\s+([a-zA-Z0-9_]+)$/i);
-          if (!m) throw new Error("Syntax Error in DESCRIBE.");
+          // DESCRIBE t <col> は 1 列だけに絞る（MySQL は列名パターンを受ける）
+          const m = sql.trim().replace(/;$/, '').match(/^(?:describe|desc)\s+([a-zA-Z0-9_]+)(?:\s+([a-zA-Z0-9_%]+))?$/i);
+          if (!m) throw new Error("Syntax Error in DESCRIBE. Use DESCRIBE <table> [<column>].");
+          if (m[2] !== undefined) {
+              const res = this._executeDescribe(`DESCRIBE ${m[1]}`);
+              if (!Array.isArray(res.data) || res.data.length === 0 || res.data[0].Column === undefined) return res;
+              const re = new RegExp('^' + m[2].replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
+              const data = res.data.filter(r => re.test(String(r.Column)));
+              if (data.length === 0) throw new Error(`Column '${m[2].toLowerCase()}' not found in '${m[1].toLowerCase()}'.`);
+              return { data, affectedRows: data.length };
+          }
           const name = m[1].toLowerCase();
           if (this.views[name]) {
               return { data: [{ View: name, Definition: this.views[name] }], affectedRows: 1 };
@@ -1536,10 +1638,11 @@
               }
               return { data: [{ Result: 'Success', Message: 'FOREIGN_KEY_CHECKS = 1. All foreign keys re-validated.' }], affectedRows: 0 };
           }
-          const m = raw.match(/^set\s+(?:session\s+|local\s+|global\s+)?([a-zA-Z_][a-zA-Z0-9_.]*)\s*(?::=|=|\s+to\s+)\s*([\s\S]+)$/i);
+          // 名前は @@var / @@session.var / @@global.var（MySQL）も受ける
+          const m = raw.match(/^set\s+(?:session\s+|local\s+|global\s+)?(@@)?((?:session\.|global\.|local\.)?[a-zA-Z_][a-zA-Z0-9_.]*)\s*(?::=|=|\s+to\s+)\s*([\s\S]+)$/i);
           if (!m) throw new Error("Syntax Error in SET. Use SET [SESSION] <name> = <value>.");
-          const name = m[1].toLowerCase().replace(/^@@/, '');
-          let text = m[2].trim().replace(/^'([\s\S]*)'$/, '$1').replace(/^"([\s\S]*)"$/, '$1');
+          const name = m[2].toLowerCase().replace(/^(?:session|global|local)\./, '');
+          let text = m[3].trim().replace(/^'([\s\S]*)'$/, '$1').replace(/^"([\s\S]*)"$/, '$1');
           const kind = this._SESSION_VARS[name];
           const asBool = () => {
               const t = text.toLowerCase();
@@ -1568,6 +1671,52 @@
           }
           this.sessionSettings[name] = text;
           return { data: [{ Result: "Success", Message: `Session variable '${name}' set to ${text}.` }], affectedRows: 0 };
+      },
+
+      // RESET ALL / RESET <name>（PostgreSQL）: セッション変数を既定へ戻す。
+      // read_only だけは対象外にする（外部公開時の保護を RESET で外せてしまうため。
+      // 解除は SET read_only = OFF で明示的に行う）
+      _executeReset(sql) {
+          const m = sql.trim().replace(/;$/, '').match(/^reset\s+(all|[a-zA-Z_][a-zA-Z0-9_.]*)$/i);
+          if (!m) throw new Error("Syntax Error. Use RESET ALL or RESET <name>.");
+          const target = m[1].toLowerCase().replace(/^@@/, '');
+          this.sessionSettings = this.sessionSettings || Object.create(null);
+          const defaults = (name) => {
+              if (name === 'statement_timeout') this.statementTimeoutMs = 0;
+              else if (name === 'slow_query_threshold') this.slowLogThresholdMs = 0;
+              else if (name === 'seed') { const fn = this.compileCondition('SETSEED(NULL)', []); fn({}, this.tables, {}); }
+          };
+          if (target === 'all') {
+              const kept = this.sessionSettings['read_only'];
+              const names = Object.keys(this.sessionSettings);
+              names.forEach(n => { if (n !== 'read_only') defaults(n); });
+              this.sessionSettings = Object.create(null);
+              if (kept !== undefined) this.sessionSettings['read_only'] = kept;
+              defaults('statement_timeout');
+              defaults('slow_query_threshold');
+              defaults('seed');
+              return { data: [{ Result: 'Success', Message: `All session variables reset to their defaults (read_only is left as it is; use SET read_only = OFF to change it).` }], affectedRows: 0 };
+          }
+          if (target === 'read_only') {
+              throw new Error("RESET read_only is not allowed. Use SET read_only = OFF so the change is explicit.");
+          }
+          defaults(target);
+          delete this.sessionSettings[target];
+          return { data: [{ Result: 'Success', Message: `Session variable '${target}' reset to its default.` }], affectedRows: 0 };
+      },
+
+      // DO <expr>[, <expr> ...]（MySQL）: 式を評価して結果を捨てる。
+      // 副作用のある式（NEXTVAL / SETVAL / SETSEED）を投げるための入口として使う
+      _executeDoStatement(sql, strMap) {
+          const body = sql.trim().replace(/;$/, '').replace(/^do\s+/i, '').trim();
+          if (body === '') throw new Error("Syntax Error. Use DO <expression>[, <expression> ...].");
+          const parts = this.splitSelectClause(body).map(p => p.trim()).filter(p => p !== '');
+          if (parts.length === 0) throw new Error("Syntax Error. Use DO <expression>[, <expression> ...].");
+          parts.forEach(p => {
+              const fn = this.compileCondition(p, strMap);
+              fn({}, this.tables, {});
+          });
+          return { data: [{ Result: 'Success', Message: `DO evaluated ${parts.length} expression(s); results discarded.` }], affectedRows: 0 };
       },
 
       // ============ スナップショット（メモリ内タイムトラベル） ============
@@ -1662,6 +1811,17 @@
                   return { data: [{ Result: 'Success', Message: `user_version set to ${n}.` }], affectedRows: 0 };
               }
               return { data: [{ user_version: this.userVersion || 0 }], affectedRows: 1 };
+          }
+          // PRAGMA foreign_keys [= ON|OFF]: SET FOREIGN_KEY_CHECKS と同じ切り替え。
+          // 読み出しは SQLite に合わせて 0/1 の 1 行で返す
+          if (name === 'foreign_keys') {
+              if (assign === null) {
+                  return { data: [{ foreign_keys: this.fkChecksEnabled === false ? 0 : 1 }], affectedRows: 1 };
+              }
+              if (!/^(0|1|on|off|true|false|yes|no)$/i.test(assign)) {
+                  throw new Error(`PRAGMA foreign_keys: expected ON/OFF, got '${assign}'.`);
+              }
+              return this._executeSetSessionVar(`SET FOREIGN_KEY_CHECKS = ${/^(0|off|false|no)$/i.test(assign) ? 0 : 1}`, null);
           }
           if (name === 'table_list') {
               const data = Object.keys(this.tables).filter(t => !t.startsWith('__tmp_')).map(t => ({
@@ -1955,21 +2115,46 @@
 
       // REFRESH MATERIALIZED VIEW <name>: 定義クエリを再実行して実体テーブルを差し替える
       _refreshMatView(sql, strMap) {
-          const m = sql.match(/^refresh\s+materialized\s+view\s+([a-zA-Z0-9_]+)\s*$/i);
-          if (!m) throw new Error("Syntax Error. Use REFRESH MATERIALIZED VIEW <name>.");
+          // CONCURRENTLY / WITH [NO] DATA は受理する（単一スレッドなので同時実行の
+          // 区別は無く、WITH NO DATA は「中身を空にする」指定として効かせる）
+          const m = sql.match(/^refresh\s+materialized\s+view\s+(?:concurrently\s+)?([a-zA-Z0-9_]+)(?:\s+with\s+(no\s+)?data)?\s*$/i);
+          if (!m) throw new Error("Syntax Error. Use REFRESH MATERIALIZED VIEW [CONCURRENTLY] <name> [WITH [NO] DATA].");
           const name = m[1].toLowerCase();
           const mv = this.matViews[name];
           if (!mv) throw new Error(`Materialized view '${name}' not found.`);
           const res = this.executeQuery(mv.sql, true, strMap);
           if (res.error) throw new Error(res.error);
+          const rows = m[2] ? [] : res.data;   // WITH NO DATA: 列だけ残して空にする
           this._logTableMeta(name);
-          this._materializeRows(name, res.data);
-          return { data: [{ Result: "Success", Message: `Materialized view '${name}' refreshed (${res.data.length} rows).` }], affectedRows: res.data.length };
+          this._materializeRows(name, rows);
+          return { data: [{ Result: "Success", Message: `Materialized view '${name}' refreshed (${rows.length} rows).` }], affectedRows: rows.length };
       },
 
       _executeDDL(sql, strMap) {
           let resultSet = [];
           let affectedRows = 0;
+          // --- 実DBの綴りを受けるための前処理（意味を変えない語を落とす） ---
+          // UNLOGGED / LOGGED: WAL を書くかの指定。全てメモリ上の本実装では区別が無い
+          sql = sql.replace(/^(create\s+(?:(?:global|local)\s+)?(?:temp(?:orary)?\s+)?)(?:un)?logged\s+(table\b)/i, '$1$2');
+          // CREATE INDEX ... USING BTREE|HASH ...: 索引の実装方式の指定。
+          // LuminaDB の索引は列単位ハッシュの 1 種類だけなので受理して落とす
+          // （PostgreSQL は表名の後、MySQL は列リストの後に置く。両方の位置を受ける）
+          if (/^create\s+(?:unique\s+)?index\b/i.test(sql)) {
+              sql = sql.replace(/(\bon\s+[a-zA-Z0-9_]+)\s+using\s+(?:btree|hash|gin|gist|brin|spgist|rtree|fulltext)\b/i, '$1');
+              sql = sql.replace(/\s+using\s+(?:btree|hash|gin|gist|brin|spgist|rtree|fulltext)\s*$/i, '');
+          }
+          // ALTER VIEW v AS SELECT ...: 既存ビューの再定義（CREATE OR REPLACE VIEW と同じ）。
+          // 存在しない名前は「作られたつもり」にならないよう拒否する
+          if (/^alter\s+view\b/i.test(sql)) {
+              const am = sql.match(/^alter\s+view\s+([a-zA-Z0-9_]+)\s*(?:\([\s\S]*?\)\s*)?as\s+[\s\S]+$/i);
+              if (!am) throw new Error("Syntax Error. Use ALTER VIEW <name> [(c1, ...)] AS SELECT ....");
+              const vn = am[1].toLowerCase();
+              if (!this.views[vn]) {
+                  if (this.matViews[vn]) throw new Error(`'${vn}' is a materialized view. Drop and recreate it to change its definition.`);
+                  throw new Error(`View '${vn}' not found. Use CREATE VIEW to create it.`);
+              }
+              sql = 'CREATE OR REPLACE VIEW ' + sql.replace(/^alter\s+view\s+/i, '');
+          }
           if (/^create\s+(unique\s+)?index/i.test(sql)) {
              // 複数列指定に対応する。LuminaDB のインデックスは単一列ハッシュなので、
              // 複合指定は各列に個別のインデックスを張る（先頭列で絞れれば十分効く）
@@ -2163,17 +2348,19 @@
              delete this.matViews[name];
              resultSet = [{ Result: "Success", Message: `Materialized view '${name}' dropped.` }];
           }
-          else if (/^create\s+(?:or\s+replace\s+)?view/i.test(sql)) {
-             // CREATE [OR REPLACE] VIEW name [(c1, c2, ...)] AS SELECT ...
+          else if (/^create\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?view/i.test(sql)) {
+             // CREATE [OR REPLACE] [TEMPORARY] VIEW name [(c1, c2, ...)] AS SELECT ...
              // 列リストを付けると本体の出力列を位置で改名する（SQL標準）
-             const m = sql.match(/^create\s+(or\s+replace\s+)?view\s+([a-zA-Z0-9_]+)\s*(?:\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\)\s*)?as\s+([\s\S]+)$/i);
+             // TEMPORARY はセッション限り（IDB保存・SQLエクスポート対象外）
+             const m = sql.match(/^create\s+(or\s+replace\s+)?(temp(?:orary)?\s+)?view\s+([a-zA-Z0-9_]+)\s*(?:\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\)\s*)?as\s+([\s\S]+)$/i);
              if (m) {
                 const orReplace = !!m[1];
-                const name = m[2].toLowerCase();
-                const colList = m[3] ? m[3].split(',').map(c => c.trim().toLowerCase()) : null;
+                const isTempView = !!m[2];
+                const name = m[3].toLowerCase();
+                const colList = m[4] ? m[4].split(',').map(c => c.trim().toLowerCase()) : null;
                 if (this.tables[name]) throw new Error(`Table '${name}' already exists.`);
                 if (this.views[name] && !orReplace) throw new Error(`View '${name}' already exists.`);
-                let body = m[4].trim().replace(/;$/, '');
+                let body = m[5].trim().replace(/;$/, '');
                 // WITH [LOCAL|CASCADED] CHECK OPTION: このビュー経由の書き込みが
                 // ビューの WHERE を満たすことを強制する（更新可能ビューのガード）
                 let checkOption = null;
@@ -2189,9 +2376,12 @@
                 this._logViewState(name);
                 this.views[name] = this._restoreStrings(body, strMap);
                 this.viewMeta = this.viewMeta || Object.create(null);
-                if (checkOption) this.viewMeta[name] = { checkOption };
-                else delete this.viewMeta[name];
-                resultSet = [{ Result: "Success", Message: `View '${name}' ${replaced ? 'replaced' : 'created'}${checkOption ? ' WITH CHECK OPTION' : ''}.` }];
+                if (checkOption || isTempView) {
+                    this.viewMeta[name] = {};
+                    if (checkOption) this.viewMeta[name].checkOption = checkOption;
+                    if (isTempView) this.viewMeta[name].temp = true;
+                } else delete this.viewMeta[name];
+                resultSet = [{ Result: "Success", Message: `${isTempView ? 'Temporary view' : 'View'} '${name}' ${replaced ? 'replaced' : 'created'}${checkOption ? ' WITH CHECK OPTION' : ''}${isTempView ? ' (session only: not saved and not exported)' : ''}.` }];
              } else throw new Error("Syntax Error in CREATE VIEW.");
           }
           else if (/^create\s+(?:or\s+replace\s+)?procedure/i.test(sql)) {
@@ -2566,7 +2756,11 @@
                         throw new Error(`Syntax Error in FOREIGN KEY definition near '${d.slice(0, 60)}'. Use FOREIGN KEY (col) REFERENCES table (col) [ON DELETE/UPDATE ...].`);
                     }
                     // PRIMARY KEY / UNIQUE は複数列（複合キー）を受理する
-                    const pkMatch = d.match(/^primary\s+key\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)$/i);
+                    // CONSTRAINT <name> PRIMARY KEY (...) の名前付き形も受ける。
+                    // 受けていなかったため、名前を付けた主キー宣言が列定義として解析され、
+                    // `constraint` という幻の列が増えて表そのものが壊れていた
+                    // （INSERT が「列数と値の数が合わない」で通らなくなる）
+                    const pkMatch = d.match(/^(?:constraint\s+[a-zA-Z0-9_]+\s+)?primary\s+key\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)$/i);
                     const uqMatch = d.match(/^(?:constraint\s+[a-zA-Z0-9_]+\s+)?unique\s*\(\s*([a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)\s*\)$/i);
                     if (fkMatch) {
                         const acts = this._parseFkActions(fkMatch[5]);

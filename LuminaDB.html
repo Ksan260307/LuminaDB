@@ -86,27 +86,25 @@
     </div>
 
     <!-- ツールバー
-         v1.24: 説明の無い 4 つのボタン（Export SQL / Import SQL / Import CSV / Test Data）は
-         「Data」1 つへ集約した。中身は dataModal のタブに、それぞれ何をするかの説明付きで置く。
-         残す 3 つ（Save / Load / Clear）はブラウザ内 DB の中核操作なので即座に押せる位置に残す -->
-    <div class="p-2 border-b border-gray-200 flex flex-wrap gap-2 text-xs">
-      <button id="saveIdbBtn" title="現在の DB をこのブラウザ（IndexedDB）へ保存する" class="flex-1 min-w-[30%] bg-white hover:bg-gray-100 border border-gray-300 py-1.5 rounded text-gray-700 transition-colors shadow-sm">Save DB</button>
-      <button id="loadIdbBtn" title="このブラウザに保存済みの DB を読み込む" class="flex-1 min-w-[30%] bg-white hover:bg-gray-100 border border-gray-300 py-1.5 rounded text-gray-700 transition-colors shadow-sm">Load DB</button>
-      <button id="clearIdbBtn" title="保存データを削除して初期状態に戻す" class="flex-1 min-w-[30%] bg-red-50 hover:bg-red-100 border border-red-200 py-1.5 rounded text-red-700 transition-colors shadow-sm">Clear DB</button>
-
-      <button id="openDataBtn" title="ファイルの書き出し・読み込み・テストデータ生成 (Ctrl+Shift+D)" class="w-full bg-white hover:bg-gray-100 border border-gray-300 py-1.5 rounded text-blue-600 font-medium transition-colors shadow-sm flex items-center justify-center gap-1.5">
-        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>
-        Data — 入出力 / テストデータ
+         v1.24: 説明の無い 4 つのボタン（Export SQL / Import SQL / Import CSV / Test Data）を
+         「Data」1 つへ集約した。
+         v1.34: 残っていた 6 つ（Save DB / Load DB / Clear DB / Open File / Save / Save As）も
+         同じモーダルへ移し、サイドバーの入口を 1 つにした。ボタン名だけでは
+         「このブラウザに保存」と「ファイルへ保存」の違いが判らず、どれを押せば
+         データが残るのかが読み取れなかったため。移した先では 1 件ずつ説明を付けている。
+         よく使う保存は Ctrl+S（このブラウザ）/ Ctrl+Shift+S（ファイル）で直接呼べる -->
+    <div class="p-2 border-b border-gray-200 flex flex-col gap-2 text-xs">
+      <button id="openDataBtn" title="保存・読み込み・書き出し・テストデータ (Ctrl+Shift+D)" class="w-full bg-white hover:bg-gray-100 border border-gray-300 py-2 rounded text-blue-600 font-medium transition-colors shadow-sm flex items-center justify-center gap-1.5">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 1.66 3.58 3 8 3s8-1.34 8-3V7M4 7c0 1.66 3.58 3 8 3s8-1.34 8-3M4 7c0-1.66 3.58-3 8-3s8 1.34 8 3m0 5c0 1.66-3.58 3-8 3s-8-1.34-8-3"/></svg>
+        データ — 保存 / 読み込み / 入出力
       </button>
       <input type="file" id="sqlFileInput" accept=".sql,.txt" class="hidden">
 
-      <!-- ディスク上のファイルとして開く / 保存する。
-           IndexedDB はブラウザのサイトデータを消すと失われ、別の端末へ持ち出せない。
-           ファイルハンドルを保持すると通常のアプリと同じ「開く→編集→上書き保存」ができる -->
-      <div class="w-full flex gap-2">
-        <button id="fileOpenBtn" title="ディスク上の .luminadb ファイルを開く" class="flex-1 bg-white hover:bg-gray-100 border border-gray-300 py-1.5 rounded text-gray-700 transition-colors shadow-sm">Open File</button>
-        <button id="fileSaveBtn" title="開いているファイルへ上書き保存する" class="flex-1 bg-white hover:bg-gray-100 border border-gray-300 py-1.5 rounded text-gray-700 transition-colors shadow-sm disabled:opacity-40 disabled:bg-gray-100" disabled>Save</button>
-        <button id="fileSaveAsBtn" title="名前を付けてディスクへ保存する" class="flex-1 bg-white hover:bg-gray-100 border border-gray-300 py-1.5 rounded text-gray-700 transition-colors shadow-sm">Save As</button>
+      <!-- 自動保存の状態と、開いているファイル名。どちらも「今どこに残るのか」を
+           常に見えるようにするためのもので、操作は上のボタンから行う -->
+      <div id="storageStateLine" class="w-full text-[10px] text-gray-500 flex items-center gap-1.5">
+        <span class="inline-block w-1.5 h-1.5 rounded-full bg-green-500 shrink-0"></span>
+        <span>このブラウザへ自動保存</span>
       </div>
       <div id="openFileLabel" class="hidden w-full text-[10px] text-gray-500 truncate" title="開いているファイル"></div>
     </div>
@@ -344,20 +342,130 @@
     <div class="absolute inset-0 bg-gray-900/40 backdrop-blur-sm closeModalBg cursor-pointer"></div>
     <div class="relative bg-white border border-gray-200 rounded-lg shadow-2xl w-full max-w-2xl p-6 m-4 flex flex-col gap-4 max-h-[88vh]">
       <div class="flex justify-between items-center border-b border-gray-100 pb-3">
-        <h2 class="text-lg font-bold text-gray-800">Data — 入出力とテストデータ</h2>
+        <h2 class="text-lg font-bold text-gray-800">データ — 保存 / 読み込み / 入出力</h2>
         <button class="closeModalBtn text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">✕</button>
       </div>
 
       <!-- タブ -->
-      <div class="flex gap-1 border-b border-gray-200 -mb-1" role="tablist">
-        <button class="dataTabBtn px-3 py-2 text-sm font-medium border-b-2 border-blue-600 text-blue-700" data-pane="dataPaneExport" role="tab">書き出し</button>
+      <div class="flex gap-1 border-b border-gray-200 -mb-1 flex-wrap" role="tablist">
+        <button class="dataTabBtn px-3 py-2 text-sm font-medium border-b-2 border-blue-600 text-blue-700" data-pane="dataPaneBrowser" role="tab">このブラウザ</button>
+        <button class="dataTabBtn px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800" data-pane="dataPaneFile" role="tab">ファイル</button>
+        <button class="dataTabBtn px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800" data-pane="dataPaneExport" role="tab">書き出し</button>
         <button class="dataTabBtn px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800" data-pane="dataPaneImport" role="tab">読み込み</button>
         <button id="openGeneratorBtn" class="dataTabBtn px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800" data-pane="dataPaneGen" role="tab">テストデータ</button>
       </div>
 
       <div class="overflow-y-auto pr-1 -mr-1">
+        <!-- ============================================================
+             このブラウザ（IndexedDB）
+             v1.34: サイドバーにあった Save DB / Load DB / Clear DB をここへ移した。
+             3 つとも「このブラウザの中だけ」に効く操作で、ファイルへの保存とは
+             別物であることが名前からは読み取れなかった
+             ============================================================ -->
+        <div id="dataPaneBrowser" class="dataPane flex flex-col gap-3">
+          <div class="rounded border border-blue-100 bg-blue-50/60 p-3">
+            <p class="text-xs text-blue-900 leading-relaxed">
+              <span class="font-semibold">変更は 1 秒後にこのブラウザへ自動保存されます。</span>
+              下のボタンは、その保存を今すぐ行う / 保存した地点へ戻す / 消して作り直すためのものです。
+            </p>
+            <p class="text-xs text-blue-900/80 leading-relaxed mt-1.5">
+              保存先はこのブラウザのこのサイト（IndexedDB）だけです。<span class="font-medium">閲覧データを削除すると消え、他の端末やブラウザからは見えません</span>。
+              持ち出す・バックアップを取るなら <span class="font-medium">ファイル</span> タブか <span class="font-medium">書き出し</span> タブを使ってください。
+            </p>
+          </div>
+
+          <div id="idbStatusLine" class="text-[11px] text-gray-500 border border-gray-200 rounded px-3 py-2"></div>
+
+          <div class="border border-gray-200 rounded p-3 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">今すぐ保存 <span class="ml-1 font-mono text-[10px] bg-gray-100 border border-gray-300 rounded px-1 py-0.5 text-gray-600">Ctrl + S</span></div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                現在の状態をこのブラウザへ書き込みます。<span class="font-medium">変更のあった表だけ</span>を書き直すので、
+                表が増えても待たされません。自動保存があるので普段は不要ですが、タブを閉じる直前など
+                確実に書いておきたいときに押してください。
+              </p>
+            </div>
+            <button id="saveIdbBtn" class="shrink-0 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">保存</button>
+          </div>
+
+          <div class="border border-gray-200 rounded p-3 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">保存した状態を読み込む</div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                このブラウザに保存済みの内容で、<span class="font-medium">今の内容を置き換えます</span>。
+                編集を捨てて最後に保存した地点へ戻したいとき、または別のタブが行った更新を取り込むときに使います。
+              </p>
+            </div>
+            <button id="loadIdbBtn" class="shrink-0 bg-white hover:bg-gray-100 border border-gray-300 text-gray-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">読み込む</button>
+          </div>
+
+          <div class="border border-red-200 rounded p-3 flex items-center justify-between gap-3 bg-red-50/40">
+            <div>
+              <div class="text-sm font-semibold text-red-800">保存データを消して初期状態に戻す</div>
+              <p class="text-xs text-red-700/80 leading-relaxed mt-0.5">
+                このブラウザの保存データを削除し、サンプルデータだけの初期状態から作り直します。
+                <span class="font-medium">元に戻せません</span>。押すと確認画面が出ます。
+                残しておきたいものがあるなら、先に <span class="font-medium">ファイル</span> か <span class="font-medium">書き出し</span> で外へ出してください。
+              </p>
+            </div>
+            <button id="clearIdbBtn" class="shrink-0 bg-red-50 hover:bg-red-100 border border-red-300 text-red-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">初期化</button>
+          </div>
+        </div>
+
+        <!-- ============================================================
+             ファイル（File System Access API）
+             ============================================================ -->
+        <div id="dataPaneFile" class="dataPane hidden flex-col gap-3">
+          <div class="rounded border border-gray-200 bg-gray-50 p-3">
+            <p class="text-xs text-gray-600 leading-relaxed">
+              データベース全体を <code class="bg-white border border-gray-200 px-1 rounded">.luminadb</code> ファイルとしてディスクに置きます。
+              普通のアプリと同じ<span class="font-medium">「開く → 編集 → 上書き保存」</span>で、
+              別の端末へ持ち出す・世代のバックアップを取る・チームで共有するといった扱いができます。
+            </p>
+            <p class="text-xs text-gray-500 leading-relaxed mt-1.5">
+              中身は表・ビュー・トリガーなどを含む復元用のテキストです。SQL として読みたいだけなら
+              <span class="font-medium">書き出し</span> タブの SQL ダンプを使ってください。
+            </p>
+          </div>
+
+          <div id="openFileName" class="text-[11px] text-gray-500 border border-gray-200 rounded px-3 py-2"></div>
+          <div id="fileApiNote" class="hidden text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-3 py-2"></div>
+
+          <div class="border border-gray-200 rounded p-3 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">ファイルを開く</div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                保存済みの <code class="bg-gray-100 px-1 rounded">.luminadb</code> を読み込み、
+                <span class="font-medium">今の内容を置き換えます</span>。以後この画面の「上書き保存」はそのファイルへ書きます。
+              </p>
+            </div>
+            <button id="fileOpenBtn" class="shrink-0 bg-white hover:bg-gray-100 border border-gray-300 text-gray-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">開く</button>
+          </div>
+
+          <div class="border border-gray-200 rounded p-3 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">上書き保存 <span class="ml-1 font-mono text-[10px] bg-gray-100 border border-gray-300 rounded px-1 py-0.5 text-gray-600">Ctrl + Shift + S</span></div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                いま開いているファイルへ書き戻します。<span class="font-medium">ファイルを開くか一度「名前を付けて保存」するまでは押せません</span>
+                （どのファイルへ書くのかが決まらないため）。
+              </p>
+            </div>
+            <button id="fileSaveBtn" class="shrink-0 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm disabled:opacity-40 disabled:bg-gray-300 disabled:text-gray-600" disabled>上書き保存</button>
+          </div>
+
+          <div class="border border-gray-200 rounded p-3 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">名前を付けて保存</div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                保存先を選んで新しいファイルを作ります。日付を付けた世代バックアップを残すときにも使えます。
+              </p>
+            </div>
+            <button id="fileSaveAsBtn" class="shrink-0 bg-white hover:bg-gray-100 border border-gray-300 text-gray-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">名前を付けて保存</button>
+          </div>
+        </div>
+
         <!-- 書き出し -->
-        <div id="dataPaneExport" class="dataPane flex flex-col gap-3">
+        <div id="dataPaneExport" class="dataPane hidden flex-col gap-3">
           <div class="border border-gray-200 rounded p-3 flex flex-col gap-2">
             <div class="flex items-center justify-between gap-3">
               <div>
@@ -551,7 +659,9 @@
         <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">エディタタブを閉じる</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Alt + W</kbd></dd></div>
         <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">n 枚目のエディタタブへ</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Alt + 1 〜 9</kbd></dd></div>
         <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">実行計画を見る（実行しない）</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Shift + E</kbd></dd></div>
-        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">データの入出力パネル</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Shift + D</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">データ画面（保存 / 読み込み / 入出力）</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Shift + D</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">このブラウザへ保存</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + S</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">ファイルへ保存（開いていれば上書き）</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Shift + S</kbd></dd></div>
         <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">コンソールの開閉</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + `</kbd></dd></div>
         <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">補完の選択 / 確定</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">↑ ↓ / Enter · Tab</kbd></dd></div>
         <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">このヘルプ</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">?</kbd></dd></div>
@@ -632,84 +742,98 @@
 
   <!-- Engine: テーブル構造とSQLエンジン (engine-core が本体、他は prototype 拡張) -->
   <script src="js/engine/table.js?v=16"></script>
-  <script src="js/engine/engine-core.js?v=47"></script>
-  <script src="js/engine/engine-expression.js?v=49"></script>
-  <script src="js/engine/engine-subquery.js?v=27"></script>
-  <script src="js/engine/engine-select.js?v=48"></script>
-  <script src="js/engine/engine-dml.js?v=34"></script>
-  <script src="js/engine/engine-ddl.js?v=47"></script>
+  <script src="js/engine/engine-core.js?v=50"></script>
+  <script src="js/engine/engine-expression.js?v=54"></script>
+  <script src="js/engine/engine-subquery.js?v=30"></script>
+  <script src="js/engine/engine-select.js?v=52"></script>
+  <script src="js/engine/engine-dml.js?v=35"></script>
+  <script src="js/engine/engine-ddl.js?v=49"></script>
   <script src="js/engine/engine-transaction.js?v=13"></script>
-  <script src="js/engine/engine-io.js?v=23"></script>
+  <script src="js/engine/engine-io.js?v=24"></script>
   <!-- Storage: IndexedDB 永続化 -->
-  <script src="js/storage/idb.js?v=4"></script>
+  <script src="js/storage/idb.js?v=5"></script>
   <!-- UI: state を先頭に、描画系 → 入出力系の順で読み込む -->
   <script src="js/ui/state.js?v=2"></script>
-  <script src="js/ui/editor.js?v=24"></script>
-  <script src="js/ui/help.js?v=27"></script>
-  <script src="js/ui/modals.js?v=6"></script>
+  <script src="js/ui/editor.js?v=25"></script>
+  <script src="js/ui/help.js?v=28"></script>
+  <script src="js/ui/modals.js?v=7"></script>
   <script src="js/ui/schema-editor.js?v=3"></script>
   <script src="js/ui/results.js?v=8"></script>
   <script src="js/ui/table-tree.js?v=7"></script>
   <script src="js/ui/schema-insight.js?v=1"></script>
-  <script src="js/ui/data-io.js?v=8"></script>
+  <script src="js/ui/data-io.js?v=9"></script>
   <script src="js/ui/query-runner.js?v=11"></script>
   <script src="js/ui/console.js?v=4"></script>
   <!-- API: 外部クエリ受付 (fetch インターセプト / window.LuminaDB / postMessage) -->
   <script src="js/api/api.js?v=15"></script>
   <!-- Tests & Bootstrap -->
-  <script src="js/tests/test-suite-extra.js?v=14"></script>
-  <script src="js/tests/test-suite-features.js?v=4"></script>
-  <script src="js/tests/test-suite-fixes.js?v=1"></script>
-  <script src="js/tests/test-suite-v2.js?v=3"></script>
-  <script src="js/tests/test-suite-v3.js?v=1"></script>
-  <script src="js/tests/test-suite-v4.js?v=1"></script>
-  <script src="js/tests/test-suite-v5.js?v=1"></script>
-  <script src="js/tests/test-suite-v6.js?v=2"></script>
-  <script src="js/tests/test-suite-v7.js?v=2"></script>
-  <script src="js/tests/test-suite-v8.js?v=1"></script>
+  <script src="js/tests/test-helpers.js?v=2"></script>
+  <script src="js/tests/test-suite-extra.js?v=15"></script>
+  <script src="js/tests/test-suite-features.js?v=5"></script>
+  <script src="js/tests/test-suite-fixes.js?v=2"></script>
+  <script src="js/tests/test-suite-v2.js?v=4"></script>
+  <script src="js/tests/test-suite-v3.js?v=2"></script>
+  <script src="js/tests/test-suite-v4.js?v=2"></script>
+  <script src="js/tests/test-suite-v5.js?v=2"></script>
+  <script src="js/tests/test-suite-v6.js?v=3"></script>
+  <script src="js/tests/test-suite-v7.js?v=3"></script>
+  <script src="js/tests/test-suite-v8.js?v=2"></script>
   <script src="js/tests/test-suite-v9.js?v=1"></script>
   <script src="js/tests/test-suite-v10.js?v=2"></script>
   <script src="js/tests/test-suite-v11.js?v=1"></script>
-  <script src="js/tests/test-suite-v12.js?v=2"></script>
-  <script src="js/tests/test-suite-v13.js?v=4"></script>
-  <script src="js/tests/test-suite-v14.js?v=5"></script>
-  <script src="js/tests/test-suite-v15.js?v=1"></script>
-  <script src="js/tests/test-suite-v16.js?v=2"></script>
-  <script src="js/tests/test-suite-v17.js?v=4"></script>
-  <script src="js/tests/test-suite-v18.js?v=3"></script>
-  <script src="js/tests/test-suite-v19.js?v=2"></script>
-  <script src="js/tests/test-suite-v20.js?v=3"></script>
-  <script src="js/tests/test-suite-v21.js?v=4"></script>
-  <script src="js/tests/test-suite-v22.js?v=2"></script>
-  <script src="js/tests/test-suite-v23.js?v=4"></script>
-  <script src="js/tests/test-suite-v24.js?v=1"></script>
-  <script src="js/tests/test-suite-v25.js?v=2"></script>
-  <script src="js/tests/test-suite-v26.js?v=2"></script>
-  <script src="js/tests/test-suite-v27.js?v=4"></script>
-  <script src="js/tests/test-suite-v28.js?v=2"></script>
-  <script src="js/tests/test-suite-v29.js?v=2"></script>
-  <script src="js/tests/test-suite-v30.js?v=2"></script>
-  <script src="js/tests/test-suite-v31.js?v=2"></script>
-  <script src="js/tests/test-suite-v32.js?v=2"></script>
-  <script src="js/tests/test-suite-v33.js?v=6"></script>
-  <script src="js/tests/test-suite-v34.js?v=1"></script>
-  <script src="js/tests/test-suite-v35.js?v=1"></script>
-  <script src="js/tests/test-suite-v36.js?v=1"></script>
-  <script src="js/tests/test-suite-v37.js?v=1"></script>
-  <script src="js/tests/test-suite-v38.js?v=1"></script>
-  <script src="js/tests/test-suite-v39.js?v=1"></script>
-  <script src="js/tests/test-suite-v40.js?v=1"></script>
-  <script src="js/tests/test-suite-v41.js?v=1"></script>
-  <script src="js/tests/test-suite-v42.js?v=1"></script>
-  <script src="js/tests/test-suite-v43.js?v=1"></script>
-  <script src="js/tests/test-suite-v44.js?v=1"></script>
-  <script src="js/tests/test-suite-v45.js?v=1"></script>
-  <script src="js/tests/test-suite-v46.js?v=1"></script>
-  <script src="js/tests/test-suite-v47.js?v=1"></script>
-  <script src="js/tests/test-suite-v48.js?v=1"></script>
-  <script src="js/tests/test-suite-v49.js?v=1"></script>
-  <script src="js/tests/test-suite-v50.js?v=1"></script>
-  <script src="js/tests/test-suite.js?v=46"></script>
+  <script src="js/tests/test-suite-v12.js?v=3"></script>
+  <script src="js/tests/test-suite-v13.js?v=5"></script>
+  <script src="js/tests/test-suite-v14.js?v=6"></script>
+  <script src="js/tests/test-suite-v15.js?v=2"></script>
+  <script src="js/tests/test-suite-v16.js?v=3"></script>
+  <script src="js/tests/test-suite-v17.js?v=5"></script>
+  <script src="js/tests/test-suite-v18.js?v=4"></script>
+  <script src="js/tests/test-suite-v19.js?v=3"></script>
+  <script src="js/tests/test-suite-v20.js?v=4"></script>
+  <script src="js/tests/test-suite-v21.js?v=5"></script>
+  <script src="js/tests/test-suite-v22.js?v=3"></script>
+  <script src="js/tests/test-suite-v23.js?v=5"></script>
+  <script src="js/tests/test-suite-v24.js?v=3"></script>
+  <script src="js/tests/test-suite-v25.js?v=4"></script>
+  <script src="js/tests/test-suite-v26.js?v=4"></script>
+  <script src="js/tests/test-suite-v27.js?v=6"></script>
+  <script src="js/tests/test-suite-v28.js?v=4"></script>
+  <script src="js/tests/test-suite-v29.js?v=5"></script>
+  <script src="js/tests/test-suite-v30.js?v=4"></script>
+  <script src="js/tests/test-suite-v31.js?v=4"></script>
+  <script src="js/tests/test-suite-v32.js?v=5"></script>
+  <script src="js/tests/test-suite-v33.js?v=8"></script>
+  <script src="js/tests/test-suite-v34.js?v=3"></script>
+  <script src="js/tests/test-suite-v35.js?v=2"></script>
+  <script src="js/tests/test-suite-v36.js?v=2"></script>
+  <script src="js/tests/test-suite-v37.js?v=2"></script>
+  <script src="js/tests/test-suite-v38.js?v=2"></script>
+  <script src="js/tests/test-suite-v39.js?v=2"></script>
+  <script src="js/tests/test-suite-v40.js?v=2"></script>
+  <script src="js/tests/test-suite-v41.js?v=2"></script>
+  <script src="js/tests/test-suite-v42.js?v=2"></script>
+  <script src="js/tests/test-suite-v43.js?v=2"></script>
+  <script src="js/tests/test-suite-v44.js?v=2"></script>
+  <script src="js/tests/test-suite-v45.js?v=2"></script>
+  <script src="js/tests/test-suite-v46.js?v=2"></script>
+  <script src="js/tests/test-suite-v47.js?v=2"></script>
+  <script src="js/tests/test-suite-v48.js?v=2"></script>
+  <script src="js/tests/test-suite-v49.js?v=2"></script>
+  <script src="js/tests/test-suite-v50.js?v=2"></script>
+  <script src="js/tests/test-suite-v51.js?v=2"></script>
+  <script src="js/tests/test-suite-v52.js?v=2"></script>
+  <script src="js/tests/test-suite-v53.js?v=2"></script>
+  <script src="js/tests/test-suite-v54.js?v=2"></script>
+  <script src="js/tests/test-suite-v55.js?v=2"></script>
+  <script src="js/tests/test-suite-v56.js?v=2"></script>
+  <script src="js/tests/test-suite-v57.js?v=1"></script>
+  <script src="js/tests/test-suite-v58.js?v=1"></script>
+  <script src="js/tests/test-suite-v59.js?v=1"></script>
+  <script src="js/tests/test-suite-v60.js?v=1"></script>
+  <script src="js/tests/test-suite-v61.js?v=1"></script>
+  <script src="js/tests/test-suite-v62.js?v=1"></script>
+  <script src="js/tests/test-suite-v63.js?v=1"></script>
+  <script src="js/tests/test-suite.js?v=53"></script>
   <script src="js/main.js"></script>
 </body>
 </html>

@@ -16,14 +16,8 @@
     //   test-suite.js の tests 配列へ getV33Tests() のスプレッドで合流する
     // ============================================================================
     function getV33Tests() {
-      const T = [];
-      const err = (name, sql, frag) => T.push({
-        name, sql, isErrorExpected: true,
-        check: r => !!r.error && (!frag || r.error.toLowerCase().includes(String(frag).toLowerCase()))
-      });
-      const fn = (name, f) => T.push({ name, fn: f });
-      const q = (sql) => db.executeQuery(sql);
-      const one = (sql) => { const r = q(sql); return r.error ? { __err: r.error } : Object.values(r.data[0])[0]; };
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, err, t: fn, q, oneSafe: one } = makeTestKit('V33');
       const plan = (sql) => { const r = q(sql); return r.error ? null : r.data; };
       const ops = (sql) => { const p = plan(sql); return p ? p.map(x => x.Operation) : ['ERR']; };
 

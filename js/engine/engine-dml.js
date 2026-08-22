@@ -1974,21 +1974,39 @@
       // expandSubqueries より前（executeQuery のディスパッチ直前）に呼ぶこと。
       // 括弧の外（トップレベル）に現れる最初のキーワード位置を返す。無ければ -1。
       // サブクエリ内の FROM / WHERE を句の区切りと誤認しないために必要
+      // 2 語以上のキーワード（'order by'）は、語の間の空白を \s+ で受ける。
+      // 単純な substr 比較だと `ORDER\nBY` や `ORDER  BY` が一致せず、
+      // GROUP_CONCAT(x ORDER\nBY y) の ORDER BY が引数の一部として扱われていた
       _topLevelKeyword(sql, word, startAt) {
-          const w = word.toLowerCase(), len = w.length;
+          const w = word.trim().toLowerCase(), len = w.length;
+          const multi = /\s/.test(w);
+          const re = multi ? new RegExp(w.split(/\s+/).join('\\s+'), 'iy') : null;
           let depth = 0;
           for (let i = 0; i < sql.length; i++) {
               const c = sql[i];
               if (c === '(') { depth++; continue; }
               if (c === ')') { depth--; continue; }
               if (depth !== 0 || i < (startAt || 0)) continue;
-              if (sql.substr(i, len).toLowerCase() !== w) continue;
+              let mlen = len;
+              if (multi) {
+                  re.lastIndex = i;
+                  if (!re.test(sql)) continue;
+                  mlen = re.lastIndex - i;
+              } else if (sql.substr(i, len).toLowerCase() !== w) continue;
               if (i > 0 && /[a-zA-Z0-9_]/.test(sql[i - 1])) continue;
-              const after = sql[i + len];
+              const after = sql[i + mlen];
               if (after !== undefined && /[a-zA-Z0-9_]/.test(after)) continue;
               return i;
           }
           return -1;
+      },
+
+      // _topLevelKeyword が見つけた位置のキーワード長（語間の空白を含む実長）を返す。
+      // 'order by' のように語数が固定でも空白幅が可変な語で、直後の本文を切り出すのに使う
+      _keywordLenAt(sql, at, word) {
+          const re = new RegExp(word.trim().toLowerCase().split(/\s+/).join('\\s+'), 'iy');
+          re.lastIndex = at;
+          return re.test(sql) ? re.lastIndex - at : word.length;
       },
 
       // 複数表 UPDATE/DELETE のソースが派生表（`FROM (VALUES ...)` / `FROM (SELECT ...)`）の

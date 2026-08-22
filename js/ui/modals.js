@@ -61,19 +61,24 @@
         b.addEventListener('click', () => showDataTab(b.dataset.pane));
     });
 
-    // データモーダルを指定タブで開く（他所からの入口）
+    // データモーダルを指定タブで開く（他所からの入口）。
+    // 開くたびに保存状態の表示を作り直す（前回開いたときの数字が残らないように）
     function openDataModal(paneId) {
         if (paneId) showDataTab(paneId);
+        if (typeof refreshStorageInfo === 'function') refreshStorageInfo();
         openModal('dataModal');
     }
-    // サイドバーの Data ボタンからは必ず先頭タブ（書き出し）で開く。
+    // サイドバーのボタンからは必ず先頭タブ（このブラウザ）で開く。
     // 前回どのタブを見ていたかで入口の見た目が変わらないようにする
     const openDataBtnEl = document.getElementById('openDataBtn');
-    if (openDataBtnEl) openDataBtnEl.addEventListener('click', () => showDataTab('dataPaneExport'));
+    if (openDataBtnEl) openDataBtnEl.addEventListener('click', () => {
+        showDataTab('dataPaneBrowser');
+        if (typeof refreshStorageInfo === 'function') refreshStorageInfo();
+    });
     // Ctrl+Shift+D で開く
     document.addEventListener('keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'd') {
             e.preventDefault();
-            openDataModal('dataPaneExport');
+            openDataModal('dataPaneBrowser');
         }
     });

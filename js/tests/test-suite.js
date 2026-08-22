@@ -45,15 +45,15 @@
         // 型・制約に関するテスト
         { name: "Create Typed Table", sql: "CREATE TABLE test_types (i INTEGER, f FLOAT, t TEXT, b BOOLEAN, d DATE)", check: r => r.data[0].Result === "Success" },
         { name: "Insert Valid Types", sql: "INSERT INTO test_types (i, f, t, b, d) VALUES (1, 1.5, 'text', true, '2025-01-01')", check: r => r.data[0].Message.includes('1') },
-        { name: "Insert Invalid INTEGER", sql: "INSERT INTO test_types (i) VALUES ('abc')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
-        { name: "Insert Invalid FLOAT", sql: "INSERT INTO test_types (f) VALUES ('abc')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
-        { name: "Insert Invalid BOOLEAN", sql: "INSERT INTO test_types (b) VALUES ('abc')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
-        { name: "Insert Invalid DATE", sql: "INSERT INTO test_types (d) VALUES ('invalid-date')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
-        { name: "Update with Invalid Type", sql: "UPDATE test_types SET i = 'XYZ' WHERE i = 1", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
+        errCase("Insert Invalid INTEGER", "INSERT INTO test_types (i) VALUES ('abc')", 'Type mismatch'),
+        errCase("Insert Invalid FLOAT", "INSERT INTO test_types (f) VALUES ('abc')", 'Type mismatch'),
+        errCase("Insert Invalid BOOLEAN", "INSERT INTO test_types (b) VALUES ('abc')", 'Type mismatch'),
+        errCase("Insert Invalid DATE", "INSERT INTO test_types (d) VALUES ('invalid-date')", 'Type mismatch'),
+        errCase("Update with Invalid Type", "UPDATE test_types SET i = 'XYZ' WHERE i = 1", 'Type mismatch'),
 
-        { name: "Neg: Insert Float to Integer", sql: "INSERT INTO test_types (i) VALUES (1.5)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
-        { name: "Neg: Insert String to Integer", sql: "INSERT INTO test_types (i) VALUES ('123a')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
-        { name: "Neg: Insert Number to Date", sql: "INSERT INTO test_types (d) VALUES (20250101)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
+        errCase("Neg: Insert Float to Integer", "INSERT INTO test_types (i) VALUES (1.5)", 'Type mismatch'),
+        errCase("Neg: Insert String to Integer", "INSERT INTO test_types (i) VALUES ('123a')", 'Type mismatch'),
+        errCase("Neg: Insert Number to Date", "INSERT INTO test_types (d) VALUES (20250101)", 'Type mismatch'),
 
         // ALTER TABLE テスト
         { name: "DDL: ALTER ADD COLUMN", sql: "ALTER TABLE test_types ADD COLUMN extra_col TEXT", check: r => db.tables['test_types'].getColumnNames().includes('extra_col') },
@@ -67,10 +67,10 @@
         { name: "FK: Insert Parent", sql: "INSERT INTO fk_parent (id) VALUES (1), (2)", check: r => true },
         { name: "FK: Create Child", sql: "CREATE TABLE fk_child (id INTEGER, p_id INTEGER, FOREIGN KEY (p_id) REFERENCES fk_parent(id))", check: r => true },
         { name: "FK: Insert Valid Child", sql: "INSERT INTO fk_child (id, p_id) VALUES (10, 1)", check: r => r.data[0].Message.includes('1') },
-        { name: "FK: Insert Invalid Child", sql: "INSERT INTO fk_child (id, p_id) VALUES (20, 99)", isErrorExpected: true, check: r => r.error && r.error.includes('Foreign key constraint failed') },
-        { name: "FK: Delete Parent Blocked", sql: "DELETE FROM fk_parent WHERE id = 1", isErrorExpected: true, check: r => r.error && r.error.includes('Foreign key constraint failed') },
-        { name: "FK: Update Child Invalid", sql: "UPDATE fk_child SET p_id = 99 WHERE id = 10", isErrorExpected: true, check: r => r.error && r.error.includes('Foreign key constraint failed') },
-        { name: "FK: Update Parent Blocked", sql: "UPDATE fk_parent SET id = 99 WHERE id = 1", isErrorExpected: true, check: r => r.error && r.error.includes('Foreign key constraint failed') },
+        errCase("FK: Insert Invalid Child", "INSERT INTO fk_child (id, p_id) VALUES (20, 99)", 'Foreign key constraint failed'),
+        errCase("FK: Delete Parent Blocked", "DELETE FROM fk_parent WHERE id = 1", 'Foreign key constraint failed'),
+        errCase("FK: Update Child Invalid", "UPDATE fk_child SET p_id = 99 WHERE id = 10", 'Foreign key constraint failed'),
+        errCase("FK: Update Parent Blocked", "UPDATE fk_parent SET id = 99 WHERE id = 1", 'Foreign key constraint failed'),
         { name: "FK: Delete Parent Allowed", sql: "DELETE FROM fk_parent WHERE id = 2", check: r => r.data[0].Message.includes('1') },
 
         // コア技術動作テスト
@@ -263,41 +263,41 @@
         { name: "Cplx6: Window Func No Partition", sql: "SELECT id, age, RANK() OVER(ORDER BY age ASC) as rn FROM users ORDER BY age ASC LIMIT 3", check: r => r.data[0].rn === 1 && r.data[2].rn === 3 },
 
         // Negative Tests & Extra Boundaries (異常系 Part 2 + ランダムファジング)
-        { name: "Neg: Empty Query", sql: "   ", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: SELECT without FROM", sql: "SELECT * test_a", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: SELECT missing col", sql: "SELECT no_such_col FROM test_a", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: GROUP BY missing col", sql: "SELECT COUNT(*) FROM test_a GROUP BY no_such_col", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: ORDER BY missing col", sql: "SELECT * FROM test_a ORDER BY no_such_col", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: INSERT without INTO", sql: "INSERT test_a (id) VALUES (1)", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: UPDATE without SET", sql: "UPDATE test_a id = 1", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: DELETE without FROM", sql: "DELETE test_a WHERE id = 1", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: DROP missing table", sql: "DROP TABLE missing_table", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: TRUNCATE missing table", sql: "TRUNCATE TABLE missing_table", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: CREATE INDEX missing tbl", sql: "CREATE INDEX idx1 ON missing_tbl (id)", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: CREATE INDEX missing col", sql: "CREATE INDEX idx1 ON test_a (missing_col)", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg: Empty Query", "   "),
+        errCase("Neg: SELECT without FROM", "SELECT * test_a"),
+        errCase("Neg: SELECT missing col", "SELECT no_such_col FROM test_a"),
+        errCase("Neg: GROUP BY missing col", "SELECT COUNT(*) FROM test_a GROUP BY no_such_col"),
+        errCase("Neg: ORDER BY missing col", "SELECT * FROM test_a ORDER BY no_such_col"),
+        errCase("Neg: INSERT without INTO", "INSERT test_a (id) VALUES (1)"),
+        errCase("Neg: UPDATE without SET", "UPDATE test_a id = 1"),
+        errCase("Neg: DELETE without FROM", "DELETE test_a WHERE id = 1"),
+        errCase("Neg: DROP missing table", "DROP TABLE missing_table"),
+        errCase("Neg: TRUNCATE missing table", "TRUNCATE TABLE missing_table"),
+        errCase("Neg: CREATE INDEX missing tbl", "CREATE INDEX idx1 ON missing_tbl (id)"),
+        errCase("Neg: CREATE INDEX missing col", "CREATE INDEX idx1 ON test_a (missing_col)"),
         { name: "Neg: Double BEGIN", fn: () => { db.executeQuery("BEGIN"); let r = db.executeQuery("BEGIN"); db.executeQuery("ROLLBACK"); return r.error !== undefined; }},
         { name: "Neg: Double COMMIT", fn: () => { db.executeQuery("BEGIN"); db.executeQuery("COMMIT"); let r = db.executeQuery("COMMIT"); return r.error !== undefined; }},
         { name: "Neg: Double ROLLBACK", fn: () => { db.executeQuery("BEGIN"); db.executeQuery("ROLLBACK"); let r = db.executeQuery("ROLLBACK"); return r.error !== undefined; }},
-        { name: "Neg: SELECT missing table", sql: "SELECT * FROM not_exists", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg: SELECT missing table", "SELECT * FROM not_exists"),
         { name: "Neg: WHERE invalid math", sql: "SELECT * FROM test_a WHERE val + 'abc' = 100", check: r => r.data.length === 0 },
-        { name: "Neg: INSERT values missing", sql: "INSERT INTO test_a (id, val) VALUES ()", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: UPDATE Syntax Error", sql: "UPDATE test_a SET val = 10 WHERE", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: CREATE TABLE Syntax", sql: "CREATE TABLE", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: CREATE TABLE missing name", sql: "CREATE TABLE ()", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: CREATE TABLE existing name", sql: "CREATE TABLE test_a (id)", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: INSERT missing values", sql: "INSERT INTO test_a (id) VALUES ", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: DROP missing table 2", sql: "DROP TABLE not_exists", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: Update Invalid Col", sql: "UPDATE test_a SET invalid_col = 1", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: Update syntax", sql: "UPDATE test_a 1=1", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: Delete syntax", sql: "DELETE test_a", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg: Select invalid func", sql: "SELECT NOT_EXISTS_FUNC(val) FROM test_a", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg: INSERT values missing", "INSERT INTO test_a (id, val) VALUES ()"),
+        errCase("Neg: UPDATE Syntax Error", "UPDATE test_a SET val = 10 WHERE"),
+        errCase("Neg: CREATE TABLE Syntax", "CREATE TABLE"),
+        errCase("Neg: CREATE TABLE missing name", "CREATE TABLE ()"),
+        errCase("Neg: CREATE TABLE existing name", "CREATE TABLE test_a (id)"),
+        errCase("Neg: INSERT missing values", "INSERT INTO test_a (id) VALUES "),
+        errCase("Neg: DROP missing table 2", "DROP TABLE not_exists"),
+        errCase("Neg: Update Invalid Col", "UPDATE test_a SET invalid_col = 1"),
+        errCase("Neg: Update syntax", "UPDATE test_a 1=1"),
+        errCase("Neg: Delete syntax", "DELETE test_a"),
+        errCase("Neg: Select invalid func", "SELECT NOT_EXISTS_FUNC(val) FROM test_a"),
 
         { name: "Edge: Multi-Delete Empty", sql: "DELETE FROM test_empty WHERE id = 1", check: r => r.data[0].Message.includes('0 rows') },
         { name: "Edge: Multi-Update Empty", sql: "UPDATE test_empty SET none = 1 WHERE id = 1", check: r => r.data[0].Message.includes('0 rows') },
         { name: "Edge: Huge LIMIT & OFFSET", sql: "SELECT * FROM test_a LIMIT 1000000 OFFSET 1000000", check: r => r.data.length === 0 },
         { name: "Fuzz: Whitespace padding", sql: "   \n\t  SELECT \n\n * \t FROM \t  test_a \n LIMIT 1  \n", check: r => r.data.length === 1 },
         { name: "Fuzz: Mixed Case Query", sql: "sElEcT iD fRoM TESt_a wHeRe Id = 1", check: r => r.data.length === 1 && parseInt(Object.values(r.data[0])[0]) === 1 },
-        { name: "Edge: Quote not closed", sql: "SELECT * FROM test_a WHERE category = 'Cat1", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Edge: Quote not closed", "SELECT * FROM test_a WHERE category = 'Cat1"),
 
         // Edge Cases & Boundary Part 2
         { name: "Edge: NULL Math operations", sql: "SELECT val + 10 as v FROM test_a WHERE val IS NULL LIMIT 1", check: r => r.data.length === 0 || isNaN(r.data[0].v) || r.data[0].v === 10 || r.data[0].v === null },
@@ -572,9 +572,9 @@
              return !!(isSoA && isTypedArray);
         }},
         { name: "Type Bounds: BOOLEAN Valid Set", sql: "INSERT INTO test_types (b) VALUES (1), (0), ('true'), ('FALSE')", check: r => r.data[0].Message.includes('4') },
-        { name: "Type Bounds: BOOLEAN Invalid Value", sql: "INSERT INTO test_types (b) VALUES ('yes')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
+        errCase("Type Bounds: BOOLEAN Invalid Value", "INSERT INTO test_types (b) VALUES ('yes')", 'Type mismatch'),
         { name: "Type Bounds: DATE ISO Format", sql: "INSERT INTO test_types (d) VALUES ('2026-12-31T23:59:59Z')", check: r => r.data[0].Message.includes('1') },
-        { name: "Type Bounds: DATE Invalid Format", sql: "INSERT INTO test_types (d) VALUES ('2026/12/31')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
+        errCase("Type Bounds: DATE Invalid Format", "INSERT INTO test_types (d) VALUES ('2026/12/31')", 'Type mismatch'),
         { name: "Type Bounds: INTEGER Max Safe", sql: "INSERT INTO test_types (i) VALUES (9007199254740991)", check: r => r.data[0].Message.includes('1') },
         { name: "Type Bounds: FLOAT Extreme", sql: "INSERT INTO test_types (f) VALUES (1e308)", check: r => r.data[0].Message.includes('1') },
         { name: "Neg: Add Column existing name", fn: () => { const r = db.executeQuery("ALTER TABLE test_types ADD COLUMN i TEXT"); return r.error !== undefined; } },
@@ -594,8 +594,8 @@
         { name: "View: View of View Create", sql: "CREATE VIEW v_seniors AS SELECT * FROM v_adults WHERE age >= 35", check: r => r.data[0].Result === "Success" },
         { name: "View: Select View of View", sql: "SELECT name, age FROM v_seniors ORDER BY age ASC", check: r => r.data.length === 2 && r.data[0].name === 'Dave' && r.data[1].name === 'Frank' },
         { name: "View: Export SQL includes View", fn: () => db.exportSQL().includes('CREATE VIEW v_adults AS') },
-        { name: "Neg View: Duplicate Name", sql: "CREATE VIEW v_adults AS SELECT * FROM users", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg View: Conflicts with Table", sql: "CREATE VIEW users AS SELECT * FROM orders", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg View: Duplicate Name", "CREATE VIEW v_adults AS SELECT * FROM users"),
+        errCase("Neg View: Conflicts with Table", "CREATE VIEW users AS SELECT * FROM orders"),
         // v1.18: 単一表ビューは更新可能になった（旧: 明示エラー）。共有テーブルを汚さないよう
         // 専用のテーブル／ビューを立てて検証する
         { name: "View: Delete Through View", fn: () => {
@@ -612,16 +612,16 @@
             return !r.error && left.data[0].c === 1 && outside.data[0].Message.startsWith('0 rows') && still.data[0].c === 1;
         }},
         { name: "View: Drop", sql: "DROP VIEW v_adults", check: r => r.data[0].Result === "Success" },
-        { name: "Neg View: Select After Drop", sql: "SELECT * FROM v_adults", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg View: Drop Missing", sql: "DROP VIEW v_missing", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg View: Select After Drop", "SELECT * FROM v_adults"),
+        errCase("Neg View: Drop Missing", "DROP VIEW v_missing"),
 
         // UNIQUE Constraint
         { name: "Unique: Create Table", sql: "CREATE TABLE test_uq (id INTEGER, email TEXT UNIQUE)", check: r => r.data[0].Result === "Success" },
         { name: "Unique: Insert Distinct", sql: "INSERT INTO test_uq (id, email) VALUES (1, 'a@example.com'), (2, 'b@example.com')", check: r => r.data[0].Message.includes('2') },
-        { name: "Neg Unique: Insert Duplicate", sql: "INSERT INTO test_uq (id, email) VALUES (3, 'a@example.com')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('UNIQUE constraint failed') },
-        { name: "Neg Unique: Batch Duplicate", sql: "INSERT INTO test_uq (id, email) VALUES (4, 'x@example.com'), (5, 'x@example.com')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('UNIQUE constraint failed') },
+        errCase("Neg Unique: Insert Duplicate", "INSERT INTO test_uq (id, email) VALUES (3, 'a@example.com')", 'UNIQUE constraint failed'),
+        errCase("Neg Unique: Batch Duplicate", "INSERT INTO test_uq (id, email) VALUES (4, 'x@example.com'), (5, 'x@example.com')", 'UNIQUE constraint failed'),
         { name: "Unique: NULLs Allowed", sql: "INSERT INTO test_uq (id, email) VALUES (6, null), (7, null)", check: r => r.data[0].Message.includes('2') },
-        { name: "Neg Unique: Update to Duplicate", sql: "UPDATE test_uq SET email = 'a@example.com' WHERE id = 2", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('UNIQUE constraint failed') },
+        errCase("Neg Unique: Update to Duplicate", "UPDATE test_uq SET email = 'a@example.com' WHERE id = 2", 'UNIQUE constraint failed'),
         { name: "Unique: Update to Fresh Value", sql: "UPDATE test_uq SET email = 'c@example.com' WHERE id = 2", check: r => r.data[0].Message.includes('1') },
         { name: "Unique: Update Same Value OK", sql: "UPDATE test_uq SET email = 'c@example.com' WHERE id = 2", check: r => r.data[0].Message.includes('1') },
         { name: "Unique: Auto Index Created", fn: () => !!db.tables['test_uq'].indices['email'] },
@@ -629,17 +629,17 @@
         // PRIMARY KEY
         { name: "PK: Create Table (Column Level)", sql: "CREATE TABLE test_pk (id INTEGER PRIMARY KEY, name TEXT)", check: r => r.data[0].Result === "Success" },
         { name: "PK: Insert Valid", sql: "INSERT INTO test_pk (id, name) VALUES (1, 'first'), (2, 'second')", check: r => r.data[0].Message.includes('2') },
-        { name: "Neg PK: Insert Duplicate", sql: "INSERT INTO test_pk (id, name) VALUES (1, 'dup')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('PRIMARY KEY constraint failed') },
-        { name: "Neg PK: Insert NULL", sql: "INSERT INTO test_pk (id, name) VALUES (null, 'nopk')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('PRIMARY KEY constraint failed') },
-        { name: "Neg PK: Missing PK Column", sql: "INSERT INTO test_pk (name) VALUES ('nokey')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('PRIMARY KEY constraint failed') },
-        { name: "Neg PK: Update to Duplicate", sql: "UPDATE test_pk SET id = 1 WHERE id = 2", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('PRIMARY KEY constraint failed') },
+        errCase("Neg PK: Insert Duplicate", "INSERT INTO test_pk (id, name) VALUES (1, 'dup')", 'PRIMARY KEY constraint failed'),
+        errCase("Neg PK: Insert NULL", "INSERT INTO test_pk (id, name) VALUES (null, 'nopk')", 'PRIMARY KEY constraint failed'),
+        errCase("Neg PK: Missing PK Column", "INSERT INTO test_pk (name) VALUES ('nokey')", 'PRIMARY KEY constraint failed'),
+        errCase("Neg PK: Update to Duplicate", "UPDATE test_pk SET id = 1 WHERE id = 2", 'PRIMARY KEY constraint failed'),
         { name: "PK: Update to Fresh Key", sql: "UPDATE test_pk SET id = 99 WHERE id = 2", check: r => r.data[0].Message.includes('1') },
         { name: "PK: Auto Index Created", fn: () => !!db.tables['test_pk'].indices['id'] },
         { name: "PK: Table Level Syntax", sql: "CREATE TABLE test_pk2 (a INTEGER, b TEXT, PRIMARY KEY (a))", check: r => r.data[0].Result === "Success" },
         { name: "PK: Table Level Insert", sql: "INSERT INTO test_pk2 (a, b) VALUES (10, 'x')", check: r => r.data[0].Message.includes('1') },
-        { name: "Neg PK: Table Level Duplicate", sql: "INSERT INTO test_pk2 (a, b) VALUES (10, 'y')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('PRIMARY KEY constraint failed') },
+        errCase("Neg PK: Table Level Duplicate", "INSERT INTO test_pk2 (a, b) VALUES (10, 'y')", 'PRIMARY KEY constraint failed'),
         { name: "PK: Export SQL includes Constraints", fn: () => { const s = db.exportSQL(); return s.includes('id INTEGER PRIMARY KEY') && s.includes('email TEXT UNIQUE'); } },
-        { name: "Neg PK: Multiple PK Definition", sql: "CREATE TABLE test_pk3 (a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY)", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg PK: Multiple PK Definition", "CREATE TABLE test_pk3 (a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY)"),
 
         // UNION
         { name: "Union: Dedup Overlap", sql: "SELECT name FROM users WHERE id <= 2 UNION SELECT name FROM users WHERE id >= 2 ORDER BY name ASC", check: r => r.data.length === 10 && r.data[0].name === 'Alice' },
@@ -649,7 +649,7 @@
         { name: "Union: Order & Limit on Result", sql: "SELECT id FROM users WHERE id <= 3 UNION SELECT id FROM users WHERE id >= 8 ORDER BY id DESC LIMIT 2", check: r => r.data.length === 2 && r.data[0].id === 10 && r.data[1].id === 9 },
         { name: "Union: Three Segments Mixed", sql: "SELECT id FROM users WHERE id = 1 UNION SELECT id FROM users WHERE id = 2 UNION ALL SELECT id FROM users WHERE id = 2", check: r => r.data.length === 3 },
         { name: "Union: With Aggregates", sql: "SELECT COUNT(*) as c FROM users UNION ALL SELECT COUNT(*) as c FROM products", check: r => r.data.length === 2 && r.data[0].c === 10 && r.data[1].c === 5 },
-        { name: "Neg Union: Column Count Mismatch", sql: "SELECT id, name FROM users UNION SELECT id FROM users", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg Union: Column Count Mismatch", "SELECT id, name FROM users UNION SELECT id FROM users"),
 
         // EXISTS
         { name: "Exists: True Subquery", sql: "SELECT COUNT(*) as c FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE amount > 4)", check: r => r.data[0].c === 10 },
@@ -665,11 +665,11 @@
         { name: "Proc: Call Twice Accumulates", sql: "CALL proc_seed", check: r => r.data.length === 4 },
         { name: "Proc: Single Statement (No BEGIN)", sql: "CREATE PROCEDURE proc_cnt AS SELECT COUNT(*) as c FROM test_proc", check: r => r.data[0].Result === "Success" },
         { name: "Proc: Call Single Statement", sql: "CALL proc_cnt", check: r => r.data[0].c === 4 },
-        { name: "Neg Proc: Duplicate Name", sql: "CREATE PROCEDURE proc_cnt AS SELECT 1 FROM users", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg Proc: Call Missing", sql: "CALL proc_nope", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg Proc: Duplicate Name", "CREATE PROCEDURE proc_cnt AS SELECT 1 FROM users"),
+        errCase("Neg Proc: Call Missing", "CALL proc_nope"),
         { name: "Proc: Drop", sql: "DROP PROCEDURE proc_seed", check: r => r.data[0].Result === "Success" },
-        { name: "Neg Proc: Call After Drop", sql: "CALL proc_seed", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg Proc: Drop Missing", sql: "DROP PROCEDURE proc_missing", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg Proc: Call After Drop", "CALL proc_seed"),
+        errCase("Neg Proc: Drop Missing", "DROP PROCEDURE proc_missing"),
 
         // ============================================================
         // Added Commands: SHOW / DESCRIBE / DROP INDEX / RENAME TO /
@@ -691,7 +691,7 @@
             db.executeQuery("DROP PROCEDURE p_show");
             return !r.error && r.data.some(d => d.Procedure === 'p_show');
         }},
-        { name: "Neg Show: Unknown Target", sql: "SHOW WIDGETS", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg Show: Unknown Target", "SHOW WIDGETS"),
 
         // DESCRIBE / DESC
         { name: "Describe: Typed Table", sql: "DESCRIBE test_types", check: r => r.data.length === 5 && r.data[0].Column === 'i' && r.data[0].Type === 'INTEGER' },
@@ -704,7 +704,7 @@
             db.executeQuery("DROP VIEW v_desc");
             return !r.error && r.data[0].View === 'v_desc' && r.data[0].Definition.toLowerCase().includes('select');
         }},
-        { name: "Neg Describe: Missing Table", sql: "DESCRIBE no_such_table", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg Describe: Missing Table", "DESCRIBE no_such_table"),
 
         // DROP INDEX
         { name: "DropIdx: Create Index", sql: "CREATE INDEX idx_age ON users (age)", check: r => r.data[0].Result === "Success" },
@@ -716,8 +716,8 @@
             const r = db.executeQuery("DROP INDEX ON users (age)");
             return !r.error && !db.tables['users'].indices['age'];
         }},
-        { name: "Neg DropIdx: Missing Index", sql: "DROP INDEX idx_age ON users (age)", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg DropIdx: Missing Table", sql: "DROP INDEX idx_x ON no_such_table (id)", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg DropIdx: Missing Index", "DROP INDEX idx_age ON users (age)"),
+        errCase("Neg DropIdx: Missing Table", "DROP INDEX idx_x ON no_such_table (id)"),
 
         // ALTER TABLE ... RENAME TO
         // PK を付ける: v1.27 から FK の参照先には PRIMARY KEY / UNIQUE が必要
@@ -726,8 +726,8 @@
         { name: "RenameTbl: Insert", sql: "INSERT INTO rn_src (id) VALUES (1), (2)", check: r => r.data[0].Message.includes('2') },
         { name: "RenameTbl: Rename", sql: "ALTER TABLE rn_src RENAME TO rn_dst", check: r => r.data[0].Result === "Success" },
         { name: "RenameTbl: Select New Name", sql: "SELECT COUNT(*) as c FROM rn_dst", check: r => r.data[0].c === 2 },
-        { name: "Neg RenameTbl: Old Name Gone", sql: "SELECT * FROM rn_src", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg RenameTbl: Target Exists", sql: "ALTER TABLE rn_dst RENAME TO users", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg RenameTbl: Old Name Gone", "SELECT * FROM rn_src"),
+        errCase("Neg RenameTbl: Target Exists", "ALTER TABLE rn_dst RENAME TO users"),
         { name: "RenameTbl: FK Reference Follows", fn: () => {
             db.executeQuery("CREATE TABLE rn_child (id INTEGER, d_id INTEGER, FOREIGN KEY (d_id) REFERENCES rn_dst(id))");
             db.executeQuery("ALTER TABLE rn_dst RENAME TO rn_dst2");
@@ -985,7 +985,7 @@
             db.executeQuery("DROP TABLE sp_n");
             return mid.data[0].c === 1 && badB.error !== undefined && fin.data[0].c === 0;
         }},
-        { name: "Neg Savepoint: Outside Transaction", sql: "SAVEPOINT nope", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg Savepoint: Outside Transaction", "SAVEPOINT nope"),
 
         // ====== LuminaDB 新機能: 外部クエリ API ======
         { name: "API: window.LuminaDB.query", fn: () => {
@@ -1252,9 +1252,9 @@
             db.executeQuery("WITH x AS (SELECT id FROM users) SELECT COUNT(*) AS c FROM x");
             return !Object.keys(db.tables).some(t => t.startsWith('__tmp_'));
         }},
-        { name: "Neg CTE: Unbalanced Parens", sql: "WITH a AS (SELECT id FROM users SELECT * FROM a", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg CTE: Missing Body Table", sql: "WITH a AS (SELECT * FROM no_such_tbl) SELECT * FROM a", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "Neg CTE: No Main Statement", sql: "WITH a AS (SELECT id FROM users)", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg CTE: Unbalanced Parens", "WITH a AS (SELECT id FROM users SELECT * FROM a"),
+        errCase("Neg CTE: Missing Body Table", "WITH a AS (SELECT * FROM no_such_tbl) SELECT * FROM a"),
+        errCase("Neg CTE: No Main Statement", "WITH a AS (SELECT id FROM users)"),
 
         // FROM句なし SELECT
         { name: "Dual: Arithmetic", sql: "SELECT 1 + 1 AS v", check: r => r.data.length === 1 && r.data[0].v === 2 },
@@ -1281,7 +1281,7 @@
             const r = db.executeQuery("DROP TABLE IF EXISTS ie_t");
             return !r.error && !db.tables['ie_t'];
         }},
-        { name: "Neg: Drop Missing Without IF EXISTS", sql: "DROP TABLE definitely_missing", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg: Drop Missing Without IF EXISTS", "DROP TABLE definitely_missing"),
 
         // CREATE OR REPLACE VIEW
         { name: "OrReplace: View Replaced", fn: () => {
@@ -1297,7 +1297,7 @@
             db.executeQuery("DROP VIEW orv2");
             return !r.error && sel.data[0].c === 3;
         }},
-        { name: "Neg OrReplace: Conflicts with Table", sql: "CREATE OR REPLACE VIEW users AS SELECT * FROM orders", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg OrReplace: Conflicts with Table", "CREATE OR REPLACE VIEW users AS SELECT * FROM orders"),
 
         // CREATE TABLE AS SELECT (CTAS)
         { name: "CTAS: Basic", fn: () => {
@@ -1324,7 +1324,7 @@
             db.executeQuery("ROLLBACK");
             return !db.tables['ctas_tx'];
         }},
-        { name: "Neg CTAS: Duplicate Name", sql: "CREATE TABLE users AS SELECT * FROM products", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg CTAS: Duplicate Name", "CREATE TABLE users AS SELECT * FROM products"),
         { name: "CTAS: If Not Exists Skips", fn: () => {
             const r = db.executeQuery("CREATE TABLE IF NOT EXISTS users AS SELECT * FROM products");
             const cnt = db.executeQuery("SELECT COUNT(*) AS c FROM users");
@@ -1346,7 +1346,7 @@
             db.executeQuery("DROP INDEX ON products (stock)");
             return ok;
         }},
-        { name: "Neg ShowIdx: Missing Table", sql: "SHOW INDEXES FROM no_such_tbl", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg ShowIdx: Missing Table", "SHOW INDEXES FROM no_such_tbl"),
         { name: "ShowCreate: Table DDL", sql: "SHOW CREATE TABLE products", check: r => r.data.length === 1 && r.data[0].CreateTable.includes('CREATE TABLE products') && r.data[0].CreateTable.includes('price') },
         { name: "ShowCreate: Includes Constraints", fn: () => {
             db.executeQuery("CREATE TABLE sct_t (id INTEGER PRIMARY KEY AUTO_INCREMENT, name TEXT NOT NULL)");
@@ -1354,7 +1354,7 @@
             db.executeQuery("DROP TABLE sct_t");
             return !r.error && r.data[0].CreateTable.includes('PRIMARY KEY') && r.data[0].CreateTable.includes('AUTO_INCREMENT') && r.data[0].CreateTable.includes('NOT NULL');
         }},
-        { name: "Neg ShowCreate: Missing Table", sql: "SHOW CREATE TABLE no_such_tbl", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("Neg ShowCreate: Missing Table", "SHOW CREATE TABLE no_such_tbl"),
 
         // インデックスの IDB 永続化（ユーザー作成インデックスがリロード後も残る）
         { name: "IO: Index Metadata Roundtrip", fn: () => {
@@ -1551,7 +1551,7 @@
         // === 追加コマンドのテスト (UPSERT / ALTER制約 / 構文互換 / メタデータ) ===
 
         // REPLACE INTO
-        { name: "Cmd: REPLACE Setup", sql: "CREATE TABLE cmd_rep (id INTEGER PRIMARY KEY, v TEXT)", check: r => r.data[0].Result === 'Success' },
+        successCase("Cmd: REPLACE Setup", "CREATE TABLE cmd_rep (id INTEGER PRIMARY KEY, v TEXT)"),
         { name: "Cmd: REPLACE Seed", sql: "INSERT INTO cmd_rep (id, v) VALUES (1, 'old'), (2, 'keep')", check: r => r.data[0].Message.includes('2') },
         { name: "Cmd: REPLACE Replaces Conflict", sql: "REPLACE INTO cmd_rep (id, v) VALUES (1, 'new')", check: r => r.data[0].Message.includes('1 replaced') },
         { name: "Cmd: REPLACE Verify", fn: () => {
@@ -1567,17 +1567,17 @@
         { name: "Cmd: INSERT OR IGNORE Syntax", sql: "INSERT OR IGNORE INTO cmd_rep (id, v) VALUES (1, 'dup2')", check: r => r.data[0].Message.includes('1 ignored') },
 
         // ON DUPLICATE KEY UPDATE
-        { name: "Cmd: ODKU Setup", sql: "CREATE TABLE cmd_odku (id INTEGER PRIMARY KEY, cnt INTEGER)", check: r => r.data[0].Result === 'Success' },
+        successCase("Cmd: ODKU Setup", "CREATE TABLE cmd_odku (id INTEGER PRIMARY KEY, cnt INTEGER)"),
         { name: "Cmd: ODKU Seed", sql: "INSERT INTO cmd_odku (id, cnt) VALUES (1, 1)", check: r => r.data[0].Message.includes('1') },
         { name: "Cmd: ODKU Updates on Conflict", sql: "INSERT INTO cmd_odku (id, cnt) VALUES (1, 100) ON DUPLICATE KEY UPDATE cnt = cnt + 1", check: r => r.data[0].Message.includes('1 updated') },
         { name: "Cmd: ODKU Verify Update", sql: "SELECT cnt FROM cmd_odku WHERE id = 1", check: r => r.data[0].cnt === 2 },
         { name: "Cmd: ODKU Inserts When No Conflict", sql: "INSERT INTO cmd_odku (id, cnt) VALUES (2, 10) ON DUPLICATE KEY UPDATE cnt = cnt + 1", check: r => r.data[0].Message.includes('1 rows inserted') },
 
         // ALTER TABLE ADD/DROP PRIMARY KEY
-        { name: "Cmd: ADD PK Setup", sql: "CREATE TABLE cmd_pk (id INTEGER, v TEXT)", check: r => r.data[0].Result === 'Success' },
+        successCase("Cmd: ADD PK Setup", "CREATE TABLE cmd_pk (id INTEGER, v TEXT)"),
         { name: "Cmd: ADD PK Seed", sql: "INSERT INTO cmd_pk (id, v) VALUES (1, 'a'), (2, 'b')", check: r => r.data[0].Message.includes('2') },
-        { name: "Cmd: ALTER ADD PRIMARY KEY", sql: "ALTER TABLE cmd_pk ADD PRIMARY KEY (id)", check: r => r.data[0].Result === 'Success' },
-        { name: "Cmd: ADD PK Enforced", sql: "INSERT INTO cmd_pk (id, v) VALUES (1, 'dup')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('PRIMARY KEY') },
+        successCase("Cmd: ALTER ADD PRIMARY KEY", "ALTER TABLE cmd_pk ADD PRIMARY KEY (id)"),
+        errCase("Cmd: ADD PK Enforced", "INSERT INTO cmd_pk (id, v) VALUES (1, 'dup')", 'PRIMARY KEY'),
         { name: "Cmd: ADD PK Shown in DESCRIBE", sql: "DESCRIBE cmd_pk", check: r => r.data.find(d => d.Column === 'id').Key === 'PRIMARY' },
         { name: "Cmd: ADD PK Rejects Duplicate Data", fn: () => {
             db.executeQuery("CREATE TABLE cmd_pk2 (id INTEGER)");
@@ -1988,7 +1988,7 @@
         { name: "Feat2: NOT BETWEEN", sql: "SELECT COUNT(*) AS c FROM users WHERE age NOT BETWEEN 25 AND 30", check: r => r.data[0].c === 5 },
         { name: "Feat2: BETWEEN Still Works", sql: "SELECT COUNT(*) AS c FROM users WHERE age BETWEEN 25 AND 30", check: r => r.data[0].c === 5 },
         { name: "Feat2: ORDER BY Ordinal", sql: "SELECT name, age FROM users ORDER BY 2 DESC, 1 ASC LIMIT 2", check: r => r.data[0].name === 'Frank' && r.data[1].name === 'Dave' },
-        { name: "Feat2: ORDER BY Ordinal Out of Range", sql: "SELECT id FROM users ORDER BY 5", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('out of range') },
+        errCase("Feat2: ORDER BY Ordinal Out of Range", "SELECT id FROM users ORDER BY 5", 'out of range'),
         { name: "Feat2: ORDER BY Ordinal in UNION", sql: "SELECT id FROM users WHERE id <= 2 UNION SELECT id FROM users WHERE id >= 9 ORDER BY 1 DESC", check: r => r.data.length === 4 && r.data[0].id === 10 && r.data[3].id === 1 },
         { name: "Feat2: INSERT INTO SET", fn: () => {
             db.executeQuery("CREATE TABLE feat2_i (id INTEGER PRIMARY KEY, name TEXT, flag BOOLEAN)");
@@ -2030,7 +2030,7 @@
             db.executeQuery("DROP TABLE like_src");
             return !r.error && emptyRows && meta && !ins.error && v.data[0].id === 1 && v.data[0].st === 'ok';
         }},
-        { name: "Cmd3: CREATE TABLE LIKE Missing Source", sql: "CREATE TABLE like_x LIKE no_such_src", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('not found') },
+        errCase("Cmd3: CREATE TABLE LIKE Missing Source", "CREATE TABLE like_x LIKE no_such_src", 'not found'),
         { name: "Cmd3: CREATE OR REPLACE PROCEDURE", fn: () => {
             db.executeQuery("CREATE PROCEDURE proc_or AS SELECT 1 AS v");
             const dup = db.executeQuery("CREATE PROCEDURE proc_or AS SELECT 2 AS v");
@@ -2604,6 +2604,61 @@
         ...getV48Tests(),
         ...getV49Tests(),
         ...getV50Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v51.js 〜 test-suite-v55.js
+        //   v1.31: 「書き味」の総当たり。実装済みのクエリを、同じ意味のまま
+        //   別の書き方へ機械的に変換して結果が変わらないことを確かめる。
+        //   共通の道具立ては js/tests/test-helpers.js の makeTestKit にある。
+        //     v51 字句とレイアウト（大小文字・空白・改行・コメント・識別子）
+        //     v52 同じ意味の別の書き方（述語・論理・結合・集約・副問い合わせ・集合演算）
+        //     v53 句の組み合わせと順序（SELECT の各句の有無を総当たり）
+        //     v54 関数呼び出しと式の書き味（同義関数・引数の書き方・入れ子）
+        //     v55 DML・DDL・トランザクションの書き味
+        //     v56 実務の整形スタイル（先頭カンマ・句ごとの改行）と総合シナリオ
+        // ============================================================
+        ...getV51Tests(),
+        ...getV52Tests(),
+        ...getV53Tests(),
+        ...getV54Tests(),
+        ...getV55Tests(),
+        ...getV56Tests(),
+
+        // ============================================================
+        // 定義は js/tests/test-suite-v57.js 〜 test-suite-v61.js
+        //   v1.32: 特殊なクエリ構成の総当たり。普通は書かないが書ける形を
+        //   機械的に組み立てて、素直に書いた同じ意味のクエリと突き合わせる。
+        //     v57 深さと幅（派生表・CTE・関数・括弧・CASE の段数 / 句の幅）
+        //     v58 縮退したデータと境界（0 行・1 行・全 NULL・重複・LIMIT/OFFSET の格子）
+        //     v59 句とスコープの相互作用（副問い合わせの置き場所・名前の衝突・句の同時使用）
+        //     v60 極端な値と型（桁あふれ・サロゲートペア・遠い日付・型の混在）
+        //     v61 実行条件の不変性（索引・行順・トランザクション・ビュー・キャッシュ）
+        // ============================================================
+        ...getV57Tests(),
+        ...getV58Tests(),
+        ...getV59Tests(),
+        ...getV60Tests(),
+        ...getV61Tests(),
+
+        // ============================================================
+        // v1.33 で足した命令・関数の総点検
+        //   文（CREATE/DROP DATABASE・USE・ALTER VIEW・TEMPORARY VIEW・
+        //   EXECUTE IMMEDIATE・DO・RESET・CHECKSUM/REPAIR TABLE・
+        //   ORDER BY ... USING・EXPLAIN VERBOSE・PRAGMA foreign_keys など）と、
+        //   集計（EVERY / PRODUCT / APPROX_COUNT_DISTINCT）、
+        //   スカラー関数（BTRIM / ENCODE / ORD / UNISTR / CONTAINS / TIMEDIFF /
+        //   YEARWEEK / PERIOD_ADD / PERIOD_DIFF / JULIAN_DAY / CONVERT_TZ /
+        //   JSON_SEARCH / JSON_MERGE_PRESERVE / ARRAY_* / LOCALTIME(STAMP)）を
+        //   値・NULL・書き味・拒否されるべき綴りの 4 面から確かめる
+        // ============================================================
+        ...getV62Tests(),
+
+        // ============================================================
+        // v1.34: データ画面（保存 / 読み込み / 入出力）の再編。
+        //   サイドバーの 6 ボタンをモーダルのタブへ移し、1 件ずつ説明を付けた。
+        //   入口・置き場所・説明の有無・配線・保存状態の表示を見る（DOM 依存）
+        // ============================================================
+        ...getV63Tests(),
 
         // Cleanup (New Features)
         { name: "Drop View Stats", sql: "DROP VIEW v_stats", check: r => true },

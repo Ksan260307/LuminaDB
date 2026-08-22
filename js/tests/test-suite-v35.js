@@ -23,22 +23,9 @@
     //   test-suite.js の tests 配列へ getV35Tests() のスプレッドで合流する
     // ============================================================================
     function getV35Tests() {
-      const T = [];
-      const push = (name, sql, check) => T.push({ name, sql, check });
-      const err = (name, sql, frag) => T.push({
-        name, sql, isErrorExpected: true,
-        check: r => !!r.error && (!frag || r.error.toLowerCase().includes(String(frag).toLowerCase()))
-      });
-      const fn = (name, f) => T.push({ name, fn: f });
-      const q = (sql) => db.executeQuery(sql);
-      const rows = (sql) => { const r = q(sql); if (r.error) throw new Error(r.error); return r.data || []; };
-      const one = (sql) => { const d = rows(sql); if (!d.length) throw new Error('no rows'); return Object.values(d[0])[0]; };
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, check: push, err, t: fn, q, rowsOf: rows, oneOf: one, eq } = makeTestKit('V35');
       const col = (sql, k) => rows(sql).map(x => x[k]);
-      const eq = (a, b, label) => {
-        const x = JSON.stringify(a), y = JSON.stringify(b);
-        if (x !== y) throw new Error((label ? label + ' ' : '') + 'expected ' + y + ' but got ' + x);
-        return true;
-      };
 
       // ------------------------------------------------------------
       // 0. フィクスチャ

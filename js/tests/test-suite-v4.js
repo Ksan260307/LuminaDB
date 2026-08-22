@@ -192,7 +192,7 @@
             const r = db.executeQuery("SHOW VARIABLES");
             return !r.error && r.data.some(d => d.Variable === '@shown' && d.Value === 7);
         }},
-        { name: "V4Var: Set Without At Rejected", sql: "SET NAMES utf8", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("V4Var: Set Without At Rejected", "SET NAMES utf8"),
 
         // ============================================================
         // 3. ウィンドウフレーム (V4Frm)
@@ -216,7 +216,7 @@
             return r.data[0].s === 100 && r.data[1].s === 300;
         }},
         { name: "V4Frm: Running Sum Without Frame Unchanged", sql: "SELECT id, SUM(v) OVER(ORDER BY id) AS s FROM v4frm WHERE g = 'a' ORDER BY id", check: r => r.data.map(d => d.s).join(',') === '10,30,60,100,150' },
-        { name: "V4Frm: Invalid Bound Rejected", sql: "SELECT SUM(v) OVER(ORDER BY id ROWS BETWEEN FOO AND CURRENT ROW) AS s FROM v4frm", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('frame bound') },
+        errCase("V4Frm: Invalid Bound Rejected", "SELECT SUM(v) OVER(ORDER BY id ROWS BETWEEN FOO AND CURRENT ROW) AS s FROM v4frm", 'frame bound'),
         { name: "V4Frm: Cleanup", sql: "DROP TABLE v4frm", check: r => r.data[0].Result === "Success" },
 
         // ============================================================
@@ -267,7 +267,7 @@
             db.executeQuery("DROP VIEW v4view");
             return !r.error && r.data.length === 3;
         }},
-        { name: "V4Ddl: TABLE Missing Rejected", sql: "TABLE no_such_tbl", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('not found') },
+        errCase("V4Ddl: TABLE Missing Rejected", "TABLE no_such_tbl", 'not found'),
         { name: "V4Ddl: Describe Composite Marker", fn: () => {
             db.executeQuery("CREATE TABLE v4dsc (a INTEGER, b INTEGER, c INTEGER, PRIMARY KEY (a, b))");
             const r = db.executeQuery("DESCRIBE v4dsc");

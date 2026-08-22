@@ -57,7 +57,7 @@
             return a === b;
         }},
         { name: "XCmj: Column Values Joined Correctly", sql: "SELECT u.name, o.amount FROM users u, orders o WHERE u.id = o.user_id ORDER BY o.order_id LIMIT 1", check: r => r.data.length === 1 && r.data[0].name === 'Alice' && r.data[0].amount === 1 },
-        { name: "XCmj: FROM Clause Garbage Errors", sql: "SELECT * FROM users !!bad!!", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("XCmj: FROM Clause Garbage Errors", "SELECT * FROM users !!bad!!"),
 
         // ============================================================
         // 3. HAVING の直接集計 / 非集計 HAVING (XHav)
@@ -74,7 +74,7 @@
         { name: "XHav: Non-Grouped Having On Alias", sql: "SELECT id, age * 2 AS dbl FROM users HAVING dbl >= 70 ORDER BY id", check: r => r.data.length === 2 && r.data[0].id === 4 && r.data[1].id === 6 },
         { name: "XHav: Implicit Single Group Via Agg", sql: "SELECT COUNT(*) AS c FROM users HAVING COUNT(*) > 5", check: r => r.data.length === 1 && r.data[0].c === 10 },
         { name: "XHav: Implicit Group Filtered Out", sql: "SELECT COUNT(*) AS c FROM users HAVING COUNT(*) > 100", check: r => r.data.length === 0 },
-        { name: "XHav: Unknown Column Still Errors", sql: "SELECT age, COUNT(*) AS c FROM users GROUP BY age HAVING zz_ghost > 1", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("XHav: Unknown Column Still Errors", "SELECT age, COUNT(*) AS c FROM users GROUP BY age HAVING zz_ghost > 1"),
 
         // ============================================================
         // 4. ORDER BY 式・集計・未選択列 (XOrd)
@@ -96,8 +96,8 @@
             return r.data.length === 3 && r.data[0].id === 3 && r.data[1].id === 2 && r.data[2].id === 1;
         }},
         { name: "XOrd: Distinct Order By Selected Expr", sql: "SELECT DISTINCT name FROM products ORDER BY LENGTH(name) ASC, name ASC LIMIT 1", check: r => r.data[0].name === 'Mouse' },
-        { name: "XOrd: Distinct Order By Hidden Col Errors", sql: "SELECT DISTINCT name FROM products ORDER BY price", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XOrd: Missing Column Still Errors", sql: "SELECT id FROM users ORDER BY nope_col", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("XOrd: Distinct Order By Hidden Col Errors", "SELECT DISTINCT name FROM products ORDER BY price"),
+        errCase("XOrd: Missing Column Still Errors", "SELECT id FROM users ORDER BY nope_col"),
         { name: "XOrd: Ordinal Still Works", sql: "SELECT name, age FROM users ORDER BY 2 DESC LIMIT 1", check: r => r.data[0].age === 40 },
         { name: "XOrd: Qualified Non-Selected Column", sql: "SELECT u.name FROM users u ORDER BY u.age DESC LIMIT 1", check: r => r.data[0].name === 'Frank' },
         { name: "XOrd: Window Alias In Order By Intact", sql: "SELECT id, ROW_NUMBER() OVER(ORDER BY age DESC) AS rn FROM users ORDER BY rn ASC LIMIT 1", check: r => r.data[0].id === 6 && r.data[0].rn === 1 },
@@ -150,7 +150,7 @@
             const v = db.executeQuery("SELECT status FROM fxa WHERE id = 3").data[0].status;
             return !ins.error && v === 'active';
         }},
-        { name: "XAdd: Not Null Enforced On New Column", sql: "INSERT INTO fxa (id, status) VALUES (4, null)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('NOT NULL') },
+        errCase("XAdd: Not Null Enforced On New Column", "INSERT INTO fxa (id, status) VALUES (4, null)", 'NOT NULL'),
         { name: "XAdd: Describe Shows Default And NotNull", fn: () => {
             const r = db.executeQuery("DESCRIBE fxa");
             const col = r.data.find(c => c.Column === 'status');

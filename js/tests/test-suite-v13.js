@@ -5,11 +5,9 @@
     //   test-suite.js の tests 配列へ getV13Tests() のスプレッドで合流する
     // ============================================================================
     function getV13Tests() {
-      const T = [];
-      const push = (name, sql, check) => T.push({ name, sql, check });
-      const approx = (a, b) => a != null && Math.abs(a - b) < 1e-6;
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, check: push, approx, mround } = makeTestKit('V13');
       // MySQL 互換 ROUND（ゼロから遠い方向）の JS 参照
-      const mround = (x, d) => { const f = Math.pow(10, d || 0); return Math.sign(x) * Math.round(Math.abs(x) * f) / f; };
       const gcd = (a, b) => { a = Math.abs(a); b = Math.abs(b); while (b) { [a, b] = [b, a % b]; } return a; };
       const fact = (n) => { let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; };
 

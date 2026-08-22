@@ -19,15 +19,8 @@
     //   test-suite.js の tests 配列へ getV27Tests() のスプレッドで合流する
     // ============================================================================
     function getV27Tests() {
-      const T = [];
-      const push = (name, sql, check) => T.push({ name, sql, check });
-      const err = (name, sql, frag) => T.push({
-        name, sql, isErrorExpected: true,
-        check: r => !!r.error && (!frag || r.error.toLowerCase().includes(String(frag).toLowerCase()))
-      });
-      const fn = (name, f) => T.push({ name, fn: f });
-      const one = (sql) => { const r = db.executeQuery(sql); return r.error ? { __err: r.error } : Object.values(r.data[0])[0]; };
-      const col = (sql, k) => { const r = db.executeQuery(sql); return r.error ? ['ERR:' + r.error] : r.data.map(x => x[k]); };
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, check: push, err, t: fn, oneSafe: one, colSafe: col } = makeTestKit('V27');
       const day = (v) => String(v).slice(0, 10);
 
       // ------------------------------------------------------------

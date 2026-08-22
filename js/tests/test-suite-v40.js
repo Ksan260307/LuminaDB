@@ -13,34 +13,15 @@
     //   test-suite.js の tests 配列へ getV40Tests() のスプレッドで合流する
     // ============================================================================
     function getV40Tests() {
-      const T = [];
-      const q = (sql) => db.executeQuery(sql);
-      const t = (name, fn) => T.push({ name, fn });
-      const rows = (sql) => { const r = q(sql); if (r.error) throw new Error(r.error); return r.data || []; };
-      const one = (sql) => { const d = rows(sql); if (!d.length) throw new Error('no rows returned'); return Object.values(d[0])[0]; };
-      const same = (a, b) => (typeof a === 'number' && typeof b === 'number') ? Math.abs(a - b) < 1e-9 : a === b;
-      const expect = (actual, want, label) => {
-        if (!same(actual, want)) {
-          throw new Error((label ? label + ' ' : '') + 'expected ' + JSON.stringify(want) + ' but got ' + JSON.stringify(actual));
-        }
-        return true;
-      };
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, q, t, rowsOf: rows, oneOf: one, numEq: same, expect, expectDeep, val, sum, cnt, uniq } = makeTestKit('V40');
       const expectNear = (actual, want, eps, label) => {
         if (typeof actual !== 'number' || Math.abs(actual - want) > (eps === undefined ? 1e-9 : eps)) {
           throw new Error((label ? label + ' ' : '') + 'expected ~' + want + ' but got ' + JSON.stringify(actual));
         }
         return true;
       };
-      const expectDeep = (actual, want, label) => {
-        const a = JSON.stringify(actual), b = JSON.stringify(want);
-        if (a !== b) throw new Error((label ? label + ' ' : '') + 'expected ' + b + ' but got ' + a);
-        return true;
-      };
-      const val = (name, sql, want) => t(name, () => expect(one(sql), want));
       const valNear = (name, sql, want, eps) => t(name, () => expectNear(one(sql), want, eps));
-      const sum = (arr, f) => arr.reduce((s, x) => s + f(x), 0);
-      const cnt = (arr, f) => arr.filter(f).length;
-      const uniq = (arr, f) => new Set(arr.map(f)).size;
 
       // ----------------------------------------------------------------
       // 模型

@@ -13,8 +13,9 @@
     //   test-suite.js の tests 配列へ getV19Tests() のスプレッドで合流する
     // ============================================================================
     function getV19Tests() {
-      const T = [];
-      const fn = (name, f) => T.push({ name, fn: f });
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      // （このスイート固有の perf / bud は下で組み立てる）
+      const { T, t: fn } = makeTestKit('V19');
 
       // 較正値（V19Cal で実測して埋める）。base は 20,000 行スキャン 1 回の ms
       const CAL = { base: 3 };

@@ -57,9 +57,56 @@
         return statements;
     }
 
+    // ------------------------------------------------------------------
+    // 保存状態の表示（v1.34）
+    //
+    // 保存系のボタンをモーダルへ移したぶん、「今どこに何が残っているのか」は
+    // 画面から読み取れないといけない。ここでは
+    //   ・いま抱えているデータの規模（表数・行数）
+    //   ・前回このブラウザへ書き込んだときの結果（差分保存なので「書いた表数」が出る）
+    //   ・開いているファイル
+    // を組み立てる。数値は表示専用で、これ自体は何も保存しない
+    // ------------------------------------------------------------------
+    function currentDbScale() {
+        const names = Object.keys(db.tables).filter(t => !t.startsWith('__tmp_') && !db.tables[t].isTemp);
+        return { tables: names.length, rows: names.reduce((s, t) => s + db.tables[t].rowCount, 0) };
+    }
+    // サイドバーの 1 行。保存待ちがあるかどうかで色と文言を変える。
+    // 保存ボタンをモーダルへ移したので、「まだ書けていない変更があるか」は
+    // ここだけが伝える情報になる
+    function refreshStorageState() {
+        const line = document.getElementById('storageStateLine');
+        if (!line) return;
+        const pending = (typeof hasUnsavedChanges === 'function') && hasUnsavedChanges();
+        const dot = line.querySelector('span');
+        const text = line.querySelector('span:last-child');
+        if (dot) dot.className = `inline-block w-1.5 h-1.5 rounded-full shrink-0 ${pending ? 'bg-amber-500' : 'bg-green-500'}`;
+        if (text) text.textContent = pending ? 'このブラウザへ保存中…' : 'このブラウザへ自動保存';
+        line.title = pending
+            ? '変更を検知しました。まもなくこのブラウザ（IndexedDB）へ書き込みます。Ctrl + S で今すぐ保存できます。'
+            : '変更は 1 秒後にこのブラウザ（IndexedDB）へ自動保存されます。Ctrl + S で今すぐ保存できます。';
+    }
+    window.refreshStorageState = refreshStorageState;
+
+    function refreshStorageInfo() {
+        refreshStorageState();
+        const line = document.getElementById('idbStatusLine');
+        if (line) {
+            const { tables, rows } = currentDbScale();
+            const st = (typeof getSaveStats === 'function') ? getSaveStats() : null;
+            const saved = st && st.tables
+                ? `前回の保存: ${st.tables} 表中 ${st.written} 表を書き込み（${st.skipped} 表は変更なしで省略）`
+                : 'このセッションではまだ手動保存していません（自動保存は動いています）';
+            line.textContent = `いまのデータ: ${tables} 表 / ${rows.toLocaleString()} 行 — ${saved}`;
+        }
+        updateFileLabel();
+    }
+    window.refreshStorageInfo = refreshStorageInfo;
+
     document.getElementById('saveIdbBtn').addEventListener('click', async () => {
       try {
         await saveDB(db.exportForIDB());
+        refreshStorageInfo();
         showToast('IndexedDB にデータを保存しました。');
       } catch (e) {
         showToast(`保存エラー: ${e.message}`, true);
@@ -72,6 +119,7 @@
         if (dump) {
             db.importFromIDB(dump);
             renderTree();
+            refreshStorageInfo();
             showToast('IndexedDB からデータを読み込みました。');
         } else {
             showToast('保存されたデータがありません。', true);
@@ -203,15 +251,31 @@
         }
     }
 
-    // 開いているファイル名をサイドバーに出し、「上書き保存」の可否を切り替える
+    // 開いているファイル名をサイドバーとモーダルに出し、「上書き保存」の可否を切り替える。
+    // 未対応ブラウザでは代わりに何が起きるのかもモーダル側で伝える
     function updateFileLabel() {
         const el = document.getElementById('openFileLabel');
         const saveBtn = document.getElementById('fileSaveBtn');
         if (el) {
-            el.textContent = currentFileHandle ? currentFileHandle.name : '';
+            el.textContent = currentFileHandle ? `ファイル: ${currentFileHandle.name}` : '';
             el.classList.toggle('hidden', !currentFileHandle);
         }
         if (saveBtn) saveBtn.disabled = !currentFileHandle;
+        const name = document.getElementById('openFileName');
+        if (name) {
+            name.textContent = currentFileHandle
+                ? `開いているファイル: ${currentFileHandle.name}`
+                : '開いているファイルはありません（「名前を付けて保存」または「開く」から始めます）';
+        }
+        const note = document.getElementById('fileApiNote');
+        if (note) {
+            const unsupported = !fsSupported();
+            note.classList.toggle('hidden', !unsupported);
+            if (unsupported) {
+                note.textContent = 'このブラウザ（または file:// で開いた場合）はファイルを直接読み書きできません。'
+                    + '「保存」はダウンロード、「開く」はファイル選択に切り替わります。上書き保存はできないため、毎回新しいファイルになります。';
+            }
+        }
     }
 
     window.saveDbToFile = saveDbToFile;
@@ -225,7 +289,25 @@
         if (saveAsBtn) saveAsBtn.addEventListener('click', () => saveDbToFile(false));
         if (saveBtn) saveBtn.addEventListener('click', () => saveDbToFile(true));
         updateFileLabel();
+        refreshStorageState();
     })();
+
+    // 保存の 2 つはモーダルを開かずに呼べるようにする（v1.34 でボタンを移したぶんの代替）。
+    //   Ctrl + S        … このブラウザ（IndexedDB）へ保存
+    //   Ctrl + Shift + S … 開いているファイルへ上書き保存（無ければ名前を付けて保存）
+    // ブラウザ既定の「ページを保存」は意味がないので preventDefault する
+    document.addEventListener('keydown', (e) => {
+        if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+        if (e.key.toLowerCase() !== 's') return;
+        e.preventDefault();
+        if (e.shiftKey) {
+            saveDbToFile(!!currentFileHandle);
+            return;
+        }
+        saveDB(db.exportForIDB())
+            .then(() => { refreshStorageInfo(); showToast('IndexedDB にデータを保存しました。'); })
+            .catch(err => showToast(`保存エラー: ${err.message}`, true));
+    });
 
     // 取り込み結果をモーダル内に出す。従来は件数だけをトーストで流していたため、
     // 「何件か失敗した」ことは判っても、どの文がなぜ落ちたのかを追えなかった

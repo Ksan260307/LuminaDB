@@ -14,24 +14,10 @@
     //   test-suite.js の tests 配列へ getV38Tests() のスプレッドで合流する
     // ============================================================================
     function getV38Tests() {
-      const T = [];
-      const q = (sql) => db.executeQuery(sql);
-      const t = (name, fn) => T.push({ name, fn });
-      const rows = (sql) => { const r = q(sql); if (r.error) throw new Error(r.error); return r.data || []; };
-      const one = (sql) => { const d = rows(sql); if (!d.length) throw new Error('no rows returned'); return Object.values(d[0])[0]; };
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, q, t, rowsOf: rows, oneOf: one, numEq: same, expect, expectDeep, val, sum, cnt, uniq,
+              byKey } = makeTestKit('V38');
       const colOf = (sql, name) => rows(sql).map(r => r[name]);
-      const same = (a, b) => (typeof a === 'number' && typeof b === 'number') ? Math.abs(a - b) < 1e-9 : a === b;
-      const expect = (actual, want, label) => {
-        if (!same(actual, want)) {
-          throw new Error((label ? label + ' ' : '') + 'expected ' + JSON.stringify(want) + ' but got ' + JSON.stringify(actual));
-        }
-        return true;
-      };
-      const expectDeep = (actual, want, label) => {
-        const a = JSON.stringify(actual), b = JSON.stringify(want);
-        if (a !== b) throw new Error((label ? label + ' ' : '') + 'expected ' + b + ' but got ' + a);
-        return true;
-      };
       const expectArr = (got, want, eps, label) => {
         if (got.length !== want.length) {
           throw new Error((label ? label + ' ' : '') + 'expected ' + want.length + ' rows but got ' + got.length);
@@ -44,15 +30,6 @@
                           ' but got ' + JSON.stringify(a));
         }
         return true;
-      };
-      const val = (name, sql, want) => t(name, () => expect(one(sql), want));
-      const sum = (arr, f) => arr.reduce((s, x) => s + f(x), 0);
-      const cnt = (arr, f) => arr.filter(f).length;
-      const uniq = (arr, f) => new Set(arr.map(f)).size;
-      const byKey = (arr, keyf) => {
-        const m = new Map();
-        for (const x of arr) { const k = keyf(x); if (!m.has(k)) m.set(k, []); m.get(k).push(x); }
-        return m;
       };
 
       // ----------------------------------------------------------------

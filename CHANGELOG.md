@@ -111,6 +111,163 @@ WITH c AS MATERIALIZED (SELECT id FROM users) SELECT COUNT(*) FROM c;
 EXPLAIN QUERY PLAN SELECT * FROM users WHERE id = 1;
 ```
 
+### v1.34 — 保存まわりのボタンを 1 つの画面へまとめ、それぞれに説明を付けた
+
+サイドバーに 6 つ並んでいたボタン（`Save DB` / `Load DB` / `Clear DB` / `Open File` / `Save` / `Save As`）を
+データ画面へ移し、**1 件ずつ「何をするか・どこに残るか・戻せるか」を書いた**回です。
+テストは `test-suite-v63.js`（59 件）を追加し、全体で 52,621 件になりました。
+
+**なぜ**
+
+名前だけが並んでいて、**どれを押せばデータが残るのかが読み取れなかった**のが問題でした。
+`Save DB` は「このブラウザの中だけ」、`Save` は「ディスク上のファイル」で、
+消える条件も持ち出せるかどうかも違うのに、見た目は同じ 6 つのボタンでした。
+実際には 1 秒後に自動保存されているので、そもそも押す必要が無いことも画面からは判りませんでした。
+
+**どうしたか**
+
+- サイドバーの入口は「データ — 保存 / 読み込み / 入出力」ボタン 1 つだけにした。
+- データ画面のタブを 3 枚から 5 枚へ。先頭 2 枚が今回移した分:
+  - **このブラウザ** … 今すぐ保存 / 保存した状態を読み込む / 保存データを消して初期化。
+    冒頭で「自動保存が動いていること」「IndexedDB は他の端末から見えないこと」を伝える。
+  - **ファイル** … 開く / 上書き保存 / 名前を付けて保存。開いているファイル名を常に表示し、
+    File System Access API が無いブラウザでは「ダウンロードとファイル選択に切り替わる」ことを明示する。
+- **保存状態を可視化**した。サイドバーの 1 行が、保存待ちなら橙・書き込み済みなら緑を示す。
+  データ画面には「いまのデータ: n 表 / m 行」と前回保存の内訳（差分保存なので書いた表数）を出す。
+- ボタンが 1 段深くなったぶん、**近道を用意**した: <kbd>Ctrl</kbd>+<kbd>S</kbd> でこのブラウザへ、
+  <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> でファイルへ保存（開いていれば上書き）。
+
+**追加したテスト**（`test-suite-v63.js`）— 入口が 1 つであること、移した 6 つがすべてモーダルから届くこと、
+**6 つ全部に見出しと 30 文字以上の説明が付いていること**、破壊的な操作が赤で「戻せません」と書いてあること、
+タブとペインが 1 対 1 であること、保存状態の表示が実際のデータ量に追随すること、
+`Ctrl+S` がブラウザ既定の動作を止めること、元からある 3 タブが壊れていないこと。
+
+### v1.33 — 他DBにあって足りていなかった命令の実装
+
+実 DB 向けのスクリプトを流したときに「構文エラー」で止まっていた綴りを洗い出し、
+**文 16 種・集計 3 種・スカラー関数 18 種**を実装した回です。
+テストは `test-suite-v62.js`（2,503 件）を追加し、全体で 52,562 件になりました。
+
+```sql
+-- 文
+CREATE DATABASE shop;  USE shop;  DROP DATABASE shop;        -- SCHEMA と同じ名前空間
+ALTER VIEW v_adults AS SELECT id, name FROM users WHERE age >= 18;
+CREATE TEMPORARY VIEW v_tmp AS SELECT id FROM users;         -- 保存・エクスポート対象外
+CREATE UNLOGGED TABLE staging (a INT);                       -- UNLOGGED は受理して無視
+CREATE INDEX idx ON users USING BTREE (name);                -- USING <方式> も受ける
+EXPLAIN VERBOSE SELECT * FROM users;
+SET @@session.sql_mode = 'strict';   RESET ALL;   RESET statement_timeout;
+DO NEXTVAL('seq_id');                                        -- 式を評価して結果を捨てる
+EXECUTE IMMEDIATE 'SELECT ? AS a' USING 7;                   -- PREPARE 不要のその場実行
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily;
+PRAGMA foreign_keys = OFF;                                   -- SET FOREIGN_KEY_CHECKS と連動
+SHOW COLUMNS FROM users LIKE '%name%';   SHOW ENGINES;   SHOW CREATE INDEX idx;
+DESCRIBE users age;                                          -- 列を 1 つだけ
+CHECKSUM TABLE users;   REPAIR TABLE users;
+SELECT id FROM users ORDER BY age USING >;                   -- USING < / > は ASC / DESC
+
+-- 集計
+SELECT EVERY(age >= 18) AS all_adult,                        -- BOOL_AND の別名（SQL標準）
+       PRODUCT(qty) AS total,                                -- 非NULLの総乗（無ければ NULL）
+       APPROX_COUNT_DISTINCT(dept) AS depts                  -- 厳密な COUNT(DISTINCT) を返す
+  FROM users;
+
+-- スカラー関数
+SELECT BTRIM('xxhixx', 'x'), ENCODE('abc', 'base64'), ORD('あ'), UNISTR('\0041'),
+       CONTAINS(name, 'a'), TIMEDIFF(t2, t1), YEARWEEK(hired), JULIAN_DAY(hired),
+       PERIOD_ADD(202401, 3), PERIOD_DIFF(202406, 202401),
+       CONVERT_TZ(ts, 'UTC', '+09:00'), LOCALTIME, LOCALTIMESTAMP,
+       JSON_SEARCH(doc, 'one', 'alpha'), JSON_MERGE_PRESERVE(a, b),
+       ARRAY_DISTINCT(xs), ARRAY_CAT(xs, ys), ARRAY_REVERSE(xs);
+```
+
+決めた仕様と、そう決めた理由:
+
+| 決めたこと | 理由 |
+| --- | --- |
+| `CREATE DATABASE` / `USE` は名前を記録するだけ。存在しない名前の `USE` は**拒否**する | 単一スキーマなので実体は作れない。黙って受けると以後の表参照と食い違う |
+| `APPROX_COUNT_DISTINCT` は近似せず厳密値を返す | 全てメモリ上にあり概算の利点が無い。名前の互換だけを提供する |
+| `PRODUCT` は非 NULL が無ければ `NULL`（`SUM` の 0 とは違う） | 「掛ける値が無い」ことを 1 と区別したいため |
+| `LOCALTIME` / `LOCALTIMESTAMP` は `NOW()` と同義（MySQL 準拠） | PostgreSQL の時刻のみ版とは違う。README に明記した |
+| `BTRIM(s, NULL)` は `NULL`、`BTRIM(s)` は空白除去 | 引数の省略と NULL の明示を区別する（PostgreSQL と同じ厳格さ） |
+| `ENCODE` / `JSON_SEARCH` / `CONVERT_TZ` の**キーワード引数はコンパイル時に検査**する | 実行時 throw は行評価の catch に飲まれて黙って NULL になるため（`AT TIME ZONE` と同じ扱い） |
+| `TEMPORARY VIEW` は IDB 保存・SQL エクスポートの対象外 | 一時表と揃える。「セッション限り」と言った以上、保存してはいけない |
+| `RESET ALL` は `read_only` に触れない | 外部公開時の保護を `RESET` で外せてしまうため。解除は `SET read_only = OFF` に限る |
+
+### v1.32 — 特殊なクエリ構成の総当たりテストと、そこで出た欠陥の修正
+
+「普通は書かないが書ける」形——深い入れ子・極端な幅・縮退したデータ・端の値・
+名前の衝突——を機械的に組み立てる約 8,800 件のテスト（`test-suite-v57.js` 〜 `v61.js`）を
+追加した回です。全体で 50,059 件になりました。
+
+| 症状 | 直した内容 |
+| --- | --- |
+| **ビューに対して行コンストラクタで絞り込む**と（`SELECT ... FROM ビュー WHERE (a, b) IN ((1, 2))`）、「CTE の列リストが 2 個だが 3 列返る」という無関係なエラーになっていた。ビューを `FROM (SELECT ...)` へ展開したあと、続く `WHERE` を**派生表の別名**、その後ろの `(a, b)` を**列リスト**と読んでいた | 派生表の直後に来ても別名になり得ない語（`WHERE` / `GROUP` / `ORDER` / `JOIN` …）を別名として受けない |
+
+**追加したテスト**
+
+- **v57 深さと幅**: 派生表・CTE 連鎖・関数・括弧・`CASE`・副問い合わせを 1 段ずつ 80 段まで、
+  SELECT 項目・`IN` リスト・演算項・`WHEN`・`ORDER BY` キー・結合表数を 1 個ずつ 320 個まで掃引する。
+- **v58 縮退したデータと境界**: 0 行 / 1 行 / 全 NULL / 全同値 / 重複だらけ / 全部負 / 2 値だけ /
+  1 行だけ値あり など 11 通りの表 × 集約・まとめ方・`LIMIT` × `OFFSET` の 15 × 15 格子・
+  述語 42 種・並べ替え・結合・集合演算・ウィンドウ 18 種。期待値は JavaScript の模型から求める。
+- **v59 句とスコープの相互作用**: 副問い合わせを置ける 17 か所 × 7 形、名前の衝突、
+  句の同時使用、相関の位置、結合条件の特殊形、ウィンドウと `GROUP BY` / `QUALIFY`。
+- **v60 極端な値と型**: 桁あふれ・負のゼロ・整数の上限・極小、サロゲートペア・制御文字・
+  長大文字列、1900〜2999 年の日付、型の混在、JSON の特殊な形、丸めと精度。
+- **v61 実行条件の不変性**: 同じ 56 本のクエリを、索引 6 通り・行の挿入順 4 通り・
+  トランザクションの内外・ビュー / 一時表 / CTE 経由・式キャッシュが温まった状態で流し、
+  答えが 1 文字も変わらないことを確かめる。
+
+### v1.31 — 「書き味」の総当たりテストで出た欠陥の修正
+
+同じ意味のクエリを**書き方だけ変えて**投げ、結果が 1 文字も変わらないことを確かめる
+約 11,200 件のテスト（`test-suite-v51.js` 〜 `v56.js`）を追加する過程で見つかった欠陥を直した回です。
+「整形したら答えが変わる」たぐいの、いちばん気づきにくい種類の不具合が並びます。
+
+**整形しただけで黙って誤った値を返していたもの**
+
+| 症状 | 直した内容 |
+| --- | --- |
+| `SELECT id, sal *\n2 + 1 AS x` のように **SELECT 項目を複数行で書くと式の前半が消えていた**（この例は全行が `3` になる）。別名を切り出す正規表現が先頭に固定されておらず、`.` が改行に一致しないため改行の後ろから一致していた | 先頭を固定し、任意の文字クラスで受ける |
+| **複数行に整形した `CASE`** が誤答していた。`THEN 'hi'\nELSE 'lo'` は WHEN 節が 1 つも取れず全行 `'lo'`、`ELSE 'lo'\nEND` は ELSE ごと消えて全行 `NULL` | `WHEN` / `ELSE` の切り出しを改行込みで受ける |
+| **`OVER (...)` の中で改行する**と「ウィンドウ関数は項目全体でなければならない」というエラー。`ORDER BY sal\nDESC` と書くと **`DESC` が黙って無視**されて並び順が変わっていた | ウィンドウ呼び出しと `PARTITION BY` / `ORDER BY` の切り出しを改行込みで受ける |
+| `GROUP_CONCAT(name ORDER\nBY id ...)` の `ORDER BY` が引数の一部として扱われていた | 2 語以上のキーワードは語の間の空白を `\s+` で照合する |
+| `WHERE 基底表の条件 AND 結合先の条件 OR 別条件` で**行が黙って消えていた**。述語の押し下げが「深さ 0 の `OR` があれば分割しない」保護を失っていた（同名メソッドが別ファイルで二重定義され、後から読み込まれる素朴な実装が上書きしていた） | 用途ごとに名前を分け、保護のある実装が使われるようにする |
+| `CONSTRAINT pk_x PRIMARY KEY (id)` と**名前を付けた主キー宣言**が列定義として解析され、`constraint` という幻の列が増えて表そのものが壊れていた（以後の `INSERT` が「列数と値の数が合わない」で通らない） | 名前付きの表制約として受ける（`UNIQUE` / `CHECK` / `FOREIGN KEY` は元から対応済み） |
+
+**実 DB では書けるのに断られていたもの**
+
+| 書き方 | 直した内容 |
+| --- | --- |
+| `COUNT(*) FILTER ( WHERE c)`（開き括弧の後ろに空白や改行） | 文の `WHERE` は括弧の深さ 0 のものだけを見る |
+| `ABS (x)` / `COUNT (\n *\n )`（関数名と開き括弧の間の空白）。「関数 ABS は存在しません。ABS の間違いでは？」という意味不明なエラーになっていた | 構文語（`IN` / `EXISTS` / `NOT` …）以外は空白を詰めてから写像する |
+| `name LIKE '%' \|\| key \|\| '%'` / `LIKE CONCAT('A', '%')` / `LIKE pat_col` / `LIKE ('A%')` | `LIKE` / `ILIKE` の右辺に式を書けるようにする（従来は文字列リテラルと副問い合わせのみ） |
+| `CAST(SUBSTRING(CAST(d AS TEXT), 1, 4) AS INT)`（2 段以上入れ子の `CAST`） | 括弧の対応を見て内側から畳む（深さ制限つきの正規表現をやめた） |
+| `WHERE x IS NOT DISTINCT FROM e.col`（相関副問い合わせの中） | 句の区切りでない `FROM`（`IS DISTINCT FROM` / `EXTRACT(… FROM …)` / `TRIM(… FROM …)`）を均してから外側参照を探す |
+| `FROM t, cte`（CTE をカンマ結合で並べる） | `FROM` 句の範囲を見て、カンマ区切りの項目も CTE として解決する |
+| `WHERE d BETWEEN '2021-01-01' AND '2022-12-31'`（結合先の表の列に対して） | 述語の押し下げで `BETWEEN … AND …` の `AND` を区切りと数えない |
+| `RANK() OVER (PARTITION BY c.tier …) … GROUP BY c.tier`（修飾名の区画） | 集計後の行には修飾なしの出力名しか無いので、修飾を落として解決する |
+| `OVER (ORDER BY SUM(x) DESC NULLS LAST)`（`GROUP BY` 結果に対する窓） | 末尾の `NULLS FIRST\|LAST` も外してから式を取り出す |
+
+**テスト側の整理**
+
+- 各スイートが同じ形で持っていた道具立て（テストの登録・結果の取り出し・値の比較・
+  文字列リテラルを避けた変換・模型作り・フィクスチャの片付け）を
+  [`js/tests/test-helpers.js`](js/tests/test-helpers.js) の `makeTestKit()` へ集約した。
+  **60 本中 45 本のスイートがこれを使う**形になり、同じ関数の写しが 400 行あまり消えている。
+  古いスイートは `const { T, check: push, err, t: fn } = makeTestKit('V20');` のように
+  元の呼び名へ別名を付けて受け取るので、本文はそのまま。
+  意図して違う実装（v16 の `sum`、v23 の `val`、v35 の `col`、v40 の `expectNear` など）は
+  各スイートに残してある。
+- 配列リテラルで定義を並べるスイート（`test-suite.js` / `v2`〜`v12` など）向けに、定型テストを作る
+  工場関数 `errCase` / `okCase` / `successCase` / `valCase` を同じファイルへ用意し、
+  **232 件**の「拒否されるべき文」「`Result: 'Success'` を返す文」を 1 行の呼び出しへ寄せた。
+  エラー文の照合規則（大小文字を無視した部分一致）が全スイートで揃う。
+- スイートを 1 本だけ回すランナー [`test/run-suite.mjs`](test/run-suite.mjs) を常設した
+  （`bun test/run-suite.mjs v51` / `all`）。SQL だけで完結するスイートはこれで数十秒、
+  1 本なら 1 秒前後で回るので、エンジンを触ったらまずこれ、最後に実ブラウザ、という順で使う。
+
 ### v1.30 — コマンド全網羅テストで出た欠陥の修正
 
 実装済みコマンド（`SHOW FUNCTIONS` が返す関数 296 種と、文レベルの全コマンド）を

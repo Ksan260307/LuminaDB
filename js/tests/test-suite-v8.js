@@ -38,8 +38,7 @@
             db.executeQuery("DROP TABLE v8fd");
             return !r.error && r.data[0].c === 2;
         }},
-        { name: "V8Filter: On Non Aggregate Rejected", sql: "SELECT age FILTER (WHERE age > 0) FROM users", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('FILTER') },
+        errCase("V8Filter: On Non Aggregate Rejected", "SELECT age FILTER (WHERE age > 0) FROM users", 'FILTER'),
         { name: "V8Filter: Cleanup", sql: "DROP TABLE v8f", check: r => r.data[0].Result === "Success" },
 
         // ============================================================
@@ -59,10 +58,8 @@
             r.data[0].c === 100 && r.data[0].sm === 5050 },
         { name: "V8Gen: Join Two Series", sql: "SELECT COUNT(*) AS c FROM GENERATE_SERIES(1, 3) a JOIN GENERATE_SERIES(1, 4) b ON 1 = 1", check: r => r.data[0].c === 12 },
         { name: "V8Gen: Filter On Series", sql: "SELECT COUNT(*) AS c FROM GENERATE_SERIES(1, 10) WHERE value % 2 = 0", check: r => r.data[0].c === 5 },
-        { name: "V8Gen: Zero Step Rejected", sql: "SELECT * FROM GENERATE_SERIES(1, 5, 0)", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('step') },
-        { name: "V8Gen: Too Few Args Rejected", sql: "SELECT * FROM GENERATE_SERIES(5)", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('2 or 3 arguments') },
+        errCase("V8Gen: Zero Step Rejected", "SELECT * FROM GENERATE_SERIES(1, 5, 0)", 'step'),
+        errCase("V8Gen: Too Few Args Rejected", "SELECT * FROM GENERATE_SERIES(5)", '2 or 3 arguments'),
         { name: "V8Gen: Empty Range", sql: "SELECT COUNT(*) AS c FROM GENERATE_SERIES(5, 1)", check: r => r.data[0].c === 0 },
         { name: "V8Gen: Insert Select From Series", fn: () => {
             db.executeQuery("CREATE TABLE v8nums (n INTEGER)");
@@ -86,8 +83,7 @@
         }},
         { name: "V8Win: Multiple Definitions", sql: "SELECT id, ROW_NUMBER() OVER w1 AS a, ROW_NUMBER() OVER w2 AS b FROM users WINDOW w1 AS (ORDER BY age), w2 AS (ORDER BY id DESC) ORDER BY id LIMIT 1", check: r =>
             r.data.length === 1 && typeof r.data[0].a === 'number' && typeof r.data[0].b === 'number' },
-        { name: "V8Win: Undefined Window Rejected", sql: "SELECT ROW_NUMBER() OVER wx AS rn FROM users WINDOW w AS (ORDER BY age)", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes("Window 'wx' is not defined") },
+        errCase("V8Win: Undefined Window Rejected", "SELECT ROW_NUMBER() OVER wx AS rn FROM users WINDOW w AS (ORDER BY age)", "Window 'wx' is not defined"),
         { name: "V8Win: Frame In Named Window", sql: "SELECT id, SUM(age) OVER w AS running FROM users WINDOW w AS (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) ORDER BY id LIMIT 2", check: r =>
             r.data.length === 2 && r.data[1].running === r.data[0].running + db.executeQuery("SELECT age FROM users WHERE id = 2").data[0].age },
 
@@ -127,10 +123,8 @@
             const r = db.executeQuery("SELECT b FROM v8gc WHERE a = 100");
             return r.data[0].b === 200;
         }},
-        { name: "V8GenCol: Insert Into Generated Rejected", sql: "INSERT INTO v8gc (a, b) VALUES (1, 99)", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes("generated column") },
-        { name: "V8GenCol: Update Generated Rejected", sql: "UPDATE v8gc SET b = 99 WHERE a = 100", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes("generated column") },
+        errCase("V8GenCol: Insert Into Generated Rejected", "INSERT INTO v8gc (a, b) VALUES (1, 99)", "generated column"),
+        errCase("V8GenCol: Update Generated Rejected", "UPDATE v8gc SET b = 99 WHERE a = 100", "generated column"),
         { name: "V8GenCol: DESCRIBE Shows Extra", fn: () => {
             const r = db.executeQuery("DESCRIBE v8gc");
             const row = r.data.find(x => x.Column === 'b');
@@ -154,8 +148,7 @@
             const r = eng2.executeQuery("SELECT b FROM v8gc WHERE a = 9");
             return r.data[0].b === 18;
         }},
-        { name: "V8GenCol: Generated With Default Rejected", sql: "CREATE TABLE v8bad (a INTEGER, b AS (a) DEFAULT 5)", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('DEFAULT') },
+        errCase("V8GenCol: Generated With Default Rejected", "CREATE TABLE v8bad (a INTEGER, b AS (a) DEFAULT 5)", 'DEFAULT'),
         { name: "V8GenCol: Cleanup", sql: "DROP TABLE v8gc", check: r => r.data[0].Result === "Success" },
 
         // ============================================================

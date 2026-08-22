@@ -3,14 +3,15 @@
     // ============================================================================
 
     // 集計関数名の一覧（先頭一致判定・式中判定・書き換えで共用）
-    const LUMINA_AGG_NAMES = 'COUNT_IF|COUNT|SUM|AVG|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|REGR_SLOPE|REGR_INTERCEPT|REGR_COUNT|REGR_R2|REGR_AVGX|REGR_AVGY|REGR_SXX|REGR_SYY|REGR_SXY|MODE|ANY_VALUE|GROUPING_ID|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG';
+    const LUMINA_AGG_NAMES = 'APPROX_COUNT_DISTINCT|COUNT_IF|COUNT|SUM|AVG|EVERY|PRODUCT|MAX_BY|MIN_BY|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV_SAMP|STDDEV_POP|STDDEV|VARIANCE|VAR_SAMP|VAR_POP|MEDIAN|PERCENTILE_CONT|PERCENTILE_DISC|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|REGR_SLOPE|REGR_INTERCEPT|REGR_COUNT|REGR_R2|REGR_AVGX|REGR_AVGY|REGR_SXX|REGR_SYY|REGR_SXY|MODE|ANY_VALUE|GROUPING_ID|GROUPING|JSON_ARRAYAGG|JSON_OBJECTAGG';
 
     // 引数をちょうど 1 個だけ取る集計。余分な引数はカンマ式として最後の値だけが
     // 使われ「黙って別の答え」になるので、コンパイル時に弾く
     const LUMINA_ONE_ARG_AGGS = new Set([
         'SUM', 'AVG', 'MIN', 'MAX', 'COUNT_IF', 'ARRAY_AGG', 'JSON_ARRAYAGG',
         'STDDEV', 'STDDEV_POP', 'STDDEV_SAMP', 'VARIANCE', 'VAR_POP', 'VAR_SAMP',
-        'MEDIAN', 'BIT_AND', 'BIT_OR', 'BIT_XOR', 'BOOL_AND', 'BOOL_OR', 'ANY_VALUE'
+        'MEDIAN', 'BIT_AND', 'BIT_OR', 'BIT_XOR', 'BOOL_AND', 'BOOL_OR', 'ANY_VALUE',
+        'EVERY', 'PRODUCT', 'APPROX_COUNT_DISTINCT'
     ]);
 
     // OVER (...) を付けて使える関数。ここに無い名前は評価側の分岐に当たらず
@@ -55,11 +56,13 @@
           // 集計の入れ子（MAX(SUM(x)) 等）は SQL 標準でも不可。ここで弾かないと内側の
           // 集計名が列参照として解決され "Column 'sum' not found" という判りにくい
           // エラーになるため、意図の伝わる文言で拒否する
-          if (/\b(?:COUNT|SUM|AVG|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV(?:_POP|_SAMP)?|VARIANCE|VAR_POP|VAR_SAMP|MEDIAN|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|ANY_VALUE)\s*\(/i.test(argExpr)) {
+          if (/\b(?:COUNT|SUM|AVG|MAX|MIN|GROUP_CONCAT|STRING_AGG|LISTAGG|ARRAY_AGG|STDDEV(?:_POP|_SAMP)?|VARIANCE|VAR_POP|VAR_SAMP|MEDIAN|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|ANY_VALUE|EVERY|PRODUCT|APPROX_COUNT_DISTINCT)\s*\(/i.test(argExpr)) {
               throw new Error(`Aggregate functions cannot be nested: ${func}(${argExpr.slice(0, 40)}). Compute the inner aggregate in a subquery, then aggregate that.`);
           }
           // ARRAY_AGG は JSON_ARRAYAGG の別名（PostgreSQL/標準SQL 互換）
           if (func === 'ARRAY_AGG') func = 'JSON_ARRAYAGG';
+          // EVERY は BOOL_AND の別名（SQL標準 / PostgreSQL）
+          if (func === 'EVERY') func = 'BOOL_AND';
           // FILTER (WHERE cond): 集計対象をこの条件が真の行に限定する（SQL標準）
           const filterFunc = filterExpr ? this.compileCondition(filterExpr, strMap) : null;
           // GROUPING(col): ROLLUP の小計行で 1、通常行で 0 を返す。引数は GROUP BY 項目との
@@ -80,6 +83,9 @@
               isDistinctAgg = true;
               argExpr = argExpr.replace(/^DISTINCT\s+/i, '');
           }
+          // APPROX_COUNT_DISTINCT(x): 行数が少ない前提のエンジンなので近似せず
+          // COUNT(DISTINCT x) と同じ厳密な値を返す（綴りの互換だけを提供する）
+          if (func === 'APPROX_COUNT_DISTINCT') { func = 'COUNT'; isDistinctAgg = true; }
           // GROUP_CONCAT(col SEPARATOR 'x'): 区切り文字の指定（既定はカンマ）
           let separator = ',';
           const sepMatch = argExpr.match(/^([\s\S]+?)\s+SEPARATOR\s+__STR_(\d+)__$/i);
@@ -98,7 +104,8 @@
           if (['GROUP_CONCAT', 'JSON_ARRAYAGG', 'STRING_AGG', 'LISTAGG'].includes(func)) {
               const obAt = this._topLevelKeyword(argExpr, 'order by');
               if (obAt > 0) {
-                  const ordText = argExpr.slice(obAt + 8).trim();
+                  // 'ORDER BY' の語間は空白でも改行でもよいので、実際の長さで切る
+                  const ordText = argExpr.slice(obAt + this._keywordLenAt(argExpr, obAt, 'order by')).trim();
                   argExpr = argExpr.slice(0, obAt).trim();
                   orderSpecs = this.splitSelectClause(ordText).map(s => {
                       let e = s.trim();
@@ -280,7 +287,10 @@
               if (bare === String(cs.alias).toLowerCase()) return;   // 読み替え不要
               if (!map.has(bare)) map.set(bare, cs.alias);
           });
-          if (map.size === 0) return text;
+          // 出力名（別名）の一覧。集計後の行はこの名前でしか列を持たない
+          const outNames = new Set((compiledSelects || [])
+              .filter(cs => cs && cs.alias).map(cs => String(cs.alias).toLowerCase()));
+          if (map.size === 0 && outNames.size === 0) return text;
           const sm = [];
           let s = this._maskStrings(text, sm);
           s = s.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*\s*\.\s*)?([a-zA-Z_][a-zA-Z0-9_]*)\b(\s*\()?/g,
@@ -288,7 +298,12 @@
                   if (call) return m;                                  // 関数呼び出しは触らない
                   if (/^__/.test(name)) return m;                      // 内部トークン
                   const to = map.get(name.toLowerCase());
-                  return to === undefined ? m : to;
+                  if (to !== undefined) return to;
+                  // 表名で修飾した参照（`PARTITION BY c.tier`）は、集計後の行には
+                  // 修飾なしの出力名しか無いので修飾を落とす。落とさないと
+                  // 「Column 'c.tier' not found」になっていた
+                  if (qual && outNames.has(name.toLowerCase())) return name;
+                  return m;
               });
           return this._restoreStrings(s, sm);
       },
@@ -697,7 +712,17 @@
           const gMatch = tempSql.match(/\s+group\s+by\s+([\s\S]+)$/i);
           if(gMatch) { groupByStr = gMatch[1]; tempSql = tempSql.substring(0, gMatch.index); }
 
-          const wMatch = tempSql.match(/\s+where\s+([\s\S]+)$/i);
+          // 括弧の中の WHERE を文の WHERE と取り違えないよう、深度 0 の最初の WHERE で切る。
+          // `COUNT(*) FILTER ( WHERE c)` のように開き括弧の後ろに空白や改行を入れると、
+          // 単純な `\s+where\s+` が集計の FILTER 条件へ食い込んで文が壊れていた
+          // （派生表はこの時点で実体化済みなので、文の WHERE は必ず深度 0 にある）
+          const wAt = this._topLevelKeyword(tempSql, 'where');
+          let wMatch = null;
+          if (wAt !== -1) {
+              let cut = wAt;
+              while (cut > 0 && /\s/.test(tempSql[cut - 1])) cut--;
+              wMatch = { index: cut, 1: tempSql.slice(wAt + 5) };
+          }
           if(wMatch) { whereStr = wMatch[1]; tempSql = tempSql.substring(0, wMatch.index); }
           // 空の WHERE（`SELECT * FROM t WHERE`）は構文エラー。以前は条件が無いものとして
           // 全行を返しており、条件を書き忘れた・削り過ぎたクエリが黙って通っていた
@@ -1416,7 +1441,10 @@
               //   3. AS 省略の後置別名                … SELECT id x / SELECT COUNT(*) c
               // 3 は SQL では一般的だが、末尾が裸の語になる構文（IS NULL / INTERVAL 1 DAY /
               // COLLATE NOCASE 等）と紛れるため _trailingAlias で保守的に判定する
-              const asMatch = part.match(/(.+?)\s+AS\s+([a-zA-Z0-9_]+|__STR_\d+__)$/i);
+              // `.` は改行に一致しないため、項目を複数行で書くと（`sal *\n2 + 1 AS x`）
+              // 先頭アンカー無しの `(.+?)` が改行の後ろから一致し、式の前半が黙って捨てられる。
+              // 先頭を固定し、任意の文字クラスで受ける
+              const asMatch = part.match(/^([\s\S]+?)\s+AS\s+([a-zA-Z0-9_]+|__STR_\d+__)$/i);
               let bareAlias = null;
               if (!asMatch) bareAlias = this._trailingAlias(part.trim());
               let expr = asMatch ? asMatch[1].trim() : (bareAlias ? bareAlias.expr : part.trim());
@@ -1528,12 +1556,14 @@
                   nthFromLast = fromEndM[2].toUpperCase() === 'LAST';
                   expr = `${fromEndM[1]} ${fromEndM[3] || ''}OVER (${fromEndM[4]})`;
               }
-              let wfMatch = expr.match(/^([a-zA-Z_]+)\s*\((.*?)\)\s+(IGNORE|RESPECT)\s+NULLS\s+OVER\s*\((.*?)\)$/i);
+              // OVER (...) の中身や引数を複数行で書く形（整形済み SQL では普通）を受けるため、
+              // `.` ではなく [\s\S] で受ける（`.` は改行に一致しない）
+              let wfMatch = expr.match(/^([a-zA-Z_]+)\s*\(([\s\S]*?)\)\s+(IGNORE|RESPECT)\s+NULLS\s+OVER\s*\(([\s\S]*?)\)$/i);
               if (wfMatch) {
                   wfIgnoreNulls = wfMatch[3].toUpperCase() === 'IGNORE';
                   wfMatch = [wfMatch[0], wfMatch[1], wfMatch[2], wfMatch[4]];
               } else {
-                  wfMatch = expr.match(/^([a-zA-Z_]+)\s*\((.*?)\)\s+OVER\s*\((.*?)\)$/i);
+                  wfMatch = expr.match(/^([a-zA-Z_]+)\s*\(([\s\S]*?)\)\s+OVER\s*\(([\s\S]*?)\)$/i);
               }
               if (wfMatch) {
                   let funcName = wfMatch[1].toUpperCase();
@@ -1633,14 +1663,16 @@
                       overStr = overStr.slice(0, fM.index).trim();
                   }
 
-                  let pMatch = overStr.match(/PARTITION\s+BY\s+(.+?)(?:\s+ORDER\s+BY\s+(.+))?$/i);
+                  // OVER 句を複数行で書くと `.` が改行に一致せず、ORDER BY の項目
+                  // （`... ORDER BY sal\nDESC`）が丸ごと落ちて並び順が黙って無視されていた
+                  let pMatch = overStr.match(/PARTITION\s+BY\s+([\s\S]+?)(?:\s+ORDER\s+BY\s+([\s\S]+))?$/i);
                   let partitionCols = [], orderCols = [];
                   // 分割は括弧内カンマを保護する（PARTITION BY CONCAT(a, b) 等）
                   if (pMatch) {
                       partitionCols = this.splitSelectClause(pMatch[1]).map(s=>s.trim());
                       if (pMatch[2]) orderCols = this.splitSelectClause(pMatch[2]).map(s=>s.trim());
                   } else {
-                      let oMatch = overStr.match(/ORDER\s+BY\s+(.+)$/i);
+                      let oMatch = overStr.match(/ORDER\s+BY\s+([\s\S]+)$/i);
                       if (oMatch) orderCols = this.splitSelectClause(oMatch[1]).map(s=>s.trim());
                   }
 
@@ -1700,10 +1732,15 @@
                   windowFuncs.push({ wfId, funcName, argFunc, argOffset, argDefaultFunc, argDefaultExpr,
                       percentileP, nthFromLast, pFuncs, oFuncs, frame, ignoreNulls: wfIgnoreNulls,
                       srcArg: firstArg, srcPartition: partitionCols.slice(),
+                      // 末尾の ASC|DESC と NULLS FIRST|LAST を落として式だけを残す。
+                      // NULLS 句を見ていなかったため、GROUP BY 結果に対するウィンドウで
+                      // `OVER (ORDER BY SUM(x) DESC NULLS LAST)` と書くと式が
+                      // `__wa_3  DESC NULLS LAST` のまま残って壊れていた
                       srcOrder: orderCols.map(s => {
                           const p = s.trim();
-                          const dm2 = p.match(/\s+(asc|desc)$/i);
-                          return { expr: dm2 ? p.slice(0, dm2.index).trim() : p, desc: !!(dm2 && dm2[1].toLowerCase() === 'desc') };
+                          const dm2 = p.match(/^([\s\S]+?)(?:\s+(asc|desc))?(?:\s+nulls\s+(?:first|last))?$/i);
+                          return { expr: dm2 ? dm2[1].trim() : p,
+                                   desc: !!(dm2 && dm2[2] && dm2[2].toLowerCase() === 'desc') };
                       }) });
 
                   return { type: 'window', wfId, alias };
@@ -1870,6 +1907,17 @@
                   const nm = e.match(/\s+nulls\s+(first|last)$/i);
                   if (nm) { nulls = nm[1].toLowerCase(); e = e.slice(0, nm.index).trim(); }
                   let desc = false;
+                  // USING < / >（PostgreSQL）: 比較演算子で向きを指定する綴り。
+                  // 昇順・降順そのものなので ASC / DESC へ読み替える
+                  const um = e.match(/\s+using\s+(<=|>=|<|>)$/i);
+                  if (um) {
+                      desc = um[1][0] === '>';
+                      e = e.slice(0, um.index).trim();
+                      return { expr: e, desc, nulls, isOrdinal: /^\d+$/.test(e), attachKey: null, attachFailed: false };
+                  }
+                  if (/\s+using\s+\S+$/i.test(e)) {
+                      throw new Error("ORDER BY ... USING accepts only the comparison operators < <= > >= (LuminaDB has no user-defined operators).");
+                  }
                   const dm = e.match(/\s+(asc|desc)$/i);
                   if (dm) { desc = dm[1].toLowerCase() === 'desc'; e = e.slice(0, dm.index).trim(); }
                   return { expr: e, desc, nulls, isOrdinal: /^\d+$/.test(e), attachKey: null, attachFailed: false };
@@ -2567,6 +2615,17 @@
                                   else acc = sel.func === 'BOOL_AND' ? (acc && b) : (acc || b);
                               });
                               aggRow[sel.alias] = acc;
+                          } else if (sel.func === 'PRODUCT') {
+                              // 非NULL値の総乗。非NULL値が無ければ NULL（SUM と違い 0 にはしない）
+                              let prod = null;
+                              groupPtrs.forEach(ptr => {
+                                  const v = sel.argFunc ? sel.argFunc(ptr, this.tables, aliases) : null;
+                                  if (v === null || v === undefined) return;
+                                  const n = Number(v);
+                                  if (!isFinite(n)) return;
+                                  prod = prod === null ? n : prod * n;
+                              });
+                              aggRow[sel.alias] = prod;
                           } else if (sel.func === 'REGR_COUNT') {
                               // 両方が非 NULL の行数
                               let rc = 0;

@@ -3,7 +3,7 @@
     // 各機能メソッドは engine-*.js で prototype 拡張として定義される
     // ============================================================================
     // エンジンバージョン（VERSION() 関数 / SHOW STATUS / 外部APIが参照する）
-    var LUMINA_VERSION = '1.30.0';
+    var LUMINA_VERSION = '1.34.0';
 
     class DatabaseEngine {
       constructor() {
@@ -324,6 +324,9 @@
         }
         // SQLite の EXPLAIN QUERY PLAN は通常の EXPLAIN と同義に扱う
         sql = sql.replace(/^explain\s+query\s+plan\s+/i, 'EXPLAIN ');
+        // PostgreSQL の EXPLAIN VERBOSE / EXPLAIN ANALYZE VERBOSE。LuminaDB の計画は
+        // 常に全ステップを出すので VERBOSE は取り除いて同じ経路へ流す
+        sql = sql.replace(/^explain\s+(analyze\s+)?verbose\s+/i, (m, an) => 'EXPLAIN ' + (an ? 'ANALYZE ' : ''));
         if (/^explain\s+analyze\s+/i.test(sql)) {
             // EXPLAIN ANALYZE: 実行計画に加えてクエリを実際に実行し、実測値を付記する
             isAnalyze = true;
@@ -520,20 +523,55 @@
              resultSet = res.data;
              affectedRows = res.affectedRows;
           }
-          else if (/^set\s+@/i.test(sql)) {
+          else if (/^set\s+@(?!@)/i.test(sql)) {
              const res = this._executeSetVar(sql, strMap);
              resultSet = res.data;
              affectedRows = res.affectedRows;
           }
-          else if (/^(create|drop)\s+schema\b/i.test(sql)) {
-             // 単一スキーマ (main) のみのため、CREATE/DROP SCHEMA は受理して記録するに留める。
-             // 実DB向けスクリプトをそのまま流せるようにするための互換措置
-             const sm = sql.match(/^(create|drop)\s+schema\s+(if\s+not\s+exists\s+|if\s+exists\s+)?([a-zA-Z0-9_]+)/i);
-             if (!sm) throw new Error("Syntax Error. Use CREATE|DROP SCHEMA [IF [NOT] EXISTS] <name>.");
-             const nm = sm[3].toLowerCase();
+          else if (/^(create|drop)\s+(?:schema|database)\b/i.test(sql)) {
+             // 単一スキーマ (main) のみのため、CREATE/DROP SCHEMA|DATABASE は受理して
+             // 記録するに留める。実DB向けスクリプトをそのまま流せるようにするための互換措置
+             // （MySQL の DATABASE と標準の SCHEMA は同義。同じ名前空間へ記録する）
+             const sm = sql.match(/^(create|drop)\s+(schema|database)\s+(if\s+not\s+exists\s+|if\s+exists\s+)?([a-zA-Z0-9_]+)/i);
+             if (!sm) throw new Error("Syntax Error. Use CREATE|DROP {SCHEMA|DATABASE} [IF [NOT] EXISTS] <name>.");
+             const kw = sm[2].toUpperCase();
+             const nm = sm[4].toLowerCase();
+             const isCreate = sm[1].toLowerCase() === 'create';
              this.schemas = this.schemas || Object.create(null);
-             if (sm[1].toLowerCase() === 'create') this.schemas[nm] = true; else delete this.schemas[nm];
-             resultSet = [{ Result: "Success", Message: `Schema '${nm}' ${sm[1].toLowerCase() === 'create' ? 'created' : 'dropped'} (LuminaDB uses a single schema; objects live in 'main').` }];
+             if (!isCreate && nm === 'main') throw new Error(`Cannot drop '${nm}': it is the schema every LuminaDB object lives in.`);
+             const existed = nm === 'main' || !!this.schemas[nm];
+             if (isCreate) this.schemas[nm] = true;
+             else {
+                 delete this.schemas[nm];
+                 if (this.currentSchema === nm) this.currentSchema = 'main';
+             }
+             const what = isCreate ? (existed ? 'already exists' : 'created') : (existed ? 'dropped' : 'did not exist');
+             resultSet = [{ Result: "Success", Message: `${kw} '${nm}' ${what} (LuminaDB uses a single schema; objects live in 'main').` }];
+          }
+          else if (/^use\b/i.test(sql)) {
+             // USE <db>: 単一スキーマなので「現在位置」を記録するだけ。存在しない名前は
+             // 黙って受けると以後の表参照が食い違うため拒否する
+             const um = sql.match(/^use\s+`?([a-zA-Z0-9_]+)`?$/i);
+             if (!um) throw new Error("Syntax Error. Use USE <database>.");
+             const nm = um[1].toLowerCase();
+             this.schemas = this.schemas || Object.create(null);
+             if (nm !== 'main' && !this.schemas[nm]) {
+                 throw new Error(`Database '${nm}' not found. LuminaDB keeps every object in 'main'; CREATE DATABASE ${nm} first if a script needs the name.`);
+             }
+             this.currentSchema = nm;
+             resultSet = [{ Result: "Success", Message: `Database changed to '${nm}' (LuminaDB uses a single schema; objects live in 'main').` }];
+          }
+          else if (/^reset\b/i.test(sql)) {
+             // RESET ALL / RESET <name>（PostgreSQL）: セッション変数を既定へ戻す
+             const res = this._executeReset(sql);
+             resultSet = res.data;
+             affectedRows = res.affectedRows;
+          }
+          else if (/^do\s/i.test(sql)) {
+             // DO <expr>[, <expr>...]（MySQL）: 式を評価して結果を捨てる
+             const res = this._executeDoStatement(sql, strMap);
+             resultSet = res.data;
+             affectedRows = res.affectedRows;
           }
           else if (/^pragma\b/i.test(sql)) {
              // SQLite 互換の PRAGMA（table_info / index_list / user_version 等）
@@ -588,8 +626,9 @@
              resultSet = res.data;
              affectedRows = res.affectedRows;
           }
-          else if (/^(check|analyze)\s+table\b/i.test(sql)) {
+          else if (/^(check|analyze|checksum|repair)\s+table\b/i.test(sql)) {
              // CHECK TABLE: 制約の整合性検査 / ANALYZE TABLE: 列統計レポート
+             // CHECKSUM TABLE: 内容のチェックサム / REPAIR TABLE: 受理のみ（破損しない構造）
              const res = this._executeTableMaintenance(sql);
              resultSet = res.data;
              affectedRows = res.affectedRows;
@@ -709,7 +748,8 @@
           if (/^pragma\b/i.test(s)) return !/=/.test(s);
           // SELECT ... INTO <table> は新しい表を作るので参照系ではない
           if (/^select\b[\s\S]*?\s+into\s+[a-zA-Z0-9_]+\s+from\b/i.test(s)) return false;
-          return /^(select|explain|show|describe|desc|table|values|check|analyze\s+table|use\b)/i.test(s);
+          // CHECKSUM TABLE は内容を読むだけ（REPAIR / DO は副作用を持ち得るので対象外）
+          return /^(select|explain|show|describe|desc|table|values|check|checksum\s+table|analyze\s+table|use\b)/i.test(s);
       }
 
       // 直近クエリのプロファイルを記録し、閾値を超えたものは slowLog へ積む

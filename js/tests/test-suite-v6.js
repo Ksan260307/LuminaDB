@@ -130,11 +130,9 @@
             const b = db.executeQuery("SELECT MEDIAN(age) AS m FROM users").data[0].m;
             return a === b;
         }},
-        { name: "V6Agg: PERCENTILE Bad Fraction Rejected", sql: "SELECT PERCENTILE_CONT(score, 1.5) AS p FROM v6agg", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('between 0 and 1') },
+        errCase("V6Agg: PERCENTILE Bad Fraction Rejected", "SELECT PERCENTILE_CONT(score, 1.5) AS p FROM v6agg", 'between 0 and 1'),
         { name: "V6Agg: PERCENTILE Empty Group Is NULL", sql: "SELECT PERCENTILE_CONT(score, 0.5) AS p FROM v6agg WHERE grp = 'zzz'", check: r => r.data[0].p === null },
-        { name: "V6Agg: MAX_BY Requires 2 Args", sql: "SELECT MAX_BY(item) FROM v6agg", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('2 arguments') },
+        errCase("V6Agg: MAX_BY Requires 2 Args", "SELECT MAX_BY(item) FROM v6agg", '2 arguments'),
         { name: "V6Agg: ORDER BY COUNT_IF Rewrite", sql: "SELECT grp FROM v6agg GROUP BY grp ORDER BY COUNT_IF(score > 10) DESC", check: r =>
             r.data.length === 2 && r.data[0].grp === 'a' },
 
@@ -205,9 +203,8 @@
             const n = db.executeQuery("SELECT COUNT(*) AS c FROM users").data[0].c;
             return !r.error && r.data[0].column1 === n;
         }},
-        { name: "V6Stmt: VALUES Width Mismatch Rejected", sql: "VALUES (1), (1, 2)", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('same number of columns') },
-        { name: "V6Stmt: VALUES Garbage Rejected", sql: "VALUES (1) garbage", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("V6Stmt: VALUES Width Mismatch Rejected", "VALUES (1), (1, 2)", 'same number of columns'),
+        errCase("V6Stmt: VALUES Garbage Rejected", "VALUES (1) garbage"),
         { name: "V6Stmt: TABLE With Order Limit", fn: () => {
             db.executeQuery("CREATE TABLE v6tbl (id INTEGER)");
             db.executeQuery("INSERT INTO v6tbl (id) VALUES (1), (2), (3), (4)");
@@ -228,8 +225,7 @@
         { name: "V6Stmt: CTE Column List Qualified Ref", sql: "WITH t(a) AS (SELECT 5 AS x) SELECT t.a FROM t", check: r => r.data[0].a === 5 },
         { name: "V6Stmt: Recursive CTE Column List", sql: "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5) SELECT COUNT(*) AS c, MAX(n) AS m FROM seq", check: r =>
             r.data[0].c === 5 && r.data[0].m === 5 },
-        { name: "V6Stmt: CTE Column List Width Mismatch", sql: "WITH t(a, b) AS (SELECT 1 AS x) SELECT * FROM t", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('column list') },
+        errCase("V6Stmt: CTE Column List Width Mismatch", "WITH t(a, b) AS (SELECT 1 AS x) SELECT * FROM t", 'column list'),
         { name: "V6Stmt: CTE Without List Still Works", sql: "WITH t AS (SELECT 1 AS a) SELECT a FROM t", check: r => r.data[0].a === 1 },
         { name: "V6Stmt: CTAS Without AS Keyword", fn: () => {
             db.executeQuery("DROP TABLE IF EXISTS v6ctas");
@@ -324,8 +320,7 @@
             db.executeQuery("DROP TABLE v6plain");
             return !r.error && r.data.length === 1 && r.data[0].Status === 'OK' && r.data[0].Constraint === '(no constraints)';
         }},
-        { name: "V6Show: CHECK TABLE Missing Table Suggests", sql: "CHECK TABLE usres", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes("Did you mean 'users'") },
+        errCase("V6Show: CHECK TABLE Missing Table Suggests", "CHECK TABLE usres", "Did you mean 'users'"),
         { name: "V6Show: ANALYZE TABLE Stats", fn: () => {
             db.executeQuery("CREATE TABLE v6ana (id INTEGER, v TEXT)");
             db.executeQuery("INSERT INTO v6ana (id, v) VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, NULL)");

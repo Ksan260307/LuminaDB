@@ -51,17 +51,9 @@
     //   test-suite.js の tests 配列へ getV32Tests() のスプレッドで合流する
     // ============================================================================
     function getV32Tests() {
-      const T = [];
-      const push = (name, sql, check) => T.push({ name, sql, check });
-      const err = (name, sql, frag) => T.push({
-        name, sql, isErrorExpected: true,
-        check: r => !!r.error && (!frag || r.error.toLowerCase().includes(String(frag).toLowerCase()))
-      });
-      const fn = (name, f) => T.push({ name, fn: f });
-      const one = (sql) => { const r = db.executeQuery(sql); return r.error ? { __err: r.error } : Object.values(r.data[0])[0]; };
-      const col = (sql, k) => { const r = db.executeQuery(sql); return r.error ? ['ERR:' + r.error] : r.data.map(x => x[k]); };
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, check: push, err, t: fn, q, oneSafe: one, colSafe: col } = makeTestKit('V32');
       const near = (a, b) => typeof a === 'number' && Math.abs(a - b) < 1e-9;
-      const q = (sql) => db.executeQuery(sql);
 
       // ============================================================
       // A1. 失敗した REPLACE INTO は表を変えない
@@ -637,10 +629,12 @@
         typeof window.saveDbToFile === 'function'
         && typeof window.openDbFromFile === 'function'
         && typeof window.luminaFsSupported === 'function');
-      fn('V32File the sidebar has Open / Save / Save As', () =>
-        !!document.getElementById('fileOpenBtn')
-        && !!document.getElementById('fileSaveBtn')
-        && !!document.getElementById('fileSaveAsBtn'));
+      // v1.34: サイドバーからデータモーダルの「ファイル」タブへ移した
+      fn('V32File the file tab has Open / Save / Save As', () => {
+        const ids = [...document.querySelectorAll('#dataPaneFile button')].map(b => b.id);
+        return ids.includes('fileOpenBtn') && ids.includes('fileSaveBtn') && ids.includes('fileSaveAsBtn')
+            && [...document.querySelectorAll('aside button')].every(b => b.id !== 'fileOpenBtn');
+      });
       fn('V32File Save is disabled until a file is opened', () =>
         document.getElementById('fileSaveBtn').disabled === true);
       fn('V32File the backup text the file path writes round-trips', () => {

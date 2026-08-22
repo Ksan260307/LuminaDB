@@ -218,20 +218,20 @@
         // ============================================================
         // 2. 異常系テスト (XNeg)
         // ============================================================
-        { name: "XNeg: Select Missing Table", sql: "SELECT * FROM zz_nothing", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Join Missing Table", sql: "SELECT * FROM users u JOIN zz_nothing z ON u.id = z.id", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: From Subquery Missing Table", sql: "SELECT * FROM (SELECT * FROM zz_nothing) t", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Having Unknown Column", sql: "SELECT age, COUNT(*) AS c FROM users GROUP BY age HAVING zz_ghost > 1", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Order By Ordinal Zero", sql: "SELECT id FROM users ORDER BY 0", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('out of range') },
-        { name: "XNeg: Order By Ordinal 99", sql: "SELECT id FROM users ORDER BY 99", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('out of range') },
-        { name: "XNeg: Union Column Mismatch", sql: "SELECT id, name FROM users UNION SELECT id FROM users", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Intersect Column Mismatch", sql: "SELECT id, name FROM users INTERSECT SELECT id FROM users", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Except Column Mismatch", sql: "SELECT id FROM users EXCEPT SELECT id, name FROM users", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Unknown Function", sql: "SELECT TOTALLY_FAKE_FN(id) AS v FROM users", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Unterminated String", sql: "SELECT * FROM users WHERE name = 'Alice", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Insert Missing Table", sql: "INSERT INTO zz_nothing (id) VALUES (1)", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Update Missing Table", sql: "UPDATE zz_nothing SET id = 1", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Delete Missing Table", sql: "DELETE FROM zz_nothing", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("XNeg: Select Missing Table", "SELECT * FROM zz_nothing"),
+        errCase("XNeg: Join Missing Table", "SELECT * FROM users u JOIN zz_nothing z ON u.id = z.id"),
+        errCase("XNeg: From Subquery Missing Table", "SELECT * FROM (SELECT * FROM zz_nothing) t"),
+        errCase("XNeg: Having Unknown Column", "SELECT age, COUNT(*) AS c FROM users GROUP BY age HAVING zz_ghost > 1"),
+        errCase("XNeg: Order By Ordinal Zero", "SELECT id FROM users ORDER BY 0", 'out of range'),
+        errCase("XNeg: Order By Ordinal 99", "SELECT id FROM users ORDER BY 99", 'out of range'),
+        errCase("XNeg: Union Column Mismatch", "SELECT id, name FROM users UNION SELECT id FROM users"),
+        errCase("XNeg: Intersect Column Mismatch", "SELECT id, name FROM users INTERSECT SELECT id FROM users"),
+        errCase("XNeg: Except Column Mismatch", "SELECT id FROM users EXCEPT SELECT id, name FROM users"),
+        errCase("XNeg: Unknown Function", "SELECT TOTALLY_FAKE_FN(id) AS v FROM users"),
+        errCase("XNeg: Unterminated String", "SELECT * FROM users WHERE name = 'Alice"),
+        errCase("XNeg: Insert Missing Table", "INSERT INTO zz_nothing (id) VALUES (1)"),
+        errCase("XNeg: Update Missing Table", "UPDATE zz_nothing SET id = 1"),
+        errCase("XNeg: Delete Missing Table", "DELETE FROM zz_nothing"),
         { name: "XNeg: Insert Fewer Values", fn: () => {
             db.executeQuery("CREATE TABLE nx_cnt (a INTEGER, b INTEGER)");
             const r = db.executeQuery("INSERT INTO nx_cnt (a, b) VALUES (1)");
@@ -279,22 +279,22 @@
             db.executeQuery("DROP VIEW nx_v");
             return r.error !== undefined;
         }},
-        { name: "XNeg: Multi Auto Increment", sql: "CREATE TABLE nx_ai (a INTEGER AUTO_INCREMENT, b INTEGER AUTO_INCREMENT)", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Table PK On Missing Column", sql: "CREATE TABLE nx_pkm (a INTEGER, PRIMARY KEY (zz))", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Create Index Syntax", sql: "CREATE INDEX ON users", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Drop Index No On Clause", sql: "DROP INDEX idx_x", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Alter Missing Table", sql: "ALTER TABLE zz_nothing ADD COLUMN x TEXT", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Rename Column Missing", sql: "ALTER TABLE users RENAME COLUMN zz_ghost TO abc", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Rename Column To Existing", sql: "ALTER TABLE users RENAME COLUMN id TO name", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("XNeg: Multi Auto Increment", "CREATE TABLE nx_ai (a INTEGER AUTO_INCREMENT, b INTEGER AUTO_INCREMENT)"),
+        errCase("XNeg: Table PK On Missing Column", "CREATE TABLE nx_pkm (a INTEGER, PRIMARY KEY (zz))"),
+        errCase("XNeg: Create Index Syntax", "CREATE INDEX ON users"),
+        errCase("XNeg: Drop Index No On Clause", "DROP INDEX idx_x"),
+        errCase("XNeg: Alter Missing Table", "ALTER TABLE zz_nothing ADD COLUMN x TEXT"),
+        errCase("XNeg: Rename Column Missing", "ALTER TABLE users RENAME COLUMN zz_ghost TO abc"),
+        errCase("XNeg: Rename Column To Existing", "ALTER TABLE users RENAME COLUMN id TO name"),
         { name: "XNeg: Rename Table To Existing", fn: () => {
             db.executeQuery("CREATE TABLE nx_rn (id INTEGER)");
             const r = db.executeQuery("ALTER TABLE nx_rn RENAME TO users");
             db.executeQuery("DROP TABLE nx_rn");
             return r.error !== undefined;
         }},
-        { name: "XNeg: Rename Table Statement Missing", sql: "RENAME TABLE zz_nothing TO abc", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Rename Table Syntax", sql: "RENAME TABLE users", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Modify Missing Column", sql: "ALTER TABLE users MODIFY COLUMN zz_ghost INTEGER", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("XNeg: Rename Table Statement Missing", "RENAME TABLE zz_nothing TO abc"),
+        errCase("XNeg: Rename Table Syntax", "RENAME TABLE users"),
+        errCase("XNeg: Modify Missing Column", "ALTER TABLE users MODIFY COLUMN zz_ghost INTEGER"),
         { name: "XNeg: Alter Add PK Twice", fn: () => {
             db.executeQuery("CREATE TABLE nx_pk2 (id INTEGER PRIMARY KEY)");
             const r = db.executeQuery("ALTER TABLE nx_pk2 ADD PRIMARY KEY (id)");
@@ -351,8 +351,8 @@
             db.executeQuery("ROLLBACK");
             return r.error !== undefined;
         }},
-        { name: "XNeg: View Non-Select Body", sql: "CREATE VIEW nx_bad AS UPDATE users SET age = 1", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: View Self Reference", sql: "CREATE VIEW nx_selfv AS SELECT * FROM nx_selfv", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("XNeg: View Non-Select Body", "CREATE VIEW nx_bad AS UPDATE users SET age = 1"),
+        errCase("XNeg: View Self Reference", "CREATE VIEW nx_selfv AS SELECT * FROM nx_selfv"),
         // v1.18: 単一表ビューへの INSERT / UPDATE は基底表へ書き換えて実行される（旧: 明示エラー）。
         // 共有テーブル (users) を書き換えないよう専用テーブルで検証する
         { name: "XView: Insert Into View Now Works", fn: () => {
@@ -381,21 +381,21 @@
             db.executeQuery("DROP VIEW nx_v4");
             return r.error !== undefined && r.error.includes('not updatable');
         }},
-        { name: "XNeg: Call Syntax With Args", sql: "CALL some_proc(1)", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Create Procedure Empty Body", sql: "CREATE PROCEDURE nx_p AS", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("XNeg: Call Syntax With Args", "CALL some_proc(1)"),
+        errCase("XNeg: Create Procedure Empty Body", "CREATE PROCEDURE nx_p AS"),
         // v1.2: 相関サブクエリは行単位評価でサポートされた（旧: 明示エラー）
         { name: "XNeg: Correlated Scalar Subquery Now Works", sql: "SELECT * FROM users u WHERE age > (SELECT AVG(amount) FROM orders o WHERE o.user_id = u.id)", check: r => !r.error && r.data.length === 10 },
         { name: "XNeg: Correlated IN Subquery Now Works", sql: "SELECT * FROM users u WHERE id IN (SELECT user_id FROM orders WHERE user_id = u.id)", check: r => !r.error && r.data.length === 4 },
-        { name: "XNeg: CTE Missing Main Statement", sql: "WITH a AS (SELECT id FROM users)", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: CTE Body Error", sql: "WITH a AS (SELECT * FROM zz_nothing) SELECT * FROM a", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Show Unknown Target", sql: "SHOW GADGETS", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Show Indexes Missing Table", sql: "SHOW INDEXES FROM zz_nothing", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Show Create Table Missing", sql: "SHOW CREATE TABLE zz_nothing", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Show Create View Missing", sql: "SHOW CREATE VIEW zz_nothing", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Describe Missing", sql: "DESCRIBE zz_nothing", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Truncate Missing", sql: "TRUNCATE TABLE zz_nothing", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: Create Table Like Missing Source", sql: "CREATE TABLE nx_like LIKE zz_nothing", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XNeg: CTAS From Missing Table", sql: "CREATE TABLE nx_ctas AS SELECT * FROM zz_nothing", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("XNeg: CTE Missing Main Statement", "WITH a AS (SELECT id FROM users)"),
+        errCase("XNeg: CTE Body Error", "WITH a AS (SELECT * FROM zz_nothing) SELECT * FROM a"),
+        errCase("XNeg: Show Unknown Target", "SHOW GADGETS"),
+        errCase("XNeg: Show Indexes Missing Table", "SHOW INDEXES FROM zz_nothing"),
+        errCase("XNeg: Show Create Table Missing", "SHOW CREATE TABLE zz_nothing"),
+        errCase("XNeg: Show Create View Missing", "SHOW CREATE VIEW zz_nothing"),
+        errCase("XNeg: Describe Missing", "DESCRIBE zz_nothing"),
+        errCase("XNeg: Truncate Missing", "TRUNCATE TABLE zz_nothing"),
+        errCase("XNeg: Create Table Like Missing Source", "CREATE TABLE nx_like LIKE zz_nothing"),
+        errCase("XNeg: CTAS From Missing Table", "CREATE TABLE nx_ctas AS SELECT * FROM zz_nothing"),
         { name: "XNeg: Optimize In Transaction", fn: () => {
             db.executeQuery("BEGIN");
             const r = db.executeQuery("OPTIMIZE");
@@ -411,18 +411,18 @@
             const r = db.executeQuery("INSERT INTO nx_cc (id, p_id, em, nm) VALUES (10, 1, 'a@x', 'n1'), (11, 2, 'b@x', 'n2')");
             return !r.error && r.data[0].Message.includes('2');
         }},
-        { name: "XNeg: FK Insert Invalid", sql: "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (12, 99, 'c@x', 'n3')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Foreign key') },
-        { name: "XNeg: FK Update Invalid", sql: "UPDATE nx_cc SET p_id = 99 WHERE id = 10", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Foreign key') },
-        { name: "XNeg: FK Delete Parent Restrict", sql: "DELETE FROM nx_cp WHERE id = 1", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Foreign key') },
-        { name: "XNeg: FK Update Parent Restrict", sql: "UPDATE nx_cp SET id = 5 WHERE id = 1", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Foreign key') },
-        { name: "XNeg: PK Duplicate Insert", sql: "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (10, 1, 'z@x', 'n9')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('PRIMARY KEY') },
-        { name: "XNeg: PK Batch Internal Duplicate", sql: "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (20, 1, 'k1@x', 'k1'), (20, 1, 'k2@x', 'k2')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('PRIMARY KEY') },
-        { name: "XNeg: PK Null Insert", sql: "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (null, 1, 'w@x', 'w1')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('PRIMARY KEY') },
-        { name: "XNeg: Unique Duplicate Insert", sql: "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (30, 1, 'a@x', 'n5')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('UNIQUE') },
-        { name: "XNeg: Unique Update Collision", sql: "UPDATE nx_cc SET em = 'a@x' WHERE id = 11", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('UNIQUE') },
-        { name: "XNeg: NotNull Insert Null", sql: "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (40, 1, 'd@x', null)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('NOT NULL') },
-        { name: "XNeg: NotNull Column Omitted", sql: "INSERT INTO nx_cc (id, p_id, em) VALUES (41, 1, 'e@x')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('NOT NULL') },
-        { name: "XNeg: NotNull Update To Null", sql: "UPDATE nx_cc SET nm = null WHERE id = 10", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('NOT NULL') },
+        errCase("XNeg: FK Insert Invalid", "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (12, 99, 'c@x', 'n3')", 'Foreign key'),
+        errCase("XNeg: FK Update Invalid", "UPDATE nx_cc SET p_id = 99 WHERE id = 10", 'Foreign key'),
+        errCase("XNeg: FK Delete Parent Restrict", "DELETE FROM nx_cp WHERE id = 1", 'Foreign key'),
+        errCase("XNeg: FK Update Parent Restrict", "UPDATE nx_cp SET id = 5 WHERE id = 1", 'Foreign key'),
+        errCase("XNeg: PK Duplicate Insert", "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (10, 1, 'z@x', 'n9')", 'PRIMARY KEY'),
+        errCase("XNeg: PK Batch Internal Duplicate", "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (20, 1, 'k1@x', 'k1'), (20, 1, 'k2@x', 'k2')", 'PRIMARY KEY'),
+        errCase("XNeg: PK Null Insert", "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (null, 1, 'w@x', 'w1')", 'PRIMARY KEY'),
+        errCase("XNeg: Unique Duplicate Insert", "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (30, 1, 'a@x', 'n5')", 'UNIQUE'),
+        errCase("XNeg: Unique Update Collision", "UPDATE nx_cc SET em = 'a@x' WHERE id = 11", 'UNIQUE'),
+        errCase("XNeg: NotNull Insert Null", "INSERT INTO nx_cc (id, p_id, em, nm) VALUES (40, 1, 'd@x', null)", 'NOT NULL'),
+        errCase("XNeg: NotNull Column Omitted", "INSERT INTO nx_cc (id, p_id, em) VALUES (41, 1, 'e@x')", 'NOT NULL'),
+        errCase("XNeg: NotNull Update To Null", "UPDATE nx_cc SET nm = null WHERE id = 10", 'NOT NULL'),
         { name: "XNeg: Constraint Rows Unchanged", sql: "SELECT COUNT(*) AS c FROM nx_cc", check: r => r.data[0].c === 2 },
         { name: "XNeg: Constraint Cleanup", fn: () => {
             db.executeQuery("DROP TABLE nx_cc");
@@ -455,12 +455,7 @@
             ["f", "'xyz'"], ["f", "false"], ["f", "'1.2.3'"],
             ["b", "'yes'"], ["b", "2"], ["b", "'10'"],
             ["d", "'2026/01/01'"], ["d", "'not-a-date'"],
-        ].map(([col, val], i) => ({
-            name: `XNeg Gen: Type Mismatch ${i + 1} [${col} <- ${val}]`,
-            sql: `INSERT INTO nx_types (${col}) VALUES (${val})`,
-            isErrorExpected: true,
-            check: r => r.error !== undefined && r.error.includes('Type mismatch')
-        })),
+        ].map(([col, val], i) => (errCase(`XNeg Gen: Type Mismatch ${i + 1} [${col} <- ${val}]`, `INSERT INTO nx_types (${col}) VALUES (${val})`, 'Type mismatch'))),
         { name: "XNeg: Types No Rows Leaked", sql: "SELECT COUNT(*) AS c FROM nx_types", check: r => r.data[0].c === 0 },
         { name: "XNeg: Types Cleanup", sql: "DROP TABLE nx_types", check: r => r.data[0].Result === "Success" },
 
@@ -578,7 +573,7 @@
             const v = db.executeQuery("SELECT COUNT(*) AS c FROM bx_types WHERE f > 1e308");
             return !!r.error && r.error.includes('Type mismatch') && v.data[0].c === 0;
         }},
-        { name: "XBnd: Integer Overflow Rejected", sql: "INSERT INTO bx_types (i) VALUES (1e309)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
+        errCase("XBnd: Integer Overflow Rejected", "INSERT INTO bx_types (i) VALUES (1e309)", 'Type mismatch'),
         { name: "XBnd: Empty String Into Integer Is Null", fn: () => {
             db.executeQuery("CREATE TABLE bx_e1 (i INTEGER)");
             const r = db.executeQuery("INSERT INTO bx_e1 (i) VALUES ('')");
@@ -664,7 +659,7 @@
         // JS の Date は非閏年の 2/29 を 3/1 へ繰り上げる（不正日付ではなく有効値として受理される）
         { name: "XBnd: Non-Leap Feb 29 Rolls To Mar 1", sql: "INSERT INTO bx_date (id, d) VALUES (2, '2023-02-29')", check: r => r.data[0].Message.includes('1 rows inserted') },
         { name: "XBnd: Non-Leap Feb 29 Stored As Mar 1", sql: "SELECT COUNT(*) AS c FROM bx_date WHERE d = '2023-03-01 00:00:00'", check: r => r.data[0].c === 1 },
-        { name: "XBnd: Month 13 Rejected", sql: "INSERT INTO bx_date (id, d) VALUES (3, '2026-13-01')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Type mismatch') },
+        errCase("XBnd: Month 13 Rejected", "INSERT INTO bx_date (id, d) VALUES (3, '2026-13-01')", 'Type mismatch'),
         { name: "XBnd: Min Max Year Accepted", sql: "INSERT INTO bx_date (id, d) VALUES (4, '0001-01-01'), (5, '9999-12-31')", check: r => r.data[0].Message.includes('2') },
         { name: "XBnd: DateTime With Seconds", sql: "INSERT INTO bx_date (id, d) VALUES (6, '2026-07-11 12:34:56')", check: r => r.data[0].Message.includes('1') },
         { name: "XBnd: DateTime Millis Accepted", sql: "INSERT INTO bx_date (id, d) VALUES (7, '2026-01-01 00:00:00.123')", check: r => r.data[0].Message.includes('1') },
@@ -990,9 +985,9 @@
         // --- 式コンパイルのコード注入防御 ---
         { name: "XSec: Template Literal In String Inert", sql: "SELECT 'a${window.__sp=1}b' AS v", check: r => r.data[0].v === 'a${window.__sp=1}b' && window.__sp === undefined },
         { name: "XSec: Backtick In String Inert", sql: "SELECT '`whoami`' AS v", check: r => r.data[0].v === '`whoami`' },
-        { name: "XSec: window Not Resolvable", sql: "SELECT window FROM users", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XSec: document Not Resolvable", sql: "SELECT document FROM users", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "XSec: eval Not Resolvable", sql: "SELECT eval FROM users", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("XSec: window Not Resolvable", "SELECT window FROM users"),
+        errCase("XSec: document Not Resolvable", "SELECT document FROM users"),
+        errCase("XSec: eval Not Resolvable", "SELECT eval FROM users"),
         { name: "XSec: alert Call Not Executable", fn: () => {
             const r = db.executeQuery("SELECT * FROM users WHERE alert(1)");
             return r.error !== undefined;

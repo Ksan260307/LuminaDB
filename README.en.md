@@ -2,9 +2,9 @@
 
 [日本語](README.md) | **English**
 
-A build-free, in-memory SQL database engine that runs entirely in the browser. Open a single HTML file and you get a full SQL engine (DQL / DML / DDL), transactions, window functions, triggers, views, commercial-DB commands such as `MERGE` / `TOP` / `ON CONFLICT`, and 270+ built-in functions — with no server.
+A build-free, in-memory SQL database engine that runs entirely in the browser. Open a single HTML file and you get a full SQL engine (DQL / DML / DDL), transactions, window functions, triggers, views, commercial-DB commands such as `MERGE` / `TOP` / `ON CONFLICT`, and 320+ built-in functions — with no server.
 
-> Self-contained tests: **30,039** (all passing — including 780+ security and 490+ performance tests)
+> Self-contained tests: **52,621** (all passing — including 780+ security and 490+ performance tests)
 >
 > Additions and fixes are recorded in [CHANGELOG.en.md](CHANGELOG.en.md).
 
@@ -56,7 +56,7 @@ ORDER BY o.amount DESC;
 | **Subqueries** | scalar / `IN` / `EXISTS` / correlated / **quantified comparison `= ANY`, `> ALL`, `SOME`** / **derived-table column lists (`(SELECT ...) AS t(a, b)`)** / **`FROM (VALUES ...) AS t(a, b)`** |
 | **CTEs** | `WITH` / `WITH RECURSIVE` (with column lists) |
 | **Window functions** | `ROW_NUMBER` / `RANK` / `LAG` / `LEAD` / frame specs (**`ROWS` / `RANGE` / `GROUPS`**, **`EXCLUDE CURRENT ROW\|GROUP\|TIES\|NO OTHERS`**) / named windows (`WINDOW` clause) / `QUALIFY` / **`IGNORE NULLS`, `RESPECT NULLS`** / **`FILTER (WHERE ...) OVER (...)`** |
-| **Aggregates** | many aggregate functions / **aggregates nested in expressions (`ROUND(AVG(x), 2)`, `100.0 * SUM(a) / SUM(b)`)** / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / **`CUBE`, `GROUPING SETS`** / **`GROUP BY ALL`** / `GROUPING()` / **`WITHIN GROUP (ORDER BY ...)`** / `GROUP_CONCAT` |
+| **Aggregates** | many aggregate functions (including **`EVERY` (alias of `BOOL_AND`), `PRODUCT`, `APPROX_COUNT_DISTINCT` (returns the exact value)**) / **aggregates nested in expressions (`ROUND(AVG(x), 2)`, `100.0 * SUM(a) / SUM(b)`)** / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / **`CUBE`, `GROUPING SETS`** / **`GROUP BY ALL`** / `GROUPING()` / **`WITHIN GROUP (ORDER BY ...)`** / `GROUP_CONCAT` |
 | **DML** | `INSERT` (multi-row, `SELECT`, `SET`, `DEFAULT`, **`DEFAULT VALUES`**) / `UPDATE` / `DELETE` (`ORDER BY`, `LIMIT`) / `REPLACE` / `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO NOTHING`, `DO UPDATE` (PostgreSQL, `EXCLUDED`) / `MERGE INTO ... USING ... WHEN MATCHED/NOT MATCHED` (Oracle/SQL Server) / **multi-table `UPDATE ... FROM`, `UPDATE ... JOIN`, `DELETE ... USING`, `DELETE t FROM t JOIN s`** / `RETURNING` |
 | **DDL** | `CREATE / ALTER / DROP TABLE` (**`CASCADE`, `RESTRICT`**) / `VIEW` / **`MATERIALIZED VIEW` (with `REFRESH`)** / `INDEX` (**multi-column, `UNIQUE`, `DROP INDEX` by name**) / `TRIGGER` / `PROCEDURE` / `SEQUENCE` / **`FUNCTION` (user-defined scalar functions)** / `CREATE TABLE AS` & `LIKE` / **`SELECT ... INTO`** / **`COMMENT ON`** / `TEMPORARY` |
 | **Constraints** | `PRIMARY KEY` (composite) / `UNIQUE` / `NOT NULL` / `DEFAULT` (incl. `CURRENT_TIMESTAMP`) / **`ON UPDATE CURRENT_TIMESTAMP`** / `CHECK` / `FOREIGN KEY` (`ON DELETE/UPDATE` actions) / `AUTO_INCREMENT` / **identity columns (`GENERATED ALWAYS AS IDENTITY`, `IDENTITY(1,1)`)** / generated columns (`GENERATED ALWAYS AS`) |
@@ -66,9 +66,9 @@ ORDER BY o.amount DESC;
 | **Operators & predicates** | **`\|\|` (string concatenation)** / **`::` (cast)** / **`ILIKE`** / **`SIMILAR TO`** / **row constructors** / **`COLLATE` (`NOCASE`, `BINARY`, `NOACCENT`, `NUMERIC`)** / **`LIKE ANY`, `LIKE ALL`** / **date ± `INTERVAL`** |
 | **Full-text search** | **`MATCH (col, ...) AGAINST ('terms' [IN BOOLEAN\|NATURAL LANGUAGE MODE])`** — `+`required / `-`excluded / `"phrase"` / `term*` prefix, usable as a relevance score |
 | **Table functions** | `GENERATE_SERIES` (**numeric ranges and timestamp ranges with an `INTERVAL` step**) / `STRING_SPLIT(str, sep)` / `UNNEST(a, b, ...)` / **`JSON_TABLE` (JSON → rows)** / **`WITH ORDINALITY`** |
-| **Arrays** | **`ARRAY[...]` constructor** / **`ARRAY_LENGTH`, `ARRAY_POSITION`, `ARRAY_CONTAINS`, `ARRAY_APPEND`, `ARRAY_PREPEND`, `ARRAY_REMOVE`, `ARRAY_SORT`, `ARRAY_TO_STRING`, `STRING_TO_ARRAY`** / **`= ANY(ARRAY[...])`** |
+| **Arrays** | **`ARRAY[...]` constructor** / **`ARRAY_LENGTH`, `ARRAY_POSITION`, `ARRAY_CONTAINS`, `ARRAY_APPEND`, `ARRAY_PREPEND`, `ARRAY_REMOVE`, `ARRAY_SORT`, `ARRAY_TO_STRING`, `STRING_TO_ARRAY`, `ARRAY_DISTINCT`, `ARRAY_CAT`, `ARRAY_REVERSE`** / **`= ANY(ARRAY[...])`** |
 | **Sampling** | **`TABLESAMPLE [BERNOULLI\|SYSTEM] (n PERCENT\|n ROWS) [REPEATABLE (seed)]`** |
-| **Ranges & time series** | **`(s1, e1) OVERLAPS (s2, e2)`** / **`BETWEEN SYMMETRIC`** / **`DATE_BIN`, `TIME_BUCKET`** / **`AGE(a, b)`** / **`EXTRACT(EPOCH\|DOW\|DOY FROM ...)`** / **`AT TIME ZONE`** |
+| **Ranges & time series** | **`(s1, e1) OVERLAPS (s2, e2)`** / **`BETWEEN SYMMETRIC`** / **`DATE_BIN`, `TIME_BUCKET`** / **`AGE(a, b)`** / **`EXTRACT(EPOCH\|DOW\|DOY FROM ...)`** / **`AT TIME ZONE`, `CONVERT_TZ`** / **`TIMEDIFF`, `YEARWEEK`, `PERIOD_ADD`, `PERIOD_DIFF`, `JULIAN_DAY`** / **`LOCALTIME`, `LOCALTIMESTAMP`** (same as `NOW()`, following MySQL) |
 | **Statistical aggregates** | **`REGR_SLOPE`, `REGR_INTERCEPT`, `REGR_R2`, `REGR_COUNT`, `REGR_AVGX`, `REGR_AVGY`, `REGR_SXX`, `REGR_SYY`, `REGR_SXY`** / **`MODE() WITHIN GROUP (ORDER BY x)`** |
 | **Fuzzy matching** | **`LEVENSHTEIN` (`EDIT_DISTANCE`)** / **`SIMILARITY` (0–1)** / **`DIFFERENCE` (SOUNDEX closeness)** / **`REGEXP_MATCHES`, `REGEXP_SPLIT_TO_ARRAY`** |
 | **JSON predicates** | **`<expr> IS [NOT] JSON [VALUE\|OBJECT\|ARRAY\|SCALAR]`** / **`JSON_EXISTS`** / **`JSON_QUERY`** |
@@ -76,12 +76,12 @@ ORDER BY o.amount DESC;
 | **Cursors** | **`DECLARE <name> CURSOR FOR` / `OPEN` / `FETCH ... INTO` / `CLOSE`** (multi-column `FETCH`) |
 | **Error handling** | **`DECLARE {CONTINUE\|EXIT} HANDLER FOR {NOT FOUND\|SQLEXCEPTION\|SQLSTATE 'xxxxx'}`** / **`SIGNAL`, `RESIGNAL`** with `SET MESSAGE_TEXT` |
 | **Catalog** | **`INFORMATION_SCHEMA.TABLES / COLUMNS / VIEWS / TABLE_CONSTRAINTS / KEY_COLUMN_USAGE / ROUTINES / SEQUENCES / SCHEMATA`** / **`PRAGMA table_info`, `table_list`, `index_list`, `foreign_key_list`, `user_version`** / **`sqlite_master`** |
-| **Compatibility syntax** | **schema-qualified `main.t` / `public.t`** / **`CREATE`, `DROP SCHEMA`** / **partial indexes** / **`SELECT ... FOR UPDATE\|SHARE [NOWAIT\|SKIP LOCKED]`** / **`WITH ... AS [NOT] MATERIALIZED`** / **`EXPLAIN QUERY PLAN`** / **`REINDEX`, `CHECKPOINT`, `FLUSH`, `CLUSTER`** (accepted) / **`SHOW CREATE FUNCTION`** |
+| **Compatibility syntax** | **schema-qualified `main.t` / `public.t`** / **`CREATE`, `DROP SCHEMA`, `CREATE`, `DROP DATABASE`, `USE`** / **partial indexes** / **`CREATE INDEX ... USING BTREE\|HASH`** (accepted) / **`CREATE UNLOGGED TABLE`** (accepted) / **`SELECT ... FOR UPDATE\|SHARE [NOWAIT\|SKIP LOCKED]`** / **`WITH ... AS [NOT] MATERIALIZED`** / **`EXPLAIN QUERY PLAN`, `EXPLAIN VERBOSE`** / **`REINDEX`, `CHECKPOINT`, `FLUSH`, `CLUSTER`, `REPAIR TABLE`** (accepted) / **`CHECKSUM TABLE`** (really computed) / **`SHOW CREATE FUNCTION`, `SHOW CREATE INDEX`, `SHOW ENGINES`, `SHOW COLUMNS ... LIKE`** / **`DESCRIBE <table> <column>`** / **`PRAGMA foreign_keys`** / **`SET @@var`, `RESET ALL`** / **`DO <expr>`** / **`EXECUTE IMMEDIATE '<sql>' [USING ...]`** / **`ALTER VIEW`, `CREATE TEMPORARY VIEW`** / **`REFRESH MATERIALIZED VIEW CONCURRENTLY`** / **`ORDER BY x USING <\|>`** |
 | **Session statements** | **`SET TRANSACTION ISOLATION LEVEL`** / **`LOCK`, `UNLOCK TABLES`** / **`GRANT`, `REVOKE`** / **`DISCARD`** (accepted for script compatibility) / **`SET statement_timeout`, `read_only`, `seed`, `slow_query_threshold`** / **system variables `@@version`, `@@identity`** |
 | **Snapshots** | **`CREATE / RESTORE / DROP SNAPSHOT`**, **`SHOW SNAPSHOTS`** (in-memory time travel) |
 | **Other** | prepared statements (`PREPARE`/`EXECUTE`/`DEALLOCATE`) / user variables (`SET @x`, **`DECLARE @x`**) / `EXPLAIN` (**`(FORMAT JSON)`**) & `EXPLAIN ANALYZE` / `VALUES` statement / `TABLE` statement / `SHOW *` (incl. **`STORAGE`, `SETTINGS`, `COMMENTS`, `MATERIALIZED VIEWS`, `SNAPSHOTS`, `PROFILE`, `SLOW QUERIES`**), `DESCRIBE`, `CHECK TABLE`, `ANALYZE TABLE` |
 
-### Built-in functions (270+)
+### Built-in functions (320+)
 
 Covering String, Numeric, Date/Time, JSON, Regexp, Hash/Encoding, Null/Flow, Aggregate, Window, Sequence, and Meta categories. Use `SHOW FUNCTIONS` to list and search them.
 
@@ -89,8 +89,9 @@ Functions commonly used in commercial databases are included (selection):
 
 - **Oracle**: `DECODE` / `NVL` / `NVL2` / `ADD_MONTHS` / `MONTHS_BETWEEN` / `NEXT_DAY` / `WIDTH_BUCKET` / `INITCAP` / `LISTAGG` / `TO_NUMBER` / `TO_CHAR` / `TO_DATE` / `NANVL` / `REMAINDER` / `SYS_GUID`
 - **SQL Server**: `ISNULL` / `IIF` / `CHOOSE` / `CHARINDEX` / `PATINDEX` / `LEN` / `STUFF` / `QUOTENAME` / `PARSENAME` / `REPLICATE` / `TRY_CAST` / `TRY_CONVERT` / `DATEADD` / `DATEPART` / `DATENAME` / `NEWID` / `EOMONTH`
-- **PostgreSQL**: `DATE_PART` / `SPLIT_PART` / `STARTS_WITH` / `ENDS_WITH` / `STRPOS` / `OVERLAY` / `TO_HEX` / `QUOTE_IDENT` / `QUOTE_LITERAL` / `GCD` / `LCM` / `MAKE_DATE` / `CHR`
-- **Common/other**: `SHIFTLEFT` / `SHIFTRIGHT` / `LOG(base, x)` / `USER` / `CURRENT_USER` / `CURRENT_SCHEMA` / `POW` / `BITAND` / `BITOR` / `BITXOR` and many more
+- **PostgreSQL**: `DATE_PART` / `SPLIT_PART` / `STARTS_WITH` / `ENDS_WITH` / `STRPOS` / `OVERLAY` / `TO_HEX` / `QUOTE_IDENT` / `QUOTE_LITERAL` / `GCD` / `LCM` / `MAKE_DATE` / `CHR` / `BTRIM` / `ENCODE` / `EVERY`
+- **MySQL**: `ORD` / `CONTAINS` / `TIMEDIFF` / `YEARWEEK` / `PERIOD_ADD` / `PERIOD_DIFF` / `CONVERT_TZ` / `LOCALTIME` / `LOCALTIMESTAMP` / `JSON_SEARCH` / `JSON_MERGE_PRESERVE`
+- **Common/other**: `SHIFTLEFT` / `SHIFTRIGHT` / `LOG(base, x)` / `USER` / `CURRENT_USER` / `CURRENT_SCHEMA` / `POW` / `BITAND` / `BITOR` / `BITXOR` / `UNISTR` / `JULIAN_DAY` and many more
 
 ```sql
 -- Scalar function example
@@ -123,9 +124,8 @@ SELECT TOP 3 * FROM users ORDER BY age DESC;
 | **Table Editor** | Launched from the ⚙ icon in the sidebar. Add / delete / rename / retype / drag-reorder columns, plus edit **PRIMARY KEY / NOT NULL / UNIQUE / AUTO_INCREMENT / DEFAULT** via checkboxes. The edit is shown as a live `CREATE TABLE` preview. |
 | **Command Reference** | Opened from "Help". A categorized command catalog with **search** (incremental filtering + highlighting across both command names and SQL text); one click inserts a command into the editor. |
 | **Console** | An execution-log panel in the **bottom-left** of the screen. Records executed queries, **result counts** (rows returned for SELECT, rows affected for DML), timings, errors, and system events chronologically. **Click a log line to reload its query into the editor**, and use **Copy** to copy the whole log to the clipboard. **Toggle its visibility at will** via the launcher button or <kbd>Ctrl</kbd>+<kbd>`</kbd> (backtick); the state is persisted. |
-| **Test Data Generator** | Bulk-inject dummy data into a chosen table. |
-| **CSV Import / SQL Import & Export** | Import CSV; dump/restore schema + data as SQL. |
-| **Save / Load / Clear DB** | Manually save/load/reset the IndexedDB store. |
+| **Data screen** | Five tabs behind the sidebar's "データ" button (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd>): **This browser** (save / load / reset the IndexedDB store), **File** (open, overwrite, or save-as a `.luminadb` file), **Export** (SQL dump, JSON), **Import** (SQL and CSV, drag & drop), and **Test data** (generate dummy rows). **Every control explains on screen what it does, where the data ends up, and whether it can be undone.** |
+| **Saving** | Changes auto-save to this browser (IndexedDB) one second later; a line in the sidebar shows whether a save is pending. <kbd>Ctrl</kbd>+<kbd>S</kbd> saves to the browser immediately, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> saves to a file. |
 
 ---
 
@@ -214,12 +214,13 @@ js/
 
 ## Testing
 
-The 30,000+ self-contained tests can be run two ways. The main suites are:
+The 50,000+ self-contained tests can be run three ways. The main suites are:
 
 | Suite | Tests | Focus |
 |-------|-------|-------|
 | `test-suite*.js` (v1–v16) | ~5,300 | SQL syntax, functions, UI, persistence |
 | `test-suite-v34.js` | 1,717 | **Large-query coverage.** Builds a 5,000-row fact table, a 1,000-row mid table and an 81-column wide table, then exercises multi-way joins (four tables, reordered joins, `USING`/`NATURAL`/`APPLY`/`LATERAL`, semi/anti joins), large-scale aggregation (`ROLLUP`/`CUBE`/`GROUPING SETS`, `FILTER`, `DISTINCT` aggregates, statistical aggregates, `WITHIN GROUP`), window functions (ranking, frames, `EXCLUDE`, `LAG`/`LEAD`, `QUALIFY`, named windows), deep and recursive CTEs, long set-operation chains, huge `IN`/`CASE`/column lists, bulk DML and transactions, paging, table functions, `PIVOT`, JSON and arrays, result invariance with and without indexes, and end-to-end reporting scenarios. Expected values come from a **JavaScript model built with the same rules as the fixture**, not from other SQL (differential testing) |
+| `test-suite-v35.js` | 106 | Regressions for the gaps found by the large-query suite: the `LAG`/`LEAD` default argument, `GROUP_CONCAT(x, 'sep')` and aggregate arity, `DATE(x)` arithmetic, ordering by a column that the select list renamed, window functions and `FILTER` written inside a larger expression, `CREATE TABLE AS` over a CTE, `GROUPING SETS (())`, the left-hand side of `IS JSON`, chained/nested/derived-table `APPLY`, and parenthesised set operations used as a derived table |
 | `test-suite-v36.js` | 1,747 | **Exhaustive multi-way joins.** Predicates built from column × operator × literal are pushed through a four-table join, together with join types × `ON` conditions, reordered joins, self and non-equi joins, semi/anti joins, `USING`/`NATURAL`, `APPLY`/`LATERAL`, chained outer joins, and result invariance with and without indexes |
 | `test-suite-v37.js` | 1,623 | **Exhaustive aggregation.** Over 2,500 rows, 18 groupings × 14 aggregate functions are compared result-set by result-set, plus `HAVING`, `ROLLUP`/`CUBE`/`GROUPING SETS`, `FILTER`, `DISTINCT` aggregates, statistical aggregates, `WITHIN GROUP`, and a filter × aggregate matrix |
 | `test-suite-v38.js` | 1,323 | **Exhaustive window functions.** Over 800 rows: ranking functions × partitions × orders, 24 frames × 8 aggregates × 5 partitions, `EXCLUDE`, `LAG`/`LEAD` offsets and defaults, `RANGE`/`GROUPS`, `QUALIFY`, named windows, windows inside expressions, windows over `GROUP BY` output, and moving averages — every test compares all 800 values |
@@ -235,7 +236,19 @@ The 30,000+ self-contained tests can be run two ways. The main suites are:
 | `test-suite-v48.js` | 1,522 | **Every SELECT clause, operator, predicate, and metadata query.** Operator sweep; predicate sweep (`IN`/`BETWEEN`/`LIKE`/`EXISTS`/`ANY`/`ALL`/`IS`); the `WHERE` × `ORDER BY` × `LIMIT`/`OFFSET` matrix; join kinds; `GROUP BY`/`HAVING`; set operations; every position a subquery can take; every `SHOW`/`DESCRIBE`/`EXPLAIN`/`PRAGMA`/`INFORMATION_SCHEMA` variant; table functions, arrays, `PIVOT`, and full-text search |
 | `test-suite-v49.js` | 1,007 | Regressions for the defects this sweep found, plus cross-clause combinations: the three-valued truth table, the same function used in eight clause positions, join × predicate × ordering, aggregates combined with windows, `BETWEEN`/`IN` left operand × value sweep, and nested `OVER` clauses |
 | `test-suite-v50.js` | 1,976 | **Scalar expression sweep.** The evaluation layer everything else rests on, swept across arithmetic, comparison, string, `CASE`, NULL propagation, operator precedence, deep nesting, and application to columns |
-| `test-suite-v35.js` | 106 | Regressions for the gaps found by the large-query suite: the `LAG`/`LEAD` default argument, `GROUP_CONCAT(x, 'sep')` and aggregate arity, `DATE(x)` arithmetic, ordering by a column that the select list renamed, window functions and `FILTER` written inside a larger expression, `CREATE TABLE AS` over a CTE, `GROUPING SETS (())`, the left-hand side of `IS JSON`, chained/nested/derived-table `APPLY`, and parenthesised set operations used as a derived table |
+| `test-suite-v51.js` | 4,122 | **Lexical and layout styles.** 60 implemented queries put through case changes, whitespace, tabs, CRLF, surrounding blank lines, trailing semicolons, line comments and block comments — plus an exhaustive sweep that replaces **each single space, one at a time, with a newline or a comment**. Also covers identifier/alias/qualification spellings and the forms that are rejected (`"…"` is a string, `[…]` is not an identifier quote, `#` is not a comment) |
+| `test-suite-v52.js` | 783 | **Same meaning, different phrasing.** Predicate rewrites (`=` / `<>` / `<` / `BETWEEN` / `IN` / `IS NULL`), boolean algebra (commutativity, De Morgan, distribution, double negation), joins (`JOIN` / comma / `CROSS`+`WHERE` / subquery / swapped sides / semi- and anti-joins), aggregation, subqueries and CTEs, ordering and paging, function synonyms, and set operations — all over a table containing NULLs |
+| `test-suite-v53.js` | 1,329 | **Clause combinations.** 144 combinations of `DISTINCT` × join × `WHERE` × `GROUP BY` × `HAVING` × `ORDER BY` × `LIMIT` / `OFFSET`, each written one-line, formatted, commented, upper/lower case, tab-separated, as a derived table, as a CTE, and with ordinals. Join reordering, window-clause spellings, `ROLLUP` / `GROUPING SETS`, and set-operation grouping are checked the same way |
+| `test-suite-v54.js` | 1,307 | **Function calls and expressions.** 135 built-in functions × 9 call styles (space before the parenthesis, spacing around commas, one argument per line, comments between arguments, case, tabs), argument spellings, operator precedence, `CASE` layouts, cast spellings, date expressions, JSON accessors, and string-function synonyms |
+| `test-suite-v55.js` | 1,146 | **DML / DDL / transaction styles.** 33 baseline `INSERT` / `UPDATE` / `DELETE` statements put through 10 lexical transforms and a per-space newline/comment sweep, comparing the resulting table contents. DDL variants are compared by schema (column definitions, constraints, type aliases, `ALTER` spellings), and transaction statements (`BEGIN` / `START TRANSACTION` / `COMMIT WORK` …) across 60 combinations |
+| `test-suite-v56.js` | 2,529 | **Real-world formatting and end-to-end scenarios.** 40 realistic order/customer/line-item queries put through formatter-style layouts (leading commas, newline per clause, full indentation) and the per-space newline/comment sweep. Also covers meta queries (`SHOW` / `DESCRIBE` / `EXPLAIN` / `INFORMATION_SCHEMA`) and the same aggregate assembled seven different ways |
+| `test-suite-v57.js` | 856 | **Unusual query shapes — depth and width.** Derived tables, CTE chains, function calls, parentheses, `CASE` and subqueries nested one level at a time up to 80 deep; select items, `IN` lists, operator chains, `WHEN` branches, `ORDER BY` keys and joined tables widened one at a time up to 320 — each compared against the plain query that means the same thing. Also deep structures combined with outer clauses, formatted layouts, and the limits that are rejected (recursion cap, etc.) |
+| `test-suite-v58.js` | 2,905 | **Unusual query shapes — degenerate data and boundaries.** Eleven table shapes (0 rows, 1 row, all NULL, all the same value, all duplicates, all negative, two values, one value with the rest NULL, …) put through 22 aggregates, grouping, a 15 × 15 `LIMIT` × `OFFSET` grid, 42 predicates including always-true/false, ordering, joins, set operations, 18 window functions, and no-op writes — **with expected values computed by a JavaScript model** |
+| `test-suite-v59.js` | 1,126 | **Unusual query shapes — clause and scope interactions.** Subqueries in 17 positions × 7 forms, name collisions (column alias, table alias, CTE name and derived-table name matching a real table), simultaneous clauses (grouping key × aggregate × filter written five different ways), correlation position, set operations with clauses, unusual join conditions (constant, null-safe, `OR`, inequality, subquery), and window functions interacting with `GROUP BY` / `QUALIFY` |
+| `test-suite-v60.js` | 2,749 | **Unusual query shapes — extreme values and types.** 21 numbers (overflow, tiny, negative zero, integer limits) × operators, comparisons and 21 numeric functions; 20 strings (empty, very long, surrogate pairs, control characters, quotes) × string functions; 22 dates from 1900 to 2999 × date functions; mixed-type comparison; extreme values stored in columns; unusual JSON shapes; rounding and precision |
+| `test-suite-v61.js` | 1,168 | **Unusual query shapes — invariance across execution conditions.** The same 56 queries run with six index configurations, four row-insertion orders, inside/outside transactions and after a rollback, through views / temp tables / CTEs, and with a warm expression cache — the answer must not change by a single character. Also covers unusual write shapes (self-referencing `UPDATE`, `UPDATE ... FROM`, chained upserts) |
+| `test-suite-v62.js` | 2,503 | **Full check of the commands added in v1.33.** Statements (`CREATE`/`DROP DATABASE`, `USE`, `ALTER VIEW`, `CREATE TEMPORARY VIEW`, `EXECUTE IMMEDIATE`, `DO`, `RESET`, `CHECKSUM`/`REPAIR TABLE`, `PRAGMA foreign_keys`, `SHOW ENGINES`/`CREATE INDEX`/`COLUMNS ... LIKE`, `DESCRIBE <table> <column>`, `EXPLAIN VERBOSE`, `ORDER BY ... USING`), aggregates (`EVERY`, `PRODUCT`, `APPROX_COUNT_DISTINCT`) and 18 scalar functions, each checked against a JavaScript reference implementation or an existing equivalent function. Includes exhaustive sweeps — all 256 time-zone pairs, 220 period arithmetic cases, 144 string × substring pairs — plus spelling sweeps (case, newlines, tabs, comments), whitespace-position sweeps, and the spellings that must be rejected |
+| `test-suite-v63.js` | 59 | **The reorganized data screen** (v1.34). Checks that the six controls moved out of the sidebar are actually reachable in the modal, that **all six carry a heading and an explanation**, that the destructive one is red and says it cannot be undone, that tabs and panes match one-to-one, that the save-state readout tracks the real data size, that `Ctrl+S` suppresses the browser's own save dialog, and that the original three tabs still work |
 | `test-suite-v17.js` | 247 | Regression coverage for the added syntax and operational features |
 | `test-suite-v18.js` | 679 | **Security** (injection, identifier validation, JS escape, prototype pollution, DoS guards, read-only enforcement, API boundaries, output escaping) |
 | `test-suite-v19.js` | 433 | **Performance** (calibrated time budgets, complexity scaling, absolute safety net) |
@@ -264,11 +277,20 @@ bun test/browser-test.mjs
 
 Opens the actual `LuminaDB.html` in headless Chrome / Edge and, via the Chrome DevTools Protocol, waits for `runTestSuite()` to finish and collects the results. Because DOM, IndexedDB, `crypto.subtle`, and `postMessage` are all real, UI, security, and encrypted persistence are verified as in production (exit codes: `0`=all pass / `1`=failures / `2`=startup error).
 
-### 2. Manually from the browser UI
+### 2. Single-suite runner (fast feedback while developing)
+
+```bash
+bun test/run-suite.mjs v51
+```
+
+Loads only the engine and runs one SQL-only suite (`all` runs them all). It finishes in about a second,
+so the usual loop is: change the engine, run this, then confirm with route 1 at the end.
+
+### 3. Manually from the browser UI
 
 Type `runtest` into the query box and run it (or call `runTestSuite()` directly). Results appear in a toast and in the Console.
 
-See [`test/README.md`](test/README.md) for details.
+See [`test/README.md`](test/README.md) for how to run the tests and how to write a suite (the shared `makeTestKit` helpers).
 
 ---
 

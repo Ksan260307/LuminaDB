@@ -23,15 +23,8 @@
     //   test-suite.js の tests 配列へ getV29Tests() のスプレッドで合流する
     // ============================================================================
     function getV29Tests() {
-      const T = [];
-      const push = (name, sql, check) => T.push({ name, sql, check });
-      const err = (name, sql, frag) => T.push({
-        name, sql, isErrorExpected: true,
-        check: r => !!r.error && (!frag || r.error.toLowerCase().includes(String(frag).toLowerCase()))
-      });
-      const fn = (name, f) => T.push({ name, fn: f });
-      const ids = (sql) => { const r = db.executeQuery(sql); return r.error ? ['ERR:' + r.error] : r.data.map(x => x.id); };
-      const one = (sql) => { const r = db.executeQuery(sql); return r.error ? { __err: r.error } : Object.values(r.data[0])[0]; };
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, check: push, err, t: fn, idsSafe: ids, oneSafe: one } = makeTestKit('V29');
 
       // ------------------------------------------------------------
       // 0. フィクスチャ
@@ -219,20 +212,23 @@
             && !ids2.includes('openCsvBtn') && !ids2.includes('openGeneratorBtn');
       });
       fn('V29Ui one data button replaces them', () => !!document.getElementById('openDataBtn'));
-      fn('V29Ui the core buttons stay in the sidebar', () => {
-        const ids2 = [...document.querySelectorAll('aside button')].map(b => b.id);
-        return ids2.includes('saveIdbBtn') && ids2.includes('loadIdbBtn') && ids2.includes('clearIdbBtn');
+      // v1.34: 保存系の 3 つもモーダルへ移した（サイドバーの入口はボタン 1 つだけ）
+      fn('V29Ui the storage buttons moved into the modal', () => {
+        const side = [...document.querySelectorAll('aside button')].map(b => b.id);
+        const inModal = [...document.querySelectorAll('#dataModal button')].map(b => b.id);
+        return !side.includes('saveIdbBtn') && !side.includes('loadIdbBtn') && !side.includes('clearIdbBtn')
+            && inModal.includes('saveIdbBtn') && inModal.includes('loadIdbBtn') && inModal.includes('clearIdbBtn');
       });
       fn('V29Ui the data button opens the modal', () => {
         document.getElementById('openDataBtn').click();
         return !document.getElementById('dataModal').classList.contains('hidden');
       });
-      fn('V29Ui the modal has three tabs', () => {
-        return document.querySelectorAll('#dataModal .dataTabBtn').length === 3;
+      fn('V29Ui the modal has five tabs', () => {
+        return document.querySelectorAll('#dataModal .dataTabBtn').length === 5;
       });
-      fn('V29Ui export is the default tab', () => {
+      fn('V29Ui this-browser is the default tab', () => {
         const shown = [...document.querySelectorAll('#dataModal .dataPane')].filter(p => !p.classList.contains('hidden')).map(p => p.id);
-        return shown.length === 1 && shown[0] === 'dataPaneExport';
+        return shown.length === 1 && shown[0] === 'dataPaneBrowser';
       });
       fn('V29Ui switching tabs shows one pane at a time', () => {
         document.querySelector('#dataModal .dataTabBtn[data-pane="dataPaneImport"]').click();
@@ -243,7 +239,9 @@
         // 説明文が無いまま並んでいたのが元の問題。各セクションに説明段落があること
         return document.querySelectorAll('#dataPaneExport p').length >= 2
             && document.querySelectorAll('#dataPaneImport p').length >= 2
-            && document.querySelectorAll('#dataPaneGen p').length >= 1;
+            && document.querySelectorAll('#dataPaneGen p').length >= 1
+            && document.querySelectorAll('#dataPaneBrowser p').length >= 4
+            && document.querySelectorAll('#dataPaneFile p').length >= 4;
       });
       fn('V29Ui the generator tab is still reachable by its old id', () => {
         document.getElementById('openGeneratorBtn').click();

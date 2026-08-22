@@ -92,11 +92,11 @@
         { name: "V12Top: Top 1 Aggregate", sql: "SELECT TOP 1 user_id, COUNT(*) AS c FROM orders GROUP BY user_id ORDER BY c DESC", check: r => r.data.length === 1 && r.data[0].user_id === 1 },
 
         // ---- MERGE (V12Merge) ----
-        { name: "V12Merge: Setup Target", sql: "CREATE TABLE mg_t (id INTEGER PRIMARY KEY, val INTEGER, note TEXT)", check: r => r.data[0].Result === 'Success' },
+        successCase("V12Merge: Setup Target", "CREATE TABLE mg_t (id INTEGER PRIMARY KEY, val INTEGER, note TEXT)"),
         { name: "V12Merge: Seed Target", sql: "INSERT INTO mg_t (id, val, note) VALUES (1, 10, 'a'), (2, 20, 'b')", check: r => r.data[0].Message.includes('2') },
-        { name: "V12Merge: Setup Source", sql: "CREATE TABLE mg_s (id INTEGER, val INTEGER, note TEXT)", check: r => r.data[0].Result === 'Success' },
+        successCase("V12Merge: Setup Source", "CREATE TABLE mg_s (id INTEGER, val INTEGER, note TEXT)"),
         { name: "V12Merge: Seed Source", sql: "INSERT INTO mg_s (id, val, note) VALUES (2, 200, 'B'), (3, 30, 'c')", check: r => r.data[0].Message.includes('2') },
-        { name: "V12Merge: Upsert Both Branches", sql: "MERGE INTO mg_t t USING mg_s s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET val = s.val, note = s.note WHEN NOT MATCHED THEN INSERT (id, val, note) VALUES (s.id, s.val, s.note)", check: r => r.data[0].Result === 'Success' },
+        successCase("V12Merge: Upsert Both Branches", "MERGE INTO mg_t t USING mg_s s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET val = s.val, note = s.note WHEN NOT MATCHED THEN INSERT (id, val, note) VALUES (s.id, s.val, s.note)"),
         { name: "V12Merge: Verify Updated Row", sql: "SELECT val, note FROM mg_t WHERE id = 2", check: r => r.data[0].val === 200 && r.data[0].note === 'B' },
         { name: "V12Merge: Verify Inserted Row", sql: "SELECT val, note FROM mg_t WHERE id = 3", check: r => r.data[0].val === 30 && r.data[0].note === 'c' },
         { name: "V12Merge: Verify Untouched Row", sql: "SELECT val, note FROM mg_t WHERE id = 1", check: r => r.data[0].val === 10 && r.data[0].note === 'a' },
@@ -159,20 +159,20 @@
         }},
 
         // ---- PostgreSQL ON CONFLICT (V12Conflict) ----
-        { name: "V12Conflict: Setup", sql: "CREATE TABLE oc_t (id INTEGER PRIMARY KEY, cnt INTEGER, name TEXT)", check: r => r.data[0].Result === 'Success' },
+        successCase("V12Conflict: Setup", "CREATE TABLE oc_t (id INTEGER PRIMARY KEY, cnt INTEGER, name TEXT)"),
         { name: "V12Conflict: Seed", sql: "INSERT INTO oc_t (id, cnt, name) VALUES (1, 5, 'x')", check: r => r.data[0].Message.includes('1') },
-        { name: "V12Conflict: Do Nothing Skips", sql: "INSERT INTO oc_t (id, cnt, name) VALUES (1, 100, 'y') ON CONFLICT (id) DO NOTHING", check: r => r.data[0].Result === 'Success' },
+        successCase("V12Conflict: Do Nothing Skips", "INSERT INTO oc_t (id, cnt, name) VALUES (1, 100, 'y') ON CONFLICT (id) DO NOTHING"),
         { name: "V12Conflict: Do Nothing Verify", sql: "SELECT cnt, name FROM oc_t WHERE id = 1", check: r => r.data[0].cnt === 5 && r.data[0].name === 'x' },
-        { name: "V12Conflict: Do Update Excluded", sql: "INSERT INTO oc_t (id, cnt, name) VALUES (1, 100, 'y') ON CONFLICT (id) DO UPDATE SET cnt = EXCLUDED.cnt, name = EXCLUDED.name", check: r => r.data[0].Result === 'Success' },
+        successCase("V12Conflict: Do Update Excluded", "INSERT INTO oc_t (id, cnt, name) VALUES (1, 100, 'y') ON CONFLICT (id) DO UPDATE SET cnt = EXCLUDED.cnt, name = EXCLUDED.name"),
         { name: "V12Conflict: Do Update Verify", sql: "SELECT cnt, name FROM oc_t WHERE id = 1", check: r => r.data[0].cnt === 100 && r.data[0].name === 'y' },
-        { name: "V12Conflict: Do Update Inserts New", sql: "INSERT INTO oc_t (id, cnt, name) VALUES (2, 7, 'z') ON CONFLICT (id) DO UPDATE SET cnt = EXCLUDED.cnt", check: r => r.data[0].Result === 'Success' },
+        successCase("V12Conflict: Do Update Inserts New", "INSERT INTO oc_t (id, cnt, name) VALUES (2, 7, 'z') ON CONFLICT (id) DO UPDATE SET cnt = EXCLUDED.cnt"),
         { name: "V12Conflict: New Row Present", sql: "SELECT cnt FROM oc_t WHERE id = 2", check: r => r.data[0].cnt === 7 },
         { name: "V12Conflict: Do Update Expr Combine", fn: () => {
             db.executeQuery("INSERT INTO oc_t (id, cnt, name) VALUES (1, 3, 'w') ON CONFLICT (id) DO UPDATE SET cnt = oc_t.cnt + EXCLUDED.cnt");
             const r = db.executeQuery("SELECT cnt FROM oc_t WHERE id = 1");
             return r.data[0].cnt === 103; // 既存 100 + 挿入 3
         }},
-        { name: "V12Conflict: Do Nothing No Target", sql: "INSERT INTO oc_t (id, cnt, name) VALUES (1, 0, 'q') ON CONFLICT DO NOTHING", check: r => r.data[0].Result === 'Success' },
+        successCase("V12Conflict: Do Nothing No Target", "INSERT INTO oc_t (id, cnt, name) VALUES (1, 0, 'q') ON CONFLICT DO NOTHING"),
         { name: "V12Conflict: Cleanup", sql: "DROP TABLE oc_t", check: r => true },
 
         // ---- MERGE / TOP のクリーンアップ ----

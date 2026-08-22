@@ -18,13 +18,8 @@
     //   test-suite.js の tests 配列へ getV23Tests() のスプレッドで合流する
     // ============================================================================
     function getV23Tests() {
-      const T = [];
-      const push = (name, sql, check) => T.push({ name, sql, check });
-      const err = (name, sql, frag) => T.push({
-        name, sql, isErrorExpected: true,
-        check: r => !!r.error && (!frag || r.error.toLowerCase().includes(String(frag).toLowerCase()))
-      });
-      const fn = (name, f) => T.push({ name, fn: f });
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, check: push, err, t: fn } = makeTestKit('V23');
       // 単一値を取り出す小さなヘルパ（fn テストの中で使う）
       const val = (sql) => { const r = db.executeQuery(sql); return r.error ? { __err: r.error } : Object.values(r.data[0])[0]; };
 

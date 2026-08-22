@@ -319,12 +319,16 @@
             if (db.inTransaction) return; // タイマー発火時点で開始されたトランザクションにも対応
             try {
                 await saveDB(db.exportForIDB());
+                if (typeof window.refreshStorageState === 'function') window.refreshStorageState();
                 console.log("Database auto-saved.");
             } catch (e) {
                 console.error("Auto-save error:", e);
                 if (typeof showToast === 'function') showToast(`自動保存に失敗しました: ${e.message}`, true);
             }
         }, 1000);
+        // サイドバーの保存状態表示（v1.34）。保存ボタンをモーダルへ移したので、
+        // 「まだ書けていない変更がある」ことはこの 1 行だけが伝える
+        if (typeof window.refreshStorageState === 'function') window.refreshStorageState();
     }
 
     // デバウンス待機中の自動保存を即時実行する（タブ非表示/クローズ間際の取りこぼし対策）。

@@ -27,15 +27,8 @@
     //   test-suite.js の tests 配列へ getV28Tests() のスプレッドで合流する
     // ============================================================================
     function getV28Tests() {
-      const T = [];
-      const push = (name, sql, check) => T.push({ name, sql, check });
-      const err = (name, sql, frag) => T.push({
-        name, sql, isErrorExpected: true,
-        check: r => !!r.error && (!frag || r.error.toLowerCase().includes(String(frag).toLowerCase()))
-      });
-      const fn = (name, f) => T.push({ name, fn: f });
-      const one = (sql) => { const r = db.executeQuery(sql); return r.error ? { __err: r.error } : Object.values(r.data[0])[0]; };
-      const keys = (sql) => { const r = db.executeQuery(sql); return r.error ? ['ERR:' + r.error] : Object.keys(r.data[0] || {}); };
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, check: push, err, t: fn, oneSafe: one, keysSafe: keys } = makeTestKit('V28');
 
       // ============================================================
       // 1. SELECT 句: 別名・修飾スター・列名の重複

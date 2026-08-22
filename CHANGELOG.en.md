@@ -4,6 +4,166 @@ Per-release additions and fixes for LuminaDB. Documentation for the current feat
 
 ---
 
+### v1.34 — the save buttons moved into one screen, each with an explanation
+
+The six buttons crowding the sidebar (`Save DB` / `Load DB` / `Clear DB` / `Open File` / `Save` / `Save As`)
+moved into the data screen, where **each one now says what it does, where the data ends up, and whether it can be undone**.
+Adds `test-suite-v63.js` (59 tests); the suite now totals 52,621.
+
+**Why**
+
+They were just names in a row, and **nothing told you which one actually keeps your data**.
+`Save DB` writes inside this browser only; `Save` writes a file on disk — different lifetimes,
+different portability, identical-looking buttons. Nor did the screen mention that everything
+auto-saves a second later, so pressing any of them is usually unnecessary.
+
+**What changed**
+
+- The sidebar now has a single entry: "データ — 保存 / 読み込み / 入出力".
+- The data screen went from three tabs to five; the two new ones hold what moved:
+  - **This browser** — save now / load the saved state / wipe and reset. The intro explains that
+    auto-save is running and that an IndexedDB store is invisible to other devices.
+  - **File** — open / overwrite / save as. The open file's name is always shown, and browsers without
+    the File System Access API are told the buttons fall back to a download and a file picker.
+- **Save state is now visible**: a line in the sidebar turns amber while a save is pending and green once written.
+  The data screen shows "いまのデータ: n tables / m rows" plus the last save's breakdown
+  (how many tables were actually written, since saving is incremental).
+- Because the buttons are one level deeper, there are now shortcuts: <kbd>Ctrl</kbd>+<kbd>S</kbd> saves to this
+  browser, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> saves to a file (overwriting the open one).
+
+**New tests** (`test-suite-v63.js`) — one entry point in the sidebar; all six moved controls reachable from the
+modal; **every one of them carrying a heading and at least 30 characters of explanation**; the destructive action
+rendered in red and stating that it cannot be undone; tabs and panes matching one-to-one; the save-state readout
+tracking the actual data size; `Ctrl+S` suppressing the browser's own save dialog; and the original three tabs intact.
+
+### v1.33 — the commands other databases have and LuminaDB was missing
+
+Collects the spellings that stopped a real-world script with a syntax error and implements them:
+**16 statements, 3 aggregates, and 18 scalar functions**.
+Adds `test-suite-v62.js` (2,503 tests); the suite now totals 52,562.
+
+```sql
+-- Statements
+CREATE DATABASE shop;  USE shop;  DROP DATABASE shop;        -- same namespace as SCHEMA
+ALTER VIEW v_adults AS SELECT id, name FROM users WHERE age >= 18;
+CREATE TEMPORARY VIEW v_tmp AS SELECT id FROM users;         -- never saved or exported
+CREATE UNLOGGED TABLE staging (a INT);                       -- UNLOGGED accepted and ignored
+CREATE INDEX idx ON users USING BTREE (name);                -- USING <method> accepted
+EXPLAIN VERBOSE SELECT * FROM users;
+SET @@session.sql_mode = 'strict';   RESET ALL;   RESET statement_timeout;
+DO NEXTVAL('seq_id');                                        -- evaluate, discard the result
+EXECUTE IMMEDIATE 'SELECT ? AS a' USING 7;                   -- run without PREPARE
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily;
+PRAGMA foreign_keys = OFF;                                   -- same switch as SET FOREIGN_KEY_CHECKS
+SHOW COLUMNS FROM users LIKE '%name%';   SHOW ENGINES;   SHOW CREATE INDEX idx;
+DESCRIBE users age;                                          -- a single column
+CHECKSUM TABLE users;   REPAIR TABLE users;
+SELECT id FROM users ORDER BY age USING >;                   -- USING < / > mean ASC / DESC
+
+-- Aggregates
+SELECT EVERY(age >= 18) AS all_adult,                        -- alias of BOOL_AND (SQL standard)
+       PRODUCT(qty) AS total,                                -- product of non-NULLs, else NULL
+       APPROX_COUNT_DISTINCT(dept) AS depts                  -- returns the exact COUNT(DISTINCT)
+  FROM users;
+
+-- Scalar functions
+SELECT BTRIM('xxhixx', 'x'), ENCODE('abc', 'base64'), ORD('あ'), UNISTR('\0041'),
+       CONTAINS(name, 'a'), TIMEDIFF(t2, t1), YEARWEEK(hired), JULIAN_DAY(hired),
+       PERIOD_ADD(202401, 3), PERIOD_DIFF(202406, 202401),
+       CONVERT_TZ(ts, 'UTC', '+09:00'), LOCALTIME, LOCALTIMESTAMP,
+       JSON_SEARCH(doc, 'one', 'alpha'), JSON_MERGE_PRESERVE(a, b),
+       ARRAY_DISTINCT(xs), ARRAY_CAT(xs, ys), ARRAY_REVERSE(xs);
+```
+
+Decisions, and why:
+
+| Decision | Reason |
+| --- | --- |
+| `CREATE DATABASE` / `USE` only record the name; `USE` of an unknown name is **rejected** | There is one schema, so nothing can really be created. Accepting silently would make later table references disagree with the script |
+| `APPROX_COUNT_DISTINCT` returns the exact value | Everything is in memory, so approximation buys nothing. Only the spelling is offered for compatibility |
+| `PRODUCT` returns `NULL` when there is no non-NULL value (unlike `SUM`, which returns 0) | "Nothing to multiply" has to stay distinguishable from a product of 1 |
+| `LOCALTIME` / `LOCALTIMESTAMP` mean `NOW()` (MySQL semantics) | This differs from PostgreSQL's time-only `LOCALTIME`; the README says so explicitly |
+| `BTRIM(s, NULL)` is `NULL`; `BTRIM(s)` trims whitespace | An omitted argument and an explicit NULL are different things (same strictness as PostgreSQL) |
+| Keyword arguments of `ENCODE` / `JSON_SEARCH` / `CONVERT_TZ` are **validated at compile time** | A runtime throw is swallowed by the per-row catch and would silently become NULL (same treatment as `AT TIME ZONE`) |
+| A `TEMPORARY VIEW` is excluded from IndexedDB saves and SQL export | Matches temporary tables. Calling it session-only and then saving it would be a lie |
+| `RESET ALL` leaves `read_only` alone | Otherwise `RESET` would lift the guard that protects a publicly exposed database; only `SET read_only = OFF` may do that |
+
+### v1.32 — the unusual-query-shape sweep, and the defect it found
+
+Adds ~8,800 tests (`test-suite-v57.js` … `v61.js`) that mechanically build the shapes people
+rarely write but the engine still has to handle: deep nesting, extreme width, degenerate data,
+edge values, and colliding names. The suite now totals 50,059 tests.
+
+| Symptom | Fix |
+| --- | --- |
+| Filtering a **view** with a row constructor (`SELECT ... FROM view WHERE (a, b) IN ((1, 2))`) failed with an unrelated "CTE column list has 2 names but the query returns 3 columns". After the view was inlined as `FROM (SELECT ...)`, the following `WHERE` was read as the **derived table's alias** and `(a, b)` as its **column list** | Never accept a clause keyword (`WHERE` / `GROUP` / `ORDER` / `JOIN` …) as the alias of a derived table |
+
+**New tests**
+
+- **v57 depth and width** — derived tables, CTE chains, functions, parentheses, `CASE` and subqueries
+  nested one level at a time up to 80; select items, `IN` lists, operator chains, `WHEN` branches,
+  `ORDER BY` keys and joined tables widened one at a time up to 320.
+- **v58 degenerate data and boundaries** — 11 table shapes (0 rows, 1 row, all NULL, all identical,
+  all duplicates, all negative, two values, one value with the rest NULL, …) against aggregates,
+  grouping, a 15 × 15 `LIMIT` × `OFFSET` grid, 42 predicates, ordering, joins, set operations and
+  18 window functions, with expected values from a JavaScript model.
+- **v59 clause and scope interactions** — subqueries in 17 positions × 7 forms, name collisions,
+  simultaneous clauses, correlation position, unusual join conditions, windows with `GROUP BY` / `QUALIFY`.
+- **v60 extreme values and types** — overflow, negative zero, integer limits, tiny values, surrogate
+  pairs, control characters, very long strings, dates from 1900 to 2999, mixed types, unusual JSON,
+  rounding and precision.
+- **v61 invariance across execution conditions** — the same 56 queries under six index configurations,
+  four insertion orders, inside/outside transactions, through views / temp tables / CTEs, and with a
+  warm expression cache; the answer must not change.
+
+### v1.31 — defects found by the writing-style sweep
+
+Written while adding ~11,200 tests (`test-suite-v51.js` … `v56.js`) that send the *same* query
+in many different spellings and require the result not to change by a single character.
+These are the hardest defects to notice: reformat the SQL and the answer changes.
+
+**Silently wrong answers after nothing but reformatting**
+
+| Symptom | Fix |
+| --- | --- |
+| Writing a SELECT item across lines (`SELECT id, sal *\n2 + 1 AS x`) **dropped the first half of the expression** — that example returned `3` for every row. The alias-splitting regex was not anchored at the start, and `.` does not match a newline, so it matched from after the newline | Anchor the match and accept any character |
+| A **multi-line `CASE`** returned wrong values: `THEN 'hi'\nELSE 'lo'` matched no WHEN branch at all (every row got `'lo'`), and `ELSE 'lo'\nEND` lost the ELSE entirely (every row got `NULL`) | Parse `WHEN` / `ELSE` with newline-aware patterns |
+| **A newline inside `OVER (...)`** raised "a window function must be the whole select item", and `ORDER BY sal\nDESC` **silently ignored the `DESC`**, changing the ordering | Parse the window call and its `PARTITION BY` / `ORDER BY` with newline-aware patterns |
+| `GROUP_CONCAT(name ORDER\nBY id ...)` treated the `ORDER BY` as part of the argument | Match multi-word keywords with `\s+` between the words |
+| `WHERE base-table predicate AND joined-table predicate OR other` **silently dropped rows**: predicate push-down had lost its "never split when a top-level `OR` is present" guard, because a method of the same name in another file overrode it | Give the two helpers distinct names so the guarded implementation is the one used |
+| `CONSTRAINT pk_x PRIMARY KEY (id)` — a **named primary key** — was parsed as a column definition, adding a phantom `constraint` column and breaking the table (every later `INSERT` failed with "column count doesn't match") | Accept the named table-level form (`UNIQUE` / `CHECK` / `FOREIGN KEY` already did) |
+
+**Valid SQL that was rejected**
+
+| Spelling | Fix |
+| --- | --- |
+| `COUNT(*) FILTER ( WHERE c)` (whitespace or a newline after the opening parenthesis) | Only take a `WHERE` at paren depth 0 as the statement's `WHERE` |
+| `ABS (x)` / `COUNT (\n *\n )` (space between the function name and the parenthesis), which produced the nonsensical "Function 'ABS' does not exist. Did you mean 'ABS'?" | Close the gap before mapping names, except after syntax keywords (`IN` / `EXISTS` / `NOT` …) |
+| `name LIKE '%' \|\| key \|\| '%'` / `LIKE CONCAT('A', '%')` / `LIKE pat_col` / `LIKE ('A%')` | Allow an expression on the right of `LIKE` / `ILIKE` (previously only a string literal or a subquery) |
+| `CAST(SUBSTRING(CAST(d AS TEXT), 1, 4) AS INT)` (casts nested more than one level deep) | Fold from the inside out using balanced-parenthesis scanning instead of a depth-limited regex |
+| `WHERE x IS NOT DISTINCT FROM e.col` inside a correlated subquery | Blank out the `FROM`s that are not clause separators (`IS DISTINCT FROM`, `EXTRACT(… FROM …)`, `TRIM(… FROM …)`) before looking for outer references |
+| `FROM t, cte` (a CTE in a comma-separated FROM list) | Resolve CTE references in the comma-separated items of the FROM clause too |
+| `WHERE d BETWEEN '2021-01-01' AND '2022-12-31'` on a joined table's column | Do not count the `AND` of `BETWEEN … AND …` as a separator when splitting for push-down |
+| `RANK() OVER (PARTITION BY c.tier …) … GROUP BY c.tier` (qualified partition key) | Aggregated rows only carry unqualified output names, so drop the qualifier |
+| `OVER (ORDER BY SUM(x) DESC NULLS LAST)` over `GROUP BY` results | Strip a trailing `NULLS FIRST\|LAST` as well before taking the expression |
+
+**Test-side cleanup**
+
+- The scaffolding every suite had been repeating (test registration, result extraction, value
+  comparison, literal-safe text transforms, model builders, fixture teardown) now lives in
+  [`js/tests/test-helpers.js`](js/tests/test-helpers.js) as `makeTestKit()`.
+  **45 of the 60 suites now use it**, removing over 400 lines of copied helpers. Older suites take
+  the helpers under their original names (`const { T, check: push, err, t: fn } = makeTestKit('V20');`),
+  so their bodies read exactly as before. Deliberately different implementations (v16's `sum`,
+  v23's `val`, v35's `col`, v40's `expectNear`) stay local to their suites.
+- For the suites that list their tests as array literals (`test-suite.js`, `v2`–`v12`, …), the same file
+  now provides the factories `errCase` / `okCase` / `successCase` / `valCase`. **232 definitions** for
+  "this statement must be rejected" and "this statement returns `Result: 'Success'`" collapsed into
+  one-line calls, so error-message matching (case-insensitive substring) is now uniform across suites.
+- Added a permanent single-suite runner, [`test/run-suite.mjs`](test/run-suite.mjs)
+  (`bun test/run-suite.mjs v51` / `all`). SQL-only suites finish in tens of seconds — about a second for
+  a single suite — so the loop is: touch the engine, run this, confirm in the real browser at the end.
+
 ### v1.30 — defects found by the full-command sweep
 
 Written while adding ~9,900 tests (`test-suite-v43.js` … `v50.js`) that sweep every implemented

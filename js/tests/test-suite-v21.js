@@ -8,14 +8,8 @@
     //   test-suite.js の tests 配列へ getV21Tests() のスプレッドで合流する
     // ============================================================================
     function getV21Tests() {
-      const T = [];
-      const push = (name, sql, check) => T.push({ name, sql, check });
-      const err = (name, sql, frag) => T.push({
-        name, sql, isErrorExpected: true,
-        check: r => !!r.error && (!frag || r.error.toLowerCase().includes(String(frag).toLowerCase()))
-      });
-      const fn = (name, f) => T.push({ name, fn: f });
-      const canaryClean = () => window.__v21_pwned === undefined && ({}).__v21_polluted === undefined;
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, check: push, err, t: fn, canaryClean } = makeTestKit('V21');
 
       // ------------------------------------------------------------
       // 0. フィクスチャ

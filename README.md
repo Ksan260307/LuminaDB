@@ -2,9 +2,9 @@
 
 **日本語** | [English](README.en.md)
 
-ブラウザだけで完結する、ビルド不要の in-memory SQL データベースエンジンです。単一の HTML ファイルを開くだけで、本格的な SQL（DQL / DML / DDL）・トランザクション・ウィンドウ関数・トリガー・ビュー・`MERGE` / `TOP` / `ON CONFLICT` などの商用 DB コマンド・270 以上の組み込み関数を、サーバーなしで実行できます。
+ブラウザだけで完結する、ビルド不要の in-memory SQL データベースエンジンです。単一の HTML ファイルを開くだけで、本格的な SQL（DQL / DML / DDL）・トランザクション・ウィンドウ関数・トリガー・ビュー・`MERGE` / `TOP` / `ON CONFLICT` などの商用 DB コマンド・320 以上の組み込み関数を、サーバーなしで実行できます。
 
-> 自己完結テスト **30,039 件**（全パス。うちセキュリティ 780 件超 / パフォーマンス 490 件超）
+> 自己完結テスト **52,621 件**（全パス。うちセキュリティ 780 件超 / パフォーマンス 490 件超）
 >
 > 追加・修正の履歴は [CHANGELOG.md](CHANGELOG.md) にまとめてあります。
 
@@ -57,7 +57,7 @@ ORDER BY o.amount DESC;
 | **サブクエリ** | スカラー / `IN` / `EXISTS` / 相関サブクエリ / **量化比較 `= ANY`・`> ALL`・`SOME`** / **派生表の列リスト（`(SELECT ...) AS t(a, b)`）** / **`FROM (VALUES ...) AS t(a, b)`** |
 | **CTE** | `WITH` / `WITH RECURSIVE`（列リスト対応） |
 | **ウィンドウ関数** | `ROW_NUMBER` / `RANK` / `LAG` / `LEAD` / フレーム指定（**`ROWS` / `RANGE` / `GROUPS`**、**`EXCLUDE CURRENT ROW\|GROUP\|TIES\|NO OTHERS`**）/ named window（`WINDOW` 句）/ `QUALIFY`（**ウィンドウ関数の直書き可**）/ **`IGNORE NULLS`・`RESPECT NULLS`** / **`FILTER (WHERE ...) OVER (...)`** |
-| **集計** | 多数の集計関数 / **式に内包した集計（`ROUND(AVG(x), 2)`・`100.0 * SUM(a) / SUM(b)`）** / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / **`CUBE`・`GROUPING SETS`** / **`GROUP BY ALL`** / `GROUPING()` / **`WITHIN GROUP (ORDER BY ...)`** / `GROUP_CONCAT` |
+| **集計** | 多数の集計関数（**`EVERY`（`BOOL_AND` の別名）・`PRODUCT`（総乗）・`APPROX_COUNT_DISTINCT`（厳密値を返す）** を含む）/ **式に内包した集計（`ROUND(AVG(x), 2)`・`100.0 * SUM(a) / SUM(b)`）** / `FILTER (WHERE ...)` / `GROUP BY ... WITH ROLLUP` / **`CUBE`・`GROUPING SETS`** / **`GROUP BY ALL`** / `GROUPING()` / **`WITHIN GROUP (ORDER BY ...)`** / `GROUP_CONCAT` |
 | **DML** | `INSERT`（複数行・`SELECT`・`SET`・`DEFAULT`・**`DEFAULT VALUES`**）/ `UPDATE` / `DELETE`（`ORDER BY`・`LIMIT`）/ `REPLACE` / `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO NOTHING`・`DO UPDATE`（PostgreSQL・`EXCLUDED`）/ `MERGE INTO ... USING ... WHEN MATCHED/NOT MATCHED`（Oracle/SQL Server）/ **複数表 `UPDATE ... FROM`・`UPDATE ... JOIN`・`DELETE ... USING`・`DELETE t FROM t JOIN s`** / `RETURNING` |
 | **DDL** | `CREATE / ALTER / DROP TABLE`（**`CASCADE`・`RESTRICT`**） / `VIEW` / **`MATERIALIZED VIEW`（`REFRESH` 付き）** / `INDEX`（**複合列・`UNIQUE`・名前指定の `DROP INDEX`**）/ `TRIGGER` / `PROCEDURE` / `SEQUENCE` / **`FUNCTION`（ユーザー定義スカラー関数）** / `CREATE TABLE AS`・`LIKE` / **`SELECT ... INTO`** / **`COMMENT ON`** / `TEMPORARY` |
 | **制約** | `PRIMARY KEY`（複合可）/ `UNIQUE` / `NOT NULL` / `DEFAULT`（`CURRENT_TIMESTAMP` 含む）/ **`ON UPDATE CURRENT_TIMESTAMP`** / `CHECK` / `FOREIGN KEY`（`ON DELETE/UPDATE` 参照アクション）/ `AUTO_INCREMENT` / **識別列（`GENERATED ALWAYS AS IDENTITY`・`IDENTITY(1,1)`）** / 生成列（`GENERATED ALWAYS AS`） |
@@ -67,9 +67,9 @@ ORDER BY o.amount DESC;
 | **演算子・述語** | **`\|\|`（文字列連結）** / **`::`（キャスト）** / **`ILIKE`** / **`SIMILAR TO`** / **行コンストラクタ `(a, b) = (c, d)`・`(a, b) IN ((1,2), (3,4))`** / **`COLLATE`（`NOCASE`・`BINARY`・`NOACCENT`・`NUMERIC`）** / **`LIKE ANY`・`LIKE ALL`** / **日付 ± `INTERVAL`** |
 | **全文検索** | **`MATCH (col, ...) AGAINST ('語' [IN BOOLEAN\|NATURAL LANGUAGE MODE])`**（`+`必須 / `-`除外 / `"句"` / `語*` 前方一致・スコア取得可） |
 | **表関数** | `GENERATE_SERIES`（**数値だけでなく「時刻 + `INTERVAL` 刻み」も生成**）/ `STRING_SPLIT(str, sep)` / `UNNEST(a, b, ...)` / **`JSON_TABLE`（JSON → 行）** / **`WITH ORDINALITY`** |
-| **配列** | **`ARRAY[...]` コンストラクタ** / **`ARRAY_LENGTH`・`ARRAY_POSITION`・`ARRAY_CONTAINS`・`ARRAY_APPEND`・`ARRAY_PREPEND`・`ARRAY_REMOVE`・`ARRAY_SORT`・`ARRAY_TO_STRING`・`STRING_TO_ARRAY`** / **`= ANY(ARRAY[...])`** |
+| **配列** | **`ARRAY[...]` コンストラクタ** / **`ARRAY_LENGTH`・`ARRAY_POSITION`・`ARRAY_CONTAINS`・`ARRAY_APPEND`・`ARRAY_PREPEND`・`ARRAY_REMOVE`・`ARRAY_SORT`・`ARRAY_TO_STRING`・`STRING_TO_ARRAY`・`ARRAY_DISTINCT`・`ARRAY_CAT`・`ARRAY_REVERSE`** / **`= ANY(ARRAY[...])`** |
 | **サンプリング** | **`TABLESAMPLE [BERNOULLI\|SYSTEM] (n PERCENT\|n ROWS) [REPEATABLE (seed)]`** |
-| **期間・時系列** | **`(s1, e1) OVERLAPS (s2, e2)`** / **`BETWEEN SYMMETRIC`** / **`DATE_BIN`・`TIME_BUCKET`**（時刻の区間丸め）/ **`AGE(a, b)`** / **`EXTRACT(EPOCH\|DOW\|DOY FROM ...)`** / **`AT TIME ZONE`** |
+| **期間・時系列** | **`(s1, e1) OVERLAPS (s2, e2)`** / **`BETWEEN SYMMETRIC`** / **`DATE_BIN`・`TIME_BUCKET`**（時刻の区間丸め）/ **`AGE(a, b)`** / **`EXTRACT(EPOCH\|DOW\|DOY FROM ...)`** / **`AT TIME ZONE`・`CONVERT_TZ`** / **`TIMEDIFF`・`YEARWEEK`・`PERIOD_ADD`・`PERIOD_DIFF`・`JULIAN_DAY`** / **`LOCALTIME`・`LOCALTIMESTAMP`**（MySQL と同じく `NOW()` と同義） |
 | **統計集計** | **`REGR_SLOPE`・`REGR_INTERCEPT`・`REGR_R2`・`REGR_COUNT`・`REGR_AVGX`・`REGR_AVGY`・`REGR_SXX`・`REGR_SYY`・`REGR_SXY`**（単回帰）/ **`MODE() WITHIN GROUP (ORDER BY x)`** |
 | **あいまい照合** | **`LEVENSHTEIN`（`EDIT_DISTANCE`）** / **`SIMILARITY`（0〜1）** / **`DIFFERENCE`（SOUNDEX 一致度）** / **`REGEXP_MATCHES`・`REGEXP_SPLIT_TO_ARRAY`** |
 | **JSON 述語** | **`<expr> IS [NOT] JSON [VALUE\|OBJECT\|ARRAY\|SCALAR]`** / **`JSON_EXISTS`** / **`JSON_QUERY`** |
@@ -77,12 +77,12 @@ ORDER BY o.amount DESC;
 | **カーソル** | **`DECLARE <名> CURSOR FOR` / `OPEN` / `FETCH ... INTO` / `CLOSE`**（複数列 `FETCH` 可） |
 | **例外処理** | **`DECLARE {CONTINUE\|EXIT} HANDLER FOR {NOT FOUND\|SQLEXCEPTION\|SQLSTATE 'xxxxx'}`** / **`SIGNAL`・`RESIGNAL`**（`SET MESSAGE_TEXT`） |
 | **カタログ** | **`INFORMATION_SCHEMA.TABLES / COLUMNS / VIEWS / TABLE_CONSTRAINTS / KEY_COLUMN_USAGE / ROUTINES / SEQUENCES / SCHEMATA`** / **`PRAGMA table_info`・`table_list`・`index_list`・`foreign_key_list`・`user_version`** / **`sqlite_master`** |
-| **互換構文** | **スキーマ修飾 `main.t`・`public.t`** / **`CREATE`・`DROP SCHEMA`** / **部分インデックス `CREATE INDEX ... WHERE`** / **`SELECT ... FOR UPDATE\|SHARE [NOWAIT\|SKIP LOCKED]`** / **`WITH ... AS [NOT] MATERIALIZED`** / **`EXPLAIN QUERY PLAN`** / **`REINDEX`・`CHECKPOINT`・`FLUSH`・`CLUSTER`**（受理のみ）/ **`SHOW CREATE FUNCTION`** |
+| **互換構文** | **スキーマ修飾 `main.t`・`public.t`** / **`CREATE`・`DROP SCHEMA`・`CREATE`・`DROP DATABASE`・`USE`** / **部分インデックス `CREATE INDEX ... WHERE`** / **`CREATE INDEX ... USING BTREE\|HASH`**（受理のみ）/ **`CREATE UNLOGGED TABLE`**（受理のみ）/ **`SELECT ... FOR UPDATE\|SHARE [NOWAIT\|SKIP LOCKED]`** / **`WITH ... AS [NOT] MATERIALIZED`** / **`EXPLAIN QUERY PLAN`・`EXPLAIN VERBOSE`** / **`REINDEX`・`CHECKPOINT`・`FLUSH`・`CLUSTER`・`REPAIR TABLE`**（受理のみ）/ **`CHECKSUM TABLE`**（実際に算出）/ **`SHOW CREATE FUNCTION`・`SHOW CREATE INDEX`・`SHOW ENGINES`・`SHOW COLUMNS ... LIKE`** / **`DESCRIBE <表> <列>`** / **`PRAGMA foreign_keys`** / **`SET @@var`・`RESET ALL`** / **`DO <式>`** / **`EXECUTE IMMEDIATE '<sql>' [USING ...]`** / **`ALTER VIEW`・`CREATE TEMPORARY VIEW`** / **`REFRESH MATERIALIZED VIEW CONCURRENTLY`** / **`ORDER BY x USING <\|>`** |
 | **セッション文** | **`SET TRANSACTION ISOLATION LEVEL`** / **`LOCK`・`UNLOCK TABLES`** / **`GRANT`・`REVOKE`** / **`DISCARD`**（スクリプト互換のため受理）/ **`SET statement_timeout`・`read_only`・`seed`・`slow_query_threshold`** / **システム変数 `@@version`・`@@identity`** |
 | **スナップショット** | **`CREATE / RESTORE / DROP SNAPSHOT`**・**`SHOW SNAPSHOTS`**（メモリ内タイムトラベル） |
 | **その他** | プリペアドステートメント（`PREPARE`/`EXECUTE`/`DEALLOCATE`）/ ユーザー変数（`SET @x`・**`DECLARE @x`**）/ `EXPLAIN`（**`(FORMAT JSON)`**）・`EXPLAIN ANALYZE` / `VALUES` 文 / `TABLE` 文 / `SHOW *`（**`STORAGE`・`SETTINGS`・`COMMENTS`・`MATERIALIZED VIEWS`・`SNAPSHOTS`・`PROFILE`・`SLOW QUERIES`** 含む）・`DESCRIBE`・`CHECK TABLE`・`ANALYZE TABLE` |
 
-### 組み込み関数（270 以上）
+### 組み込み関数（320 以上）
 
 文字列・数値・日付/時刻・JSON・正規表現・ハッシュ/エンコード・条件/NULL 処理・集計・ウィンドウ・シーケンス・メタ情報の各カテゴリを網羅。`SHOW FUNCTIONS` で一覧・検索できます。
 
@@ -90,8 +90,9 @@ ORDER BY o.amount DESC;
 
 - **Oracle**: `DECODE` / `NVL` / `NVL2` / `ADD_MONTHS` / `MONTHS_BETWEEN` / `NEXT_DAY` / `WIDTH_BUCKET` / `INITCAP` / `LISTAGG` / `TO_NUMBER` / `TO_CHAR` / `TO_DATE` / `NANVL` / `REMAINDER` / `SYS_GUID`
 - **SQL Server**: `ISNULL` / `IIF` / `CHOOSE` / `CHARINDEX` / `PATINDEX` / `LEN` / `STUFF` / `QUOTENAME` / `PARSENAME` / `REPLICATE` / `TRY_CAST` / `TRY_CONVERT` / `DATEADD` / `DATEPART` / `DATENAME` / `NEWID` / `EOMONTH`
-- **PostgreSQL**: `DATE_PART` / `SPLIT_PART` / `STARTS_WITH` / `ENDS_WITH` / `STRPOS` / `OVERLAY` / `TO_HEX` / `QUOTE_IDENT` / `QUOTE_LITERAL` / `GCD` / `LCM` / `MAKE_DATE` / `CHR`
-- **共通/その他**: `SHIFTLEFT` / `SHIFTRIGHT` / `LOG(base, x)` / `USER` / `CURRENT_USER` / `CURRENT_SCHEMA` / `POW` / `BITAND` / `BITOR` / `BITXOR` ほか多数
+- **PostgreSQL**: `DATE_PART` / `SPLIT_PART` / `STARTS_WITH` / `ENDS_WITH` / `STRPOS` / `OVERLAY` / `TO_HEX` / `QUOTE_IDENT` / `QUOTE_LITERAL` / `GCD` / `LCM` / `MAKE_DATE` / `CHR` / `BTRIM` / `ENCODE` / `EVERY`
+- **MySQL**: `ORD` / `CONTAINS` / `TIMEDIFF` / `YEARWEEK` / `PERIOD_ADD` / `PERIOD_DIFF` / `CONVERT_TZ` / `LOCALTIME` / `LOCALTIMESTAMP` / `JSON_SEARCH` / `JSON_MERGE_PRESERVE`
+- **共通/その他**: `SHIFTLEFT` / `SHIFTRIGHT` / `LOG(base, x)` / `USER` / `CURRENT_USER` / `CURRENT_SCHEMA` / `POW` / `BITAND` / `BITOR` / `BITXOR` / `UNISTR` / `JULIAN_DAY` ほか多数
 
 ```sql
 -- スカラー関数の例
@@ -124,9 +125,8 @@ SELECT TOP 3 * FROM users ORDER BY age DESC;
 | **Table Editor** | サイドバーの ⚙ から起動。列の追加・削除・リネーム・型変更・ドラッグ並べ替えに加え、**PRIMARY KEY / NOT NULL / UNIQUE / AUTO_INCREMENT / DEFAULT** をチェックボックスで編集。編集内容は等価な `CREATE TABLE` としてライブプレビュー表示。 |
 | **Command Reference** | 「Help」から起動。カテゴリ別のコマンド集を**検索**（コマンド名・SQL 本文の両方に対してインクリメンタル絞り込み＋ハイライト）でき、ワンクリックでエディタへ挿入。 |
 | **Console** | 画面**左下**の実行ログパネル。実行したクエリ・**結果件数**（SELECT は取得件数、DML は処理行数）・実行時間・エラー・システムイベントを時系列で記録。**ログ行をクリックすると元クエリをエディタへ再読込**でき、**Copy** ボタンでログ全体をクリップボードへコピーできます。ランチャーボタン、または <kbd>Ctrl</kbd>+<kbd>`</kbd>（バッククォート）で**表示 ON/OFF を任意に切替**（状態は保存されます）。 |
-| **Test Data Generator** | 指定テーブルへダミーデータを一括投入。 |
-| **CSV Import / SQL Import・Export** | CSV の取り込み、スキーマ+データの SQL ダンプ入出力。 |
-| **Save / Load / Clear DB** | IndexedDB への手動保存・読込・初期化。 |
+| **データ画面** | サイドバーの「データ」ボタン（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd>）で開く 5 つのタブ。**このブラウザ**（IndexedDB への保存・読み込み・初期化）/ **ファイル**（`.luminadb` を開く・上書き保存・名前を付けて保存）/ **書き出し**（SQL ダンプ・JSON）/ **読み込み**（SQL・CSV。ドラッグ&ドロップ可）/ **テストデータ**（ダミー行の生成）。**操作は 1 件ずつ「何をするか・どこに残るか・戻せるか」を画面上で説明**します。 |
+| **保存** | 変更は 1 秒後にこのブラウザ（IndexedDB）へ**自動保存**。サイドバーの 1 行が保存待ちかどうかを示します。<kbd>Ctrl</kbd>+<kbd>S</kbd> で即座にブラウザへ、<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> でファイルへ保存。 |
 
 ---
 
@@ -215,12 +215,13 @@ js/
 
 ## テスト
 
-30,000 件超の自己完結テストを 2 通りで実行できます。内訳の主なものは以下のとおりです。
+50,000 件超の自己完結テストを 3 通りで実行できます。内訳の主なものは以下のとおりです。
 
 | スイート | 件数 | 内容 |
 |----------|------|------|
 | `test-suite*.js`（v1〜v16） | 約 5,300 | SQL 構文・関数・UI・永続化の機能テスト |
 | `test-suite-v34.js` | 1,717 | **大型クエリの網羅検証**。5,000 行の fact 表・1,000 行の mid 表・81 列の wide 表などを組み立て、多段 JOIN（4 表・結合順序の入れ替え・`USING`/`NATURAL`/`APPLY`/`LATERAL`・準結合/反結合）、大規模集計（`ROLLUP`/`CUBE`/`GROUPING SETS`・`FILTER`・`DISTINCT` 集計・統計集計・`WITHIN GROUP`）、ウィンドウ関数（順位・フレーム・`EXCLUDE`・`LAG`/`LEAD`・`QUALIFY`・名前付き窓）、深い CTE と再帰、長い集合演算、巨大な `IN`/`CASE`/列リスト、大量行の DML とトランザクション、ページング、表関数・`PIVOT`・JSON・配列、索引の有無で結果が変わらないこと、総合シナリオを検査する。期待値は SQL ではなく **JavaScript 側に同じ規則で組んだ模型**の集計から作る（差分テスト） |
+| `test-suite-v35.js` | 106 | 大型クエリ検証で見つかった取りこぼしの回帰。`LAG`/`LEAD` の既定値、`GROUP_CONCAT(x, 'sep')` と集計の引数個数、`DATE(x)` の算術、別名を付けた列の `ORDER BY` / `OVER(ORDER BY)`、式の一部に書いたウィンドウ関数と `FILTER`、CTE 付き `CREATE TABLE AS`、`GROUPING SETS (())`、`IS JSON` の左辺、`APPLY` の連続・入れ子・派生表、括弧付き集合演算の派生表 |
 | `test-suite-v36.js` | 1,747 | **多段 JOIN の総当たり**。列 × 演算子 × 定数で機械的に組んだ述語を 4 表結合へ流し、結合種別 × `ON` 条件、結合順序の入れ替え、自己結合・非等価結合、準結合/反結合、`USING`/`NATURAL`、`APPLY`/`LATERAL`、外部結合の連鎖、索引の有無による不変性を検査する |
 | `test-suite-v37.js` | 1,623 | **大規模な集計の総当たり**。2,500 行に対し「まとめ方 18 通り × 集計関数 14 種」の結果セットを丸ごと突き合わせ、`HAVING`・`ROLLUP`/`CUBE`/`GROUPING SETS`・`FILTER`・`DISTINCT`・統計集計・`WITHIN GROUP`・絞り込み × 集計の総当たりを検査する |
 | `test-suite-v38.js` | 1,323 | **ウィンドウ関数の総当たり**。800 行に対し順位付け関数 × 区画 × 並び、24 種のフレーム × 8 集計 × 5 区画、`EXCLUDE`、`LAG`/`LEAD` の位置と既定値、`RANGE`/`GROUPS`、`QUALIFY`、名前付き窓、式に埋めた窓、`GROUP BY` 結果への窓、移動平均の検算を、800 行ぶんの値ごと突き合わせる |
@@ -236,7 +237,19 @@ js/
 | `test-suite-v48.js` | 1,522 | **SELECT の句・演算子・述語とメタ照会の全網羅**。演算子の総当たり、述語（`IN`/`BETWEEN`/`LIKE`/`EXISTS`/`ANY`/`ALL`/`IS`）の総当たり、`WHERE` × `ORDER BY` × `LIMIT`/`OFFSET` の行列、結合種別、`GROUP BY`/`HAVING`、集合演算、サブクエリの置ける位置、`SHOW`/`DESCRIBE`/`EXPLAIN`/`PRAGMA`/`INFORMATION_SCHEMA` の全変種、表関数・配列・`PIVOT`・全文検索 |
 | `test-suite-v49.js` | 1,007 | 全網羅テストで見つかった欠陥の回帰と、句をまたぐ組み合わせ。三値論理の真理値表、同じ関数を 8 か所の句で使う、結合 × 述語 × 並べ替え、集約とウィンドウの組み合わせ、`BETWEEN`/`IN` の左辺 × 値の総当たり、`OVER` 句の入れ子 |
 | `test-suite-v50.js` | 1,976 | **スカラー式の総当たり**。すべての層の土台になる式評価を、算術・比較・文字列・`CASE`・NULL 伝播・演算子の結合順序・深い入れ子・列への適用で総当たりする |
-| `test-suite-v35.js` | 106 | 大型クエリ検証で見つかった取りこぼしの回帰。`LAG`/`LEAD` の既定値、`GROUP_CONCAT(x, 'sep')` と集計の引数個数、`DATE(x)` の算術、別名を付けた列の `ORDER BY` / `OVER(ORDER BY)`、式の一部に書いたウィンドウ関数と `FILTER`、CTE 付き `CREATE TABLE AS`、`GROUPING SETS (())`、`IS JSON` の左辺、`APPLY` の連続・入れ子・派生表、括弧付き集合演算の派生表 |
+| `test-suite-v51.js` | 4,122 | **字句とレイアウトの書き味**。実装済みのクエリ 60 本に対し、大文字小文字・空白・タブ・CRLF・前後の余白・末尾のセミコロン・行コメント・ブロックコメントを機械的に掛け、さらに**空白 1 個ずつを改行／コメントへ差し替える総当たり**（1 クエリあたり全空白位置）で、結果が 1 文字も変わらないことを確かめる。識別子・別名・修飾の書き分けと、受け付けない書き方（`"…"` は文字列・`[…]` 不可・`#` はコメントでない）も記録する |
+| `test-suite-v52.js` | 783 | **同じ意味の別の書き方**。述語（`=` / `<>` / `<` / `BETWEEN` / `IN` / `IS NULL`）の言い換え、論理演算（交換法則・ド・モルガン・分配法則・二重否定）、結合（`JOIN` / カンマ / `CROSS`+`WHERE` / 副問い合わせ / 左右の入れ替え / 半結合・反結合）、集約、副問い合わせと CTE、並べ替えとページング、式と関数の同義形、集合演算を、NULL を含む表に対して突き合わせる |
+| `test-suite-v53.js` | 1,329 | **句の組み合わせ**。`DISTINCT` × 結合 × `WHERE` × `GROUP BY` × `HAVING` × `ORDER BY` × `LIMIT` / `OFFSET` の 144 通りを、1 行・整形・コメント入り・大小文字・タブ・派生表・CTE・序数で書き分けて突き合わせる。結合の並べ替え、ウィンドウ句の書き分け、`ROLLUP` / `GROUPING SETS`、集合演算の括り方も同様に検査する |
+| `test-suite-v54.js` | 1,307 | **関数呼び出しと式の書き味**。組み込み関数 135 本 × 9 通りの書き方（名前と括弧の間の空白・カンマ前後の空白・引数ごとの改行・引数間のコメント・大小文字・タブ）、引数の書き方、演算子の優先順位、`CASE` の書き分け、型変換の綴り、日付式・JSON の取り出し方、文字列関数の別綴り |
+| `test-suite-v55.js` | 1,146 | **DML・DDL・トランザクションの書き味**。`INSERT` / `UPDATE` / `DELETE` の基準文 33 本に字句変換 10 通りと空白位置ごとの改行・コメントを掛け、実行後の表の中身を突き合わせる。DDL は列定義・制約・型の別名・`ALTER` の綴り違いをスキーマで比較し、トランザクション文（`BEGIN` / `START TRANSACTION` / `COMMIT WORK` …）は 60 通りの組み合わせで確かめる |
+| `test-suite-v56.js` | 2,529 | **実務の整形スタイルと総合シナリオ**。受注・顧客・明細に対する実務的なクエリ 40 本へ、整形ツール風の体裁（先頭カンマ・句ごとの改行・全体インデント）と空白位置ごとの改行・コメントを掛ける。メタ照会（`SHOW` / `DESCRIBE` / `EXPLAIN` / `INFORMATION_SCHEMA`）の書き味と、同じ集計を 7 通りに組み立てて一致することも見る |
+| `test-suite-v57.js` | 856 | **特殊なクエリ構成 — 深さと幅**。派生表・CTE 連鎖・関数・括弧・CASE・副問い合わせを 1 段ずつ 80 段まで重ね、SELECT 項目・IN リスト・演算項・`WHEN`・`ORDER BY` キー・結合表数を 1 個ずつ 320 個まで広げて、素直に書いた同じ意味のクエリと突き合わせる。深い構造 × 外側の句（WHERE / GROUP BY / ウィンドウ / 集合演算）、整形して書いた形、受け付けない限界（再帰の反復上限など）も併せて検査する |
+| `test-suite-v58.js` | 2,905 | **特殊なクエリ構成 — 縮退したデータと境界**。0 行・1 行・全 NULL・全部同じ値・重複だらけ・全部負・2 値だけ・1 行だけ値あり、の 11 通りの表に対し、集約 22 種・まとめ方・`LIMIT` × `OFFSET` の 15 × 15 格子・常に真/偽を含む述語 42 種・並べ替え・結合・集合演算・ウィンドウ 18 種・0 行に当たる書き換えを掛け、**期待値は JavaScript 側の模型**から求めて突き合わせる |
+| `test-suite-v59.js` | 1,126 | **特殊なクエリ構成 — 句とスコープの相互作用**。副問い合わせを置ける 17 か所 × 7 つの形、名前の衝突（列別名・表別名・CTE 名・派生表名が実表と同じ）、句の同時使用（グループ列 × 集約 × 絞り込みを 5 通りの組み立て方で）、相関の位置、集合演算と句、結合条件の特殊形（定数・NULL 安全比較・OR・不等号・副問い合わせ）、ウィンドウと `GROUP BY`・`QUALIFY` の相互作用 |
+| `test-suite-v60.js` | 2,749 | **特殊なクエリ構成 — 極端な値と型**。桁あふれ・極小・負のゼロ・整数の上限といった 21 種の数値 × 演算子・比較・数値関数 21 種、空文字・長大文字列・サロゲートペア・制御文字・引用符を含む 20 種の文字列 × 文字列関数、1900〜2999 年の 22 日付 × 日付関数、型の混在、極端な値を列に入れた読み書き、JSON の特殊な形、丸めと精度 |
+| `test-suite-v61.js` | 1,168 | **特殊なクエリ構成 — 実行条件の不変性**。同じ 56 本のクエリを、索引の有無 6 通り・行の挿入順序 4 通り・トランザクションの内外とロールバック後・ビュー / 一時表 / CTE 経由・式キャッシュが温まった状態で実行し、答えが 1 文字も変わらないことを確かめる。自己参照 `UPDATE`・`FROM` 併用・UPSERT の連鎖といった書き換えの特殊構成も検査する |
+| `test-suite-v62.js` | 2,503 | **v1.33 で足した命令・関数の総点検**。文（`CREATE`/`DROP DATABASE`・`USE`・`ALTER VIEW`・`CREATE TEMPORARY VIEW`・`EXECUTE IMMEDIATE`・`DO`・`RESET`・`CHECKSUM`/`REPAIR TABLE`・`PRAGMA foreign_keys`・`SHOW ENGINES`/`CREATE INDEX`/`COLUMNS ... LIKE`・`DESCRIBE <表> <列>`・`EXPLAIN VERBOSE`・`ORDER BY ... USING`）、集計（`EVERY`・`PRODUCT`・`APPROX_COUNT_DISTINCT`）、スカラー関数 18 種を、JavaScript 側の参照実装や既存の同義関数との突き合わせで確かめる。時間帯の全 256 ペア、期間演算 220 通り、文字列 × 部分文字列 144 通りなどの総当たりに加え、書き方（大小・改行・タブ・コメント）と空白位置の総当たり、拒否されるべき綴りも含む |
+| `test-suite-v63.js` | 59 | **データ画面の再編**（v1.34）。サイドバーから移した 6 つの操作が本当にモーダルから届くか、**6 つ全部に見出しと説明が付いているか**、破壊的な操作が赤で「戻せません」と書いてあるか、タブとペインが 1 対 1 か、保存状態の表示が実際のデータ量に追随するか、`Ctrl+S` がブラウザ既定の動作を止めるか、元からある 3 タブが壊れていないかを見る |
 | `test-suite-v17.js` | 247 | 追加した構文と運用機能の回帰 |
 | `test-suite-v18.js` | 679 | **セキュリティ**（インジェクション / 識別子検証 / JS 脱出 / プロトタイプ汚染 / DoS ガード / 読み取り専用の強制 / API 境界 / 出力エスケープ） |
 | `test-suite-v19.js` | 433 | **パフォーマンス**（較正付きの時間予算・計算量スケーリング・絶対値の安全網） |
@@ -265,11 +278,20 @@ bun test/browser-test.mjs
 
 ヘッドレス Chrome / Edge で実際の `LuminaDB.html` を開き、Chrome DevTools Protocol 経由で `runTestSuite()` の完了を待って結果を回収します。DOM・IndexedDB・`crypto.subtle`・`postMessage` がすべて本物のため、UI・セキュリティ・暗号化永続化まで本番同様に検証できます（終了コード `0`=全パス / `1`=失敗あり / `2`=起動失敗）。
 
-### 2. ブラウザ UI から手動実行
+### 2. スイート単体ランナー（開発中の素早い確認）
+
+```bash
+bun test/run-suite.mjs v51
+```
+
+エンジンだけを読み込んで、SQL で完結するスイートを 1 本（`all` で全部）回します。1 秒前後で終わるので、
+エンジンを触ったらまずこれで潰し、最後に経路 1 で確認する、という二段構えで使います。
+
+### 3. ブラウザ UI から手動実行
 
 クエリ欄に `runtest` と入力して実行（または `runTestSuite()` を直接呼び出し）。結果はトーストとコンソールに表示されます。
 
-詳細は [`test/README.md`](test/README.md) を参照してください。
+実行方法とスイートの書き方（共通ヘルパ `makeTestKit`）の詳細は [`test/README.md`](test/README.md) を参照してください。
 
 ---
 

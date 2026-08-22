@@ -44,8 +44,7 @@
         { name: "V7Esc: Escape Char Itself", sql: "SELECT 'a!b' LIKE 'a!!b' ESCAPE '!' AS a", check: r => r.data[0].a === true },
         { name: "V7Esc: Wildcards Still Work With Escape", sql: "SELECT 'discount 50%' LIKE '%50!%' ESCAPE '!' AS a", check: r => r.data[0].a === true },
         { name: "V7Esc: NOT LIKE With Escape", sql: "SELECT COUNT(*) AS c FROM users WHERE name NOT LIKE '!%%' ESCAPE '!'", check: r => r.data[0].c === 10 },
-        { name: "V7Esc: Multi Char Escape Rejected", sql: "SELECT 'a' LIKE 'a' ESCAPE '!!'", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('single character') },
+        errCase("V7Esc: Multi Char Escape Rejected", "SELECT 'a' LIKE 'a' ESCAPE '!!'", 'single character'),
 
         // ============================================================
         // 3. 新しいスカラー関数 (V7Fn)
@@ -65,8 +64,7 @@
             r.data[0].q === '2026-07-01 00:00:00' && r.data[0].h === '2026-07-17 10:00:00' },
         // 旧: 単位名が誤っていても黙って NULL を返していた（値が無いのか綴り違いか区別できない）。
         // v1.30 から誤りとして知らせる
-        { name: "V7Fn: DATE_TRUNC Bad Unit Rejected", sql: "SELECT DATE_TRUNC('fortnight', '2026-07-17') AS d",
-          isErrorExpected: true, check: r => !!r.error && r.error.includes("Unsupported date unit 'fortnight'") },
+        errCase("V7Fn: DATE_TRUNC Bad Unit Rejected", "SELECT DATE_TRUNC('fortnight', '2026-07-17') AS d", "Unsupported date unit 'fortnight'"),
         { name: "V7Fn: TYPEOF All Types", sql: "SELECT TYPEOF(1) AS a, TYPEOF(1.5) AS b, TYPEOF('x') AS c, TYPEOF(NULL) AS d, TYPEOF(TRUE) AS e", check: r =>
             r.data[0].a === 'integer' && r.data[0].b === 'real' && r.data[0].c === 'text' && r.data[0].d === 'null' && r.data[0].e === 'boolean' },
         { name: "V7Fn: IIF Alias Of IF", sql: "SELECT IIF(2 > 1, 'y', 'n') AS a, IIF(1 > 2, 'y', 'n') AS b", check: r => r.data[0].a === 'y' && r.data[0].b === 'n' },
@@ -104,8 +102,7 @@
         { name: "V7Agg: STRING_AGG With Separator", sql: "SELECT STRING_AGG(item, ' / ') AS s FROM v7q WHERE grp = 'a'", check: r => r.data[0].s === 'a1 / a2' },
         { name: "V7Agg: STRING_AGG Group By", sql: "SELECT grp, STRING_AGG(item, '+') AS s FROM v7q GROUP BY grp ORDER BY grp", check: r =>
             r.data.length === 2 && r.data[0].s === 'a1+a2' && r.data[1].s === 'b1+b2' },
-        { name: "V7Agg: STRING_AGG Requires 2 Args", sql: "SELECT STRING_AGG(item) FROM v7q", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('2 arguments') },
+        errCase("V7Agg: STRING_AGG Requires 2 Args", "SELECT STRING_AGG(item) FROM v7q", '2 arguments'),
         { name: "V7Agg: ARRAY_AGG Alias", sql: "SELECT ARRAY_AGG(item ORDER BY score DESC) AS a FROM v7q WHERE grp = 'a'", check: r =>
             r.data[0].a === '["a2","a1"]' },
         { name: "V7Agg: BOOL_AND BOOL_OR", sql: "SELECT BOOL_AND(score > 0) AS all_pos, BOOL_AND(score > 10) AS all_gt10, BOOL_OR(score > 25) AS any_gt25, BOOL_OR(score > 100) AS any_gt100 FROM v7q", check: r =>
@@ -196,10 +193,8 @@
             db.executeQuery("DROP SEQUENCE v7sid");
             return r.data[0].c === 2 && r.data[0].m === 2;
         }},
-        { name: "V7Seq: Unknown Sequence Errors", sql: "SELECT NEXTVAL('no_such_seq')", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('not found') },
-        { name: "V7Seq: Duplicate Create Rejected", sql: "CREATE SEQUENCE v7s", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('already exists') },
+        errCase("V7Seq: Unknown Sequence Errors", "SELECT NEXTVAL('no_such_seq')", 'not found'),
+        errCase("V7Seq: Duplicate Create Rejected", "CREATE SEQUENCE v7s", 'already exists'),
         { name: "V7Seq: If Not Exists Skips", sql: "CREATE SEQUENCE IF NOT EXISTS v7s", check: r => r.data[0].Message.includes('Skipped') },
         { name: "V7Seq: SHOW SEQUENCES", fn: () => {
             const r = db.executeQuery("SHOW SEQUENCES");
@@ -275,10 +270,8 @@
             db.executeQuery("DEALLOCATE PREPARE v7q1");
             return !r.error && r.data[0].s === 'a?b' && r.data[0].v === 9;
         }},
-        { name: "V7Prep: Missing Value Rejected", sql: "EXECUTE v7range USING 25", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('has no value') },
-        { name: "V7Prep: Extra Value Rejected", sql: "EXECUTE v7find USING 1, 2", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('only') },
+        errCase("V7Prep: Missing Value Rejected", "EXECUTE v7range USING 25", 'has no value'),
+        errCase("V7Prep: Extra Value Rejected", "EXECUTE v7find USING 1, 2", 'only'),
         { name: "V7Prep: DML Via Prepared", fn: () => {
             db.executeQuery("CREATE TABLE v7pt (id INTEGER, v TEXT)");
             db.executeQuery("PREPARE v7ins FROM 'INSERT INTO v7pt (id, v) VALUES (?, ?)'");
@@ -293,8 +286,7 @@
             const names = r.data.map(x => x.Statement);
             return names.includes('v7find') && names.includes('v7range') && names.includes('v7name');
         }},
-        { name: "V7Prep: Unknown Statement Suggests", sql: "EXECUTE v7findd USING 1", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes("Did you mean 'v7find'") },
+        errCase("V7Prep: Unknown Statement Suggests", "EXECUTE v7findd USING 1", "Did you mean 'v7find'"),
         { name: "V7Prep: Self Recursion Guarded", fn: () => {
             db.executeQuery("PREPARE v7loop FROM 'EXECUTE v7loop'");
             const r = db.executeQuery("EXECUTE v7loop");
@@ -332,8 +324,7 @@
             const r = db.executeQuery("EXPLAIN SELECT * FROM users WHERE id = 1");
             return !r.error && r.data.some(x => x.Operation === 'TABLE SCAN') && !r.data.some(x => x.Operation === 'ACTUAL');
         }},
-        { name: "V7Exp: Non Select Rejected", sql: "EXPLAIN ANALYZE INSERT INTO users (id, name, age) VALUES (999, 'x', 1)", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes('SELECT statements only') },
+        errCase("V7Exp: Non Select Rejected", "EXPLAIN ANALYZE INSERT INTO users (id, name, age) VALUES (999, 'x', 1)", 'SELECT statements only'),
         { name: "V7Exp: Analyze Does Not Mutate", fn: () => {
             const before = db.executeQuery("SELECT COUNT(*) AS c FROM users").data[0].c;
             db.executeQuery("EXPLAIN ANALYZE SELECT * FROM users");

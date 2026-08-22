@@ -668,6 +668,35 @@
         { name: "INSERT OR <action>", sql: "-- REPLACE / IGNORE / ABORT / FAIL / ROLLBACK\nINSERT OR REPLACE INTO {table} (id, name) VALUES (1, 'X')" },
         { name: "Rename keeps constraints", sql: "-- 生成列・CHECK・索引名・列順すべて追随する\nALTER TABLE {table} RENAME COLUMN name TO nm" }
       ]},
+      { cat: "v1.33 Functions", cmds: [
+        { name: "Btrim / Encode", sql: "SELECT BTRIM('xxhixx', 'x') AS trimmed, ENCODE('abc', 'base64') AS b64, ENCODE('abc', 'hex') AS hx" },
+        { name: "Ord / Unistr / Contains", sql: "SELECT ORD('あ') AS code, UNISTR(CONCAT(CHAR(92), '0041')) AS ch, CONTAINS(name, 'a') AS has_a FROM {table}" },
+        { name: "Timediff", sql: "SELECT TIMEDIFF('2026-01-02 03:04:05', '2026-01-01 01:00:00') AS gap" },
+        { name: "Yearweek / Julian Day", sql: "SELECT YEARWEEK(NOW()) AS yw, JULIAN_DAY(NOW()) AS jd" },
+        { name: "Period Add / Diff", sql: "-- 期間は YYYYMM（または YYMM）\nSELECT PERIOD_ADD(202401, 3) AS moved, PERIOD_DIFF(202406, 202401) AS months" },
+        { name: "Convert Timezone", sql: "-- 'UTC' / 'JST' / '+09:00' 形式（IANA 名は非対応）\nSELECT CONVERT_TZ('2026-01-01 12:00:00', 'UTC', '+09:00') AS jst" },
+        { name: "Localtime", sql: "-- MySQL と同じく NOW() と同義\nSELECT LOCALTIME AS a, LOCALTIMESTAMP AS b" },
+        { name: "JSON Search", sql: `SELECT JSON_SEARCH('{"a": "x", "b": "xy"}', 'all', 'x%') AS paths` },
+        { name: "JSON Merge Preserve", sql: `-- 同キーは配列へまとめる（MERGE_PATCH は上書き）\nSELECT JSON_MERGE_PRESERVE('{"a": 1}', '{"a": 2, "b": 3}')` },
+        { name: "Array Distinct / Cat / Reverse", sql: "SELECT ARRAY_DISTINCT(ARRAY[1, 2, 2]) AS d, ARRAY_CAT(ARRAY[1], ARRAY[2]) AS c, ARRAY_REVERSE(ARRAY[1, 2, 3]) AS r" },
+        { name: "Every / Product / Approx Count", sql: "SELECT EVERY(age > 18) AS all_adult, PRODUCT(id) AS prod, APPROX_COUNT_DISTINCT(name) AS names FROM {table}" }
+      ]},
+      { cat: "v1.33 Commands", cmds: [
+        { name: "Database & Use", sql: "-- 単一スキーマなので名前を記録するだけ\nCREATE DATABASE shop; USE shop; USE main; DROP DATABASE shop" },
+        { name: "Alter View", sql: "CREATE VIEW v_tmp AS SELECT id FROM {table}; ALTER VIEW v_tmp AS SELECT id, name FROM {table}" },
+        { name: "Temporary View", sql: "-- 保存・エクスポート対象外（セッション限り）\nCREATE TEMPORARY VIEW v_session AS SELECT id FROM {table}" },
+        { name: "Order By Using", sql: "-- USING > は DESC、USING < は ASC\nSELECT id, age FROM {table} ORDER BY age USING >, id" },
+        { name: "Do (evaluate & discard)", sql: "DO 1 + 1" },
+        { name: "Execute Immediate", sql: "EXECUTE IMMEDIATE 'SELECT ? AS answer' USING 42" },
+        { name: "Reset session vars", sql: "SET statement_timeout = 500; RESET statement_timeout; RESET ALL" },
+        { name: "Set @@var", sql: "SET @@session.sql_mode = 'strict'" },
+        { name: "Pragma foreign_keys", sql: "PRAGMA foreign_keys" },
+        { name: "Checksum / Repair Table", sql: "CHECKSUM TABLE {table}" },
+        { name: "Show Columns Like", sql: "SHOW COLUMNS FROM {table} LIKE '%name%'" },
+        { name: "Describe one column", sql: "DESCRIBE {table} name" },
+        { name: "Show Engines / Create Index", sql: "SHOW ENGINES" },
+        { name: "Explain Verbose", sql: "EXPLAIN VERBOSE SELECT * FROM {table}" }
+      ]},
       { cat: "External API", cmds: [
         { name: "JS API", sql: "// JSコンソールから: LuminaDB.query('SELECT * FROM users WHERE id = ?', [1])" },
         { name: "JS API (Named Params)", sql: "// LuminaDB.query('SELECT * FROM users WHERE age > :min AND age < @max', { min: 24, max: 31 })" },

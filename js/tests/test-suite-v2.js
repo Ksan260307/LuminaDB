@@ -171,8 +171,7 @@
         // v1.29: 集計後のウィンドウにも ROWS フレームを付けられる（RANGE / GROUPS は不可）
         { name: "V2Win: Rows Frame Over Group By", sql: "SELECT grp, SUM(SUM(id)) OVER (ORDER BY grp ROWS UNBOUNDED PRECEDING) AS s FROM v2win GROUP BY grp ORDER BY grp",
           check: r => !r.error && r.data.length === 2 && r.data[0].s === 10 && r.data[1].s === 15 },
-        { name: "V2Win: Range Frame Over Group By Rejected", sql: "SELECT grp, SUM(SUM(id)) OVER (ORDER BY grp RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM v2win GROUP BY grp",
-          isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('not supported over GROUP BY results') },
+        errCase("V2Win: Range Frame Over Group By Rejected", "SELECT grp, SUM(SUM(id)) OVER (ORDER BY grp RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM v2win GROUP BY grp", 'not supported over GROUP BY results'),
         { name: "V2Win: Cleanup", sql: "DROP TABLE v2win", check: r => r.data[0].Result === "Success" },
 
         // ============================================================
@@ -217,7 +216,7 @@
         { name: "V2Ret: DELETE RETURNING Pre Values", sql: "DELETE FROM v2ret WHERE id = 4 RETURNING id, name, v", check: r =>
             r.data.length === 1 && r.data[0].id === 4 && r.data[0].name === 'd' && r.data[0].v === 40 },
         { name: "V2Ret: DELETE RETURNING Actually Deleted", sql: "SELECT COUNT(*) AS c FROM v2ret", check: r => r.data[0].c === 3 },
-        { name: "V2Ret: REPLACE RETURNING Rejected", sql: "REPLACE INTO v2ret (id, name, v) VALUES (1, 'z', 0) RETURNING *", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('RETURNING is not supported') },
+        errCase("V2Ret: REPLACE RETURNING Rejected", "REPLACE INTO v2ret (id, name, v) VALUES (1, 'z', 0) RETURNING *", 'RETURNING is not supported'),
         // v1.22: IGNORE / ON CONFLICT の RETURNING は「実際に書き込んだ行だけ」を返すようになった
         // （PostgreSQL と同じ。REPLACE は削除で索引がずれるため引き続き非対応）
         { name: "V2Ret: IGNORE RETURNING Skips Conflicts", sql: "INSERT IGNORE INTO v2ret (id, name, v) VALUES (1, 'z', 0) RETURNING *", check: r =>
@@ -254,7 +253,7 @@
         { name: "V2Dml: DELETE ORDER BY DESC LIMIT", sql: "DELETE FROM v2dml ORDER BY id DESC LIMIT 2", check: r => r.data[0].Message.includes('2 rows') },
         { name: "V2Dml: DELETE Removed Largest Ids", sql: "SELECT MAX(id) AS m, COUNT(*) AS c FROM v2dml", check: r => r.data[0].m === 3 && r.data[0].c === 3 },
         { name: "V2Dml: UPDATE ORDER BY Expression LIMIT RETURNING", sql: "UPDATE v2dml SET v = -1 ORDER BY v DESC LIMIT 1 RETURNING id, v", check: r => r.data.length === 1 && r.data[0].id === 1 && r.data[0].v === -1 },
-        { name: "V2Dml: INSERT VALUES Residual Garbage Rejected", sql: "INSERT INTO v2dml (id, v) VALUES (10, 1) junk (11, 2)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Syntax Error in INSERT VALUES') },
+        errCase("V2Dml: INSERT VALUES Residual Garbage Rejected", "INSERT INTO v2dml (id, v) VALUES (10, 1) junk (11, 2)", 'Syntax Error in INSERT VALUES'),
         { name: "V2Dml: INSERT Garbage Inserted Nothing", sql: "SELECT COUNT(*) AS c FROM v2dml WHERE id >= 10", check: r => r.data[0].c === 0 },
         { name: "V2Dml: Cleanup", sql: "DROP TABLE v2dml", check: r => r.data[0].Result === "Success" },
 

@@ -18,22 +18,8 @@
     //   test-suite.js の tests 配列へ getV47Tests() のスプレッドで合流する
     // ============================================================================
     function getV47Tests() {
-      const T = [];
-      const q = (sql) => db.executeQuery(sql);
-      const t = (name, fn) => T.push({ name, fn });
-      const err = (name, sql, frag) => T.push({
-        name, sql, isErrorExpected: true,
-        check: r => !!r.error && (!frag || r.error.toLowerCase().includes(String(frag).toLowerCase()))
-      });
-      const ok = (name, sql) => T.push({ name, sql, check: r => !r.error });
-      const rows = (sql) => { const r = q(sql); if (r.error) throw new Error(r.error); return r.data || []; };
-      const one = (sql) => { const d = rows(sql); if (!d.length) throw new Error('no rows'); return Object.values(d[0])[0]; };
-      const eq = (a, b, label) => {
-        const x = JSON.stringify(a), y = JSON.stringify(b);
-        if (x !== y) throw new Error((label ? label + ' ' : '') + 'expected ' + y + ' but got ' + x);
-        return true;
-      };
-      const val = (name, sql, want) => t(name, () => eq(one(sql), want));
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, q, t, err, ok, rowsOf: rows, oneOf: one, eq, val } = makeTestKit('V47');
 
       // 作業表を毎回作り直す（200 行）。模型と同じ規則で作る
       const WORK = [];

@@ -55,9 +55,9 @@
             db.executeQuery("INSERT INTO ra_r_na (id, p_id) VALUES (30, 3)");
             return true;
         }},
-        { name: "XRef: Restrict Default Blocks", sql: "DELETE FROM ra_r_p WHERE id = 1", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Foreign key constraint failed') },
-        { name: "XRef: Restrict Explicit Blocks", sql: "DELETE FROM ra_r_p WHERE id = 2", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Foreign key constraint failed') },
-        { name: "XRef: Restrict NoAction Blocks", sql: "DELETE FROM ra_r_p WHERE id = 3", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Foreign key constraint failed') },
+        errCase("XRef: Restrict Default Blocks", "DELETE FROM ra_r_p WHERE id = 1", 'Foreign key constraint failed'),
+        errCase("XRef: Restrict Explicit Blocks", "DELETE FROM ra_r_p WHERE id = 2", 'Foreign key constraint failed'),
+        errCase("XRef: Restrict NoAction Blocks", "DELETE FROM ra_r_p WHERE id = 3", 'Foreign key constraint failed'),
         { name: "XRef: Restrict Nothing Deleted", sql: "SELECT COUNT(*) AS c FROM ra_r_p", check: r => r.data[0].c === 3 },
         { name: "XRef: Restrict Unreferenced Deletable", fn: () => {
             db.executeQuery("DELETE FROM ra_r_def WHERE id = 10");
@@ -132,7 +132,7 @@
             db.executeQuery("INSERT INTO ra_mc_res (id, p_id) VALUES (20, 1)");
             return true;
         }},
-        { name: "XRef: Mixed Restrict Wins Blocks Delete", sql: "DELETE FROM ra_mp WHERE id = 1", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('Foreign key') },
+        errCase("XRef: Mixed Restrict Wins Blocks Delete", "DELETE FROM ra_mp WHERE id = 1", 'Foreign key'),
         { name: "XRef: Mixed Atomic No Cascade On Block", sql: "SELECT COUNT(*) AS c FROM ra_mc_cas", check: r => r.data[0].c === 2 },
         { name: "XRef: Mixed Cascade-Only Parent Deletable", fn: () => {
             const del = db.executeQuery("DELETE FROM ra_mp WHERE id = 2");
@@ -265,11 +265,11 @@
         // --- 列レベル CHECK ---
         { name: "XChk: Column Check Create", sql: "CREATE TABLE ck_a (id INTEGER, age INTEGER CHECK (age > 0))", check: r => r.data[0].Result === "Success" },
         { name: "XChk: Column Check Valid Insert", sql: "INSERT INTO ck_a (id, age) VALUES (1, 25)", check: r => r.data[0].Message.includes('1') },
-        { name: "XChk: Column Check Boundary Fails", sql: "INSERT INTO ck_a (id, age) VALUES (2, 0)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('CHECK constraint failed') },
-        { name: "XChk: Column Check Negative Fails", sql: "INSERT INTO ck_a (id, age) VALUES (3, -5)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('CHECK constraint failed') },
-        { name: "XChk: Column Check Atomic Batch Fail", sql: "INSERT INTO ck_a (id, age) VALUES (4, 10), (5, -1)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('CHECK') },
+        errCase("XChk: Column Check Boundary Fails", "INSERT INTO ck_a (id, age) VALUES (2, 0)", 'CHECK constraint failed'),
+        errCase("XChk: Column Check Negative Fails", "INSERT INTO ck_a (id, age) VALUES (3, -5)", 'CHECK constraint failed'),
+        errCase("XChk: Column Check Atomic Batch Fail", "INSERT INTO ck_a (id, age) VALUES (4, 10), (5, -1)", 'CHECK'),
         { name: "XChk: Column Check No Partial Insert", sql: "SELECT COUNT(*) AS c FROM ck_a", check: r => r.data[0].c === 1 },
-        { name: "XChk: Column Check Update Fails", sql: "UPDATE ck_a SET age = -3 WHERE id = 1", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('CHECK') },
+        errCase("XChk: Column Check Update Fails", "UPDATE ck_a SET age = -3 WHERE id = 1", 'CHECK'),
         { name: "XChk: Column Check Update Value Intact", sql: "SELECT age FROM ck_a WHERE id = 1", check: r => r.data[0].age === 25 },
         { name: "XChk: Column Check Update Valid", sql: "UPDATE ck_a SET age = 30 WHERE id = 1", check: r => r.data[0].Message.includes('1') },
         { name: "XChk: Column Check Cleanup", sql: "DROP TABLE ck_a", check: r => r.data[0].Result === "Success" },
@@ -278,13 +278,13 @@
         { name: "XChk: Table Check Create", sql: "CREATE TABLE ck_b (lo INTEGER, hi INTEGER, CHECK (lo <= hi))", check: r => r.data[0].Result === "Success" },
         { name: "XChk: Table Check Valid", sql: "INSERT INTO ck_b (lo, hi) VALUES (1, 5)", check: r => r.data[0].Message.includes('1') },
         { name: "XChk: Table Check Equal OK", sql: "INSERT INTO ck_b (lo, hi) VALUES (3, 3)", check: r => r.data[0].Message.includes('1') },
-        { name: "XChk: Table Check Violation", sql: "INSERT INTO ck_b (lo, hi) VALUES (5, 1)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('CHECK') },
+        errCase("XChk: Table Check Violation", "INSERT INTO ck_b (lo, hi) VALUES (5, 1)", 'CHECK'),
         { name: "XChk: Table Check Cleanup", sql: "DROP TABLE ck_b", check: r => r.data[0].Result === "Success" },
 
         // --- CHECK with IN list (括弧内カンマ) ---
         { name: "XChk: Check IN List Create", sql: "CREATE TABLE ck_in (id INTEGER, status TEXT CHECK (status IN ('active', 'inactive', 'pending')))", check: r => r.data[0].Result === "Success" },
         { name: "XChk: Check IN List Valid", sql: "INSERT INTO ck_in (id, status) VALUES (1, 'active'), (2, 'pending')", check: r => r.data[0].Message.includes('2') },
-        { name: "XChk: Check IN List Invalid", sql: "INSERT INTO ck_in (id, status) VALUES (3, 'deleted')", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('CHECK') },
+        errCase("XChk: Check IN List Invalid", "INSERT INTO ck_in (id, status) VALUES (3, 'deleted')", 'CHECK'),
         { name: "XChk: Check IN List Cleanup", sql: "DROP TABLE ck_in", check: r => r.data[0].Result === "Success" },
 
         // --- 複合 CHECK / 関数 / 文字列 ---
@@ -321,7 +321,7 @@
 
         // --- 名前付き CHECK ---
         { name: "XChk: Named Check Create", sql: "CREATE TABLE ck_named (n INTEGER, CONSTRAINT ck_pos CHECK (n > 0))", check: r => r.data[0].Result === "Success" },
-        { name: "XChk: Named Check Enforced", sql: "INSERT INTO ck_named (n) VALUES (-1)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('CHECK') },
+        errCase("XChk: Named Check Enforced", "INSERT INTO ck_named (n) VALUES (-1)", 'CHECK'),
         { name: "XChk: Named Check Valid", sql: "INSERT INTO ck_named (n) VALUES (5)", check: r => r.data[0].Message.includes('1') },
 
         // --- ODKU / IGNORE と CHECK ---

@@ -4,13 +4,8 @@
     //   test-suite.js の tests 配列へ getV17Tests() のスプレッドで合流する
     // ============================================================================
     function getV17Tests() {
-      const T = [];
-      const push = (name, sql, check) => T.push({ name, sql, check });
-      const err = (name, sql, frag) => T.push({
-        name, sql, isErrorExpected: true,
-        check: r => !!r.error && (!frag || r.error.toLowerCase().includes(String(frag).toLowerCase()))
-      });
-      const fn = (name, f) => T.push({ name, fn: f });
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, check: push, err, t: fn } = makeTestKit('V17');
 
       // ------------------------------------------------------------
       // 0. 専用フィクスチャ

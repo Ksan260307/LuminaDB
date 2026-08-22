@@ -42,7 +42,12 @@
             };
           }
         }
-        dump.__views__ = Object.assign(Object.create(null), this.views);
+        // TEMPORARY VIEW はセッション限りなので保存対象から外す（一時表と同じ扱い）
+        dump.__views__ = Object.create(null);
+        for (const v in this.views) {
+            if (this.viewMeta && this.viewMeta[v] && this.viewMeta[v].temp) continue;
+            dump.__views__[v] = this.views[v];
+        }
         dump.__viewmeta__ = JSON.parse(JSON.stringify(this.viewMeta || {}));
         dump.__domains__ = JSON.parse(JSON.stringify(this.domains || {}));
         dump.__procedures__ = JSON.parse(JSON.stringify(this.procedures));
@@ -306,7 +311,9 @@
           }
           // ビュー定義を出力（プロシージャは本体に';'を含むためSQLエクスポート対象外）
           for (let vName in this.views) {
-              const vm = (this.viewMeta && this.viewMeta[vName]) ? ` WITH ${this.viewMeta[vName].checkOption} CHECK OPTION` : '';
+              const meta = (this.viewMeta && this.viewMeta[vName]) || null;
+              if (meta && meta.temp) continue;   // TEMPORARY VIEW はエクスポートしない
+              const vm = (meta && meta.checkOption) ? ` WITH ${meta.checkOption} CHECK OPTION` : '';
               sqlLines.push(`CREATE VIEW ${vName} AS ${this.views[vName]}${vm};`);
           }
           // シーケンス定義と現在値（SETVAL で再インポート時に採番位置を復元する）

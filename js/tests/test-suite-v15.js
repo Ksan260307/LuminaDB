@@ -5,10 +5,8 @@
     //   test-suite.js の tests 配列へ getV15Tests() のスプレッドで合流する
     // ============================================================================
     function getV15Tests() {
-      const T = [];
-      const push = (name, sql, check) => T.push({ name, sql, check });
-      const approx = (a, b) => a != null && Math.abs(a - b) < 1e-6;
-      const mround = (x, d) => { const f = Math.pow(10, d || 0); return Math.sign(x) * Math.round(Math.abs(x) * f) / f; };
+      // 道具立ては js/tests/test-helpers.js の makeTestKit から受け取る
+      const { T, check: push, approx, mround } = makeTestKit('V15');
 
       // ---- シード（engine-core の _initDefaultData と一致）----
       const U_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];

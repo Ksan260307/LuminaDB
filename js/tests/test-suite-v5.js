@@ -95,9 +95,9 @@
         { name: "V5Join: NATURAL JOIN Common Columns", sql: "SELECT COUNT(*) AS c FROM v5a NATURAL JOIN v5b", check: r => r.data[0].c === 1 },
         { name: "V5Join: NATURAL LEFT JOIN", sql: "SELECT COUNT(*) AS c FROM v5a NATURAL LEFT JOIN v5b", check: r => r.data[0].c === 3 },
         { name: "V5Join: NATURAL Without Common Is Cartesian", sql: "SELECT COUNT(*) AS c FROM v5a NATURAL JOIN v5c", check: r => r.data[0].c === 6 },
-        { name: "V5Join: USING Missing Column Rejected", sql: "SELECT * FROM v5a JOIN v5b USING (nope)", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('USING') },
+        errCase("V5Join: USING Missing Column Rejected", "SELECT * FROM v5a JOIN v5b USING (nope)", 'USING'),
         { name: "V5Join: Chained Join USING Resolves Prior Tables", sql: "SELECT COUNT(*) AS c FROM v5c JOIN v5a ON 1 = 1 JOIN v5b USING (id)", check: r => r.data[0].c === 4 },
-        { name: "V5Join: Bare JOIN Without Clause Rejected", sql: "SELECT * FROM v5a JOIN v5b", isErrorExpected: true, check: r => r.error !== undefined && r.error.includes('requires an ON or USING') },
+        errCase("V5Join: Bare JOIN Without Clause Rejected", "SELECT * FROM v5a JOIN v5b", 'requires an ON or USING'),
         { name: "V5Join: Cleanup", sql: "DROP TABLE v5a, v5b, v5c", check: r => r.data[0].Message.includes('dropped') },
 
         // ============================================================
@@ -126,16 +126,14 @@
         // ============================================================
         { name: "V5Sug: Table Typo Suggestion", sql: "SELECT * FROM usres", isErrorExpected: true, check: r =>
             r.error !== undefined && r.error.includes("Table 'usres' not found") && r.error.includes("Did you mean 'users'") },
-        { name: "V5Sug: Update Table Typo", sql: "UPDATE userz SET age = 1", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes("Did you mean 'users'") },
+        errCase("V5Sug: Update Table Typo", "UPDATE userz SET age = 1", "Did you mean 'users'"),
         { name: "V5Sug: Join Table Typo", sql: "SELECT * FROM users u JOIN orderz o ON u.id = o.user_id", isErrorExpected: true, check: r =>
             r.error !== undefined && r.error.includes("Join Table 'orderz' not found") && r.error.includes("Did you mean 'orders'") },
         { name: "V5Sug: Column Typo Suggestion", sql: "SELECT nmae FROM users", isErrorExpected: true, check: r =>
             r.error !== undefined && r.error.includes("Column 'nmae' not found") && r.error.includes("Did you mean 'name'") },
         { name: "V5Sug: No Suggestion For Distant Name", sql: "SELECT * FROM zzzzqqqq", isErrorExpected: true, check: r =>
             r.error !== undefined && r.error.includes('not found') && !r.error.includes('Did you mean') },
-        { name: "V5Sug: Describe Typo", sql: "DESCRIBE prodcuts", isErrorExpected: true, check: r =>
-            r.error !== undefined && r.error.includes("Did you mean 'products'") },
+        errCase("V5Sug: Describe Typo", "DESCRIBE prodcuts", "Did you mean 'products'"),
 
         // ============================================================
         // 5. UI 改善 (V5Ui) — 実DOM・localStorage依存（ヘッドレスでは既知失敗）

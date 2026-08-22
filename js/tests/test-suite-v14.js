@@ -21,8 +21,8 @@
         // ============================================================
         // 1. FULL OUTER JOIN
         // ============================================================
-        { name: "V14Join: Create L", sql: "CREATE TABLE fj_l (id INTEGER, lv TEXT)", check: r => r.data[0].Result === 'Success' },
-        { name: "V14Join: Create R", sql: "CREATE TABLE fj_r (id INTEGER, rv TEXT)", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Join: Create L", "CREATE TABLE fj_l (id INTEGER, lv TEXT)"),
+        successCase("V14Join: Create R", "CREATE TABLE fj_r (id INTEGER, rv TEXT)"),
         { name: "V14Join: Seed L", sql: "INSERT INTO fj_l (id, lv) VALUES (1, 'a'), (2, 'b'), (3, 'c')", check: r => r.data[0].Message.includes('3') },
         { name: "V14Join: Seed R", sql: "INSERT INTO fj_r (id, rv) VALUES (2, 'B'), (3, 'C'), (4, 'D')", check: r => r.data[0].Message.includes('3') },
         { name: "V14Join: Inner Baseline", sql: "SELECT COUNT(*) AS c FROM fj_l l JOIN fj_r r ON l.id = r.id", check: r => r.data[0].c === 2 },
@@ -43,7 +43,7 @@
         // ============================================================
         // 2. GROUPING SETS / CUBE
         // ============================================================
-        { name: "V14Grp: Create", sql: "CREATE TABLE gs_t (reg TEXT, prod TEXT, amt INTEGER)", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Grp: Create", "CREATE TABLE gs_t (reg TEXT, prod TEXT, amt INTEGER)"),
         { name: "V14Grp: Seed", sql: "INSERT INTO gs_t (reg, prod, amt) VALUES ('E', 'x', 10), ('E', 'y', 20), ('W', 'x', 30), ('W', 'y', 40)", check: r => r.data[0].Message.includes('4') },
         { name: "V14Grp: Rollup Baseline", sql: "SELECT reg, prod, SUM(amt) AS s FROM gs_t GROUP BY ROLLUP(reg, prod)", check: r => r.data.length === 7 },
         { name: "V14Grp: Cube Row Count", sql: "SELECT reg, prod, SUM(amt) AS s FROM gs_t GROUP BY CUBE(reg, prod)", check: r => r.data.length === 9 },
@@ -60,7 +60,7 @@
         // ============================================================
         // 3. PIVOT / UNPIVOT
         // ============================================================
-        { name: "V14Pv: Create", sql: "CREATE TABLE pv_t (reg TEXT, q TEXT, amt INTEGER)", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Pv: Create", "CREATE TABLE pv_t (reg TEXT, q TEXT, amt INTEGER)"),
         { name: "V14Pv: Seed", sql: "INSERT INTO pv_t (reg, q, amt) VALUES ('E', 'Q1', 10), ('E', 'Q2', 20), ('W', 'Q1', 30), ('W', 'Q2', 40)", check: r => r.data[0].Message.includes('4') },
         { name: "V14Pv: Pivot Rows", sql: "SELECT * FROM pv_t PIVOT (SUM(amt) FOR q IN ('Q1', 'Q2')) p ORDER BY reg", check: r => r.data.length === 2 },
         { name: "V14Pv: Pivot Values", sql: "SELECT * FROM pv_t PIVOT (SUM(amt) FOR q IN ('Q1', 'Q2')) p ORDER BY reg", check: r => r.data[0].reg === 'E' && r.data[0].q1 === 10 && r.data[0].q2 === 20 },
@@ -70,7 +70,7 @@
         // 該当行が無い列は空集合の SUM となり、本エンジンでは 0 を返す（MySQL は NULL）
         { name: "V14Pv: Pivot Missing Value Empty Sum", sql: "SELECT * FROM pv_t PIVOT (SUM(amt) FOR q IN ('Q1', 'Q9')) p ORDER BY reg", check: r => r.data[0].q9 === 0 && r.data[0].q1 === 10 },
         { name: "V14Pv: Pivot Then Where", sql: "SELECT * FROM pv_t PIVOT (SUM(amt) FOR q IN ('Q1', 'Q2')) p WHERE reg = 'W'", check: r => r.data.length === 1 && r.data[0].q1 === 30 },
-        { name: "V14Pv: Unpivot Create", sql: "CREATE TABLE up_t (reg TEXT, q1 INTEGER, q2 INTEGER)", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Pv: Unpivot Create", "CREATE TABLE up_t (reg TEXT, q1 INTEGER, q2 INTEGER)"),
         { name: "V14Pv: Unpivot Seed", sql: "INSERT INTO up_t (reg, q1, q2) VALUES ('E', 10, 20), ('W', 30, NULL)", check: r => r.data[0].Message.includes('2') },
         { name: "V14Pv: Unpivot Rows", sql: "SELECT * FROM up_t UNPIVOT (amt FOR q IN (q1, q2)) u", check: r => r.data.length === 3 },
         { name: "V14Pv: Unpivot Values", sql: "SELECT * FROM up_t UNPIVOT (amt FOR q IN (q1, q2)) u ORDER BY reg, q", check: r => r.data[0].reg === 'E' && r.data[0].q === 'q1' && r.data[0].amt === 10 },
@@ -94,7 +94,7 @@
         // ============================================================
         // 5. IS DISTINCT FROM / <=> / 量化比較
         // ============================================================
-        { name: "V14Nd: Create", sql: "CREATE TABLE nd_t (a INTEGER, b INTEGER)", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Nd: Create", "CREATE TABLE nd_t (a INTEGER, b INTEGER)"),
         { name: "V14Nd: Seed", sql: "INSERT INTO nd_t (a, b) VALUES (1, 1), (1, 2), (NULL, 1), (NULL, NULL)", check: r => r.data[0].Message.includes('4') },
         { name: "V14Nd: Distinct From Count", sql: "SELECT COUNT(*) AS c FROM nd_t WHERE a IS DISTINCT FROM b", check: r => r.data[0].c === 2 },
         { name: "V14Nd: Not Distinct From Count", sql: "SELECT COUNT(*) AS c FROM nd_t WHERE a IS NOT DISTINCT FROM b", check: r => r.data[0].c === 2 },
@@ -116,7 +116,7 @@
         // ============================================================
         // 6. WITHIN GROUP / RANGE・GROUPS フレーム
         // ============================================================
-        { name: "V14Wg: Create", sql: "CREATE TABLE wg_t (g TEXT, v INTEGER)", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Wg: Create", "CREATE TABLE wg_t (g TEXT, v INTEGER)"),
         { name: "V14Wg: Seed", sql: "INSERT INTO wg_t (g, v) VALUES ('a', 1), ('a', 2), ('a', 3), ('a', 4), ('b', 10), ('b', 20)", check: r => r.data[0].Message.includes('6') },
         { name: "V14Wg: Percentile Cont Median", sql: "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v) AS p FROM wg_t WHERE g = 'a'", check: r => Math.abs(r.data[0].p - 2.5) < 1e-9 },
         { name: "V14Wg: Percentile Disc", sql: "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) AS p FROM wg_t WHERE g = 'a'", check: r => r.data[0].p === 2 || r.data[0].p === 3 },
@@ -147,22 +147,22 @@
         }},
         { name: "V14Fr: Range Numeric Offset", sql: "SELECT v, SUM(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM wg_t WHERE g = 'a' ORDER BY v", check: r => r.data[0].s === 3 && r.data[1].s === 6 },
         { name: "V14Fr: Groups Frame", sql: "SELECT v, SUM(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM wg_t WHERE g = 'a' ORDER BY v", check: r => r.data[0].s === 1 && r.data[1].s === 3 && r.data[2].s === 5 },
-        { name: "V14Fr: Range Requires Order By", sql: "SELECT SUM(v) OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM wg_t", isErrorExpected: true, check: r => r.error && r.error.includes('RANGE') },
-        { name: "V14Fr: Range Offset Single Order Col", sql: "SELECT SUM(v) OVER (ORDER BY g, v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM wg_t", isErrorExpected: true, check: r => r.error && r.error.includes('exactly one ORDER BY') },
+        errCase("V14Fr: Range Requires Order By", "SELECT SUM(v) OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM wg_t", 'RANGE'),
+        errCase("V14Fr: Range Offset Single Order Col", "SELECT SUM(v) OVER (ORDER BY g, v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM wg_t", 'exactly one ORDER BY'),
         { name: "V14Fr: Groups With Partition", sql: "SELECT g, v, SUM(v) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM wg_t ORDER BY g, v", check: r => r.data[0].s === 1 && r.data[4].s === 10 },
 
         // ============================================================
         // 7. SELECT INTO / MATERIALIZED VIEW / COMMENT ON / IDENTITY / セッション文
         // ============================================================
-        { name: "V14Into: Select Into", sql: "SELECT id, name INTO si_t FROM users WHERE age >= 30", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Into: Select Into", "SELECT id, name INTO si_t FROM users WHERE age >= 30"),
         { name: "V14Into: Verify Rows", sql: "SELECT COUNT(*) AS c FROM si_t", check: r => r.data[0].c === 4 },
         { name: "V14Into: Verify Cols", sql: "SELECT * FROM si_t LIMIT 1", check: r => Object.keys(r.data[0]).length === 2 && 'name' in r.data[0] },
-        { name: "V14Into: Duplicate Rejected", sql: "SELECT id INTO si_t FROM users", isErrorExpected: true, check: r => r.error && r.error.includes('already exists') },
+        errCase("V14Into: Duplicate Rejected", "SELECT id INTO si_t FROM users", 'already exists'),
         { name: "V14Into: Cleanup", sql: "DROP TABLE si_t", check: r => true },
 
-        { name: "V14Mv: Source", sql: "CREATE TABLE mv_src (id INTEGER, v INTEGER)", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Mv: Source", "CREATE TABLE mv_src (id INTEGER, v INTEGER)"),
         { name: "V14Mv: Seed", sql: "INSERT INTO mv_src (id, v) VALUES (1, 10), (2, 20)", check: r => r.data[0].Message.includes('2') },
-        { name: "V14Mv: Create MatView", sql: "CREATE MATERIALIZED VIEW mv_a AS SELECT id, v * 2 AS dbl FROM mv_src", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Mv: Create MatView", "CREATE MATERIALIZED VIEW mv_a AS SELECT id, v * 2 AS dbl FROM mv_src"),
         { name: "V14Mv: Query MatView", sql: "SELECT SUM(dbl) AS s FROM mv_a", check: r => r.data[0].s === 60 },
         { name: "V14Mv: Stale After Insert", fn: () => {
             db.executeQuery("INSERT INTO mv_src (id, v) VALUES (3, 30)");
@@ -175,25 +175,25 @@
             return r.data[0].s === 120;
         }},
         { name: "V14Mv: Show Materialized Views", sql: "SHOW MATERIALIZED VIEWS", check: r => r.data.some(x => x.View === 'mv_a' && x.Rows === 3) },
-        { name: "V14Mv: Duplicate Rejected", sql: "CREATE MATERIALIZED VIEW mv_a AS SELECT 1 AS x", isErrorExpected: true, check: r => r.error && r.error.includes('already exists') },
+        errCase("V14Mv: Duplicate Rejected", "CREATE MATERIALIZED VIEW mv_a AS SELECT 1 AS x", 'already exists'),
         { name: "V14Mv: If Not Exists", sql: "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_a AS SELECT 1 AS x", check: r => r.data[0].Message.includes('Skipped') },
-        { name: "V14Mv: Refresh Unknown", sql: "REFRESH MATERIALIZED VIEW mv_zzz", isErrorExpected: true, check: r => r.error && r.error.includes('not found') },
-        { name: "V14Mv: Drop", sql: "DROP MATERIALIZED VIEW mv_a", check: r => r.data[0].Result === 'Success' },
-        { name: "V14Mv: Gone After Drop", sql: "SELECT * FROM mv_a", isErrorExpected: true, check: r => r.error !== undefined },
+        errCase("V14Mv: Refresh Unknown", "REFRESH MATERIALIZED VIEW mv_zzz", 'not found'),
+        successCase("V14Mv: Drop", "DROP MATERIALIZED VIEW mv_a"),
+        errCase("V14Mv: Gone After Drop", "SELECT * FROM mv_a"),
         { name: "V14Mv: Drop If Exists", sql: "DROP MATERIALIZED VIEW IF EXISTS mv_a", check: r => r.data[0].Message.includes('Skipped') },
 
-        { name: "V14Cm: Comment On Table", sql: "COMMENT ON TABLE mv_src IS 'source table'", check: r => r.data[0].Result === 'Success' },
-        { name: "V14Cm: Comment On Column", sql: "COMMENT ON COLUMN mv_src.v IS 'the value'", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Cm: Comment On Table", "COMMENT ON TABLE mv_src IS 'source table'"),
+        successCase("V14Cm: Comment On Column", "COMMENT ON COLUMN mv_src.v IS 'the value'"),
         { name: "V14Cm: Show Comments", sql: "SHOW COMMENTS", check: r => r.data.some(x => x.Object === 'mv_src' && x.Comment === 'source table') && r.data.some(x => x.Object === 'mv_src.v') },
-        { name: "V14Cm: Comment Unknown Table", sql: "COMMENT ON TABLE nope_zzz IS 'x'", isErrorExpected: true, check: r => r.error !== undefined },
-        { name: "V14Cm: Comment Unknown Column", sql: "COMMENT ON COLUMN mv_src.nope IS 'x'", isErrorExpected: true, check: r => r.error && r.error.includes('not found') },
+        errCase("V14Cm: Comment Unknown Table", "COMMENT ON TABLE nope_zzz IS 'x'"),
+        errCase("V14Cm: Comment Unknown Column", "COMMENT ON COLUMN mv_src.nope IS 'x'", 'not found'),
         { name: "V14Cm: Remove Comment", fn: () => {
             db.executeQuery("COMMENT ON TABLE mv_src IS NULL");
             const r = db.executeQuery("SHOW COMMENTS");
             return !r.data.some(x => x.Object === 'mv_src' && x.Kind === 'TABLE');
         }},
 
-        { name: "V14Id: Identity Column", sql: "CREATE TABLE idn_t (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, nm TEXT)", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Id: Identity Column", "CREATE TABLE idn_t (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, nm TEXT)"),
         { name: "V14Id: Identity Autonumbers", fn: () => {
             db.executeQuery("INSERT INTO idn_t (nm) VALUES ('a'), ('b')");
             const r = db.executeQuery("SELECT id FROM idn_t ORDER BY id");
@@ -215,7 +215,7 @@
             db.executeQuery("DROP TABLE IF EXISTS idn3");
             return r.data.length === 2 && r.data[1].id === 2;
         }},
-        { name: "V14Id: Non-default Seed Rejected", sql: "CREATE TABLE idn4 (id INTEGER GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 1))", isErrorExpected: true, check: r => r.error && r.error.includes('non-default seed') },
+        errCase("V14Id: Non-default Seed Rejected", "CREATE TABLE idn4 (id INTEGER GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 1))", 'non-default seed'),
         { name: "V14Id: Truncate Restart Identity", fn: () => {
             db.executeQuery("TRUNCATE TABLE idn_t RESTART IDENTITY");
             db.executeQuery("INSERT INTO idn_t (nm) VALUES ('c')");
@@ -236,14 +236,14 @@
             return !t.error && t.data[0].Message.includes('identity continues at 4') && kept === 4 && reset === 1;
         }},
 
-        { name: "V14Se: Set Isolation Level", sql: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Se: Set Isolation Level", "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
         { name: "V14Se: Show Settings", sql: "SHOW SETTINGS", check: r => r.data.some(x => x.Setting === 'isolation_level' && x.Value === 'READ COMMITTED') && r.data.some(x => x.Setting === 'effective_isolation') },
-        { name: "V14Se: Set Serializable", sql: "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", check: r => r.data[0].Result === 'Success' },
-        { name: "V14Se: Lock Table No-op", sql: "LOCK TABLES users READ", check: r => r.data[0].Result === 'Success' },
-        { name: "V14Se: Unlock Tables", sql: "UNLOCK TABLES", check: r => r.data[0].Result === 'Success' },
-        { name: "V14Se: Grant No-op", sql: "GRANT SELECT ON users TO someone", check: r => r.data[0].Result === 'Success' },
-        { name: "V14Se: Revoke No-op", sql: "REVOKE SELECT ON users FROM someone", check: r => r.data[0].Result === 'Success' },
-        { name: "V14Se: Analyze No-op", sql: "ANALYZE", check: r => r.data[0].Result === 'Success' },
+        successCase("V14Se: Set Serializable", "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+        successCase("V14Se: Lock Table No-op", "LOCK TABLES users READ"),
+        successCase("V14Se: Unlock Tables", "UNLOCK TABLES"),
+        successCase("V14Se: Grant No-op", "GRANT SELECT ON users TO someone"),
+        successCase("V14Se: Revoke No-op", "REVOKE SELECT ON users FROM someone"),
+        successCase("V14Se: Analyze No-op", "ANALYZE"),
         { name: "V14Se: Analyze Table Still Works", sql: "ANALYZE TABLE users", check: r => r.data.length >= 1 },
         { name: "V14Se: Discard Clears Vars", fn: () => {
             db.executeQuery("SET @tmpvar = 5");
