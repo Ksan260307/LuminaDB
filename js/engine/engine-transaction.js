@@ -156,6 +156,7 @@
               const table = this.tables[log.table];
               if (table) {
                   table.rowCount = log.rowCount;
+                  table.version++;   // 巻き戻しも「内容が変わった」ので世代を進める
                   for (let col in log.cols) {
                       if (!table.cols[col]) continue;
                       table.cols[col].num.set(log.cols[col].num);

@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LuminaDB</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* ------------------------------------------------------------------
+       Tailwind CDN が読めなかったときの最低限のフォールバック。
+       ブラウザ内 DB はオフライン・社内プロキシ・file:// で使われるので、
+       CDN が落ちても「使えない」ではなく「見た目が素朴」に留める。
+       とくに .hidden が無いと 9 個のモーダルが全部開いた状態で
+       ページに積まれ、何も操作できなくなる（実測で確認済み）。
+       Tailwind が読めた場合は同じ内容の規則が後から入るので害はない
+       ------------------------------------------------------------------ */
+    .hidden { display: none; }
+    #tailwindWarning { display: none; }
+    /* CDN 未読込時だけ出る帯（下のスクリプトが body に data 属性を立てる） */
+    html[data-nocss="1"] #tailwindWarning {
+      display: block; background: #fef3c7; color: #92400e; border-bottom: 1px solid #f59e0b;
+      padding: 6px 10px; font: 12px/1.5 system-ui, sans-serif;
+    }
+    html[data-nocss="1"] body { font: 13px/1.5 system-ui, sans-serif; margin: 0; padding: 8px; }
+    html[data-nocss="1"] table { border-collapse: collapse; }
+    html[data-nocss="1"] th, html[data-nocss="1"] td { border: 1px solid #cbd5e1; padding: 2px 6px; }
+    html[data-nocss="1"] textarea, html[data-nocss="1"] input, html[data-nocss="1"] select { font-family: ui-monospace, monospace; }
+    html[data-nocss="1"] #editorBox { height: 10rem; }
+    html[data-nocss="1"] #resultsContainer { overflow: auto; max-height: 60vh; }
+
+    /* スクロールバー */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+    /* シンタックスハイライト (ライトテーマ向け) */
+    .hl-keyword { color: #7e22ce; font-weight: bold; } /* Purple */
+    .hl-string { color: #15803d; } /* Green */
+    .hl-number { color: #b45309; } /* Amber/Orange */
+
+    /* エディタの高さの既定値。スプリッタのドラッグは inline style で上書きする
+       （Tailwind のユーティリティクラスだと inline style で上書きできないため
+         クラスではなくこの規則で与えている） */
+    #editorBox { height: 8rem; }
+
+    /* エディタの重ね合わせ */
+    #queryInput, #highlightLayer {
+      font-family: ui-monospace, monospace;
+      font-size: 0.875rem;
+      line-height: 1.5;
+      padding: 1rem;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      border: 1px solid transparent;
+    }
+  </style>
+</head>
+<body class="h-screen w-full bg-gray-50 text-gray-800 font-sans flex overflow-hidden">
+  <!-- CDN が読めなかったときだけ見える帯（既定は display:none） -->
+  <div id="tailwindWarning">
+    スタイルシート（Tailwind CDN）を読み込めませんでした。表示は簡素になりますが、SQL の実行と保存は問題なく動きます。
+  </div>
+  <script>
+    // Tailwind Play CDN は読み込み後に window.tailwind を定義する。
+    // 定義されていなければ CDN が落ちている＝フォールバック規則を有効にする。
+    // 同期スクリプトの直後では判定できないことがあるので load でも再確認する
+    (function () {
+      const mark = () => {
+        const ok = typeof window.tailwind !== 'undefined';
+        document.documentElement.setAttribute('data-nocss', ok ? '0' : '1');
+      };
+      mark();
+      window.addEventListener('load', mark);
+    })();
+  </script>
+
+  <!-- ============================================================================ -->
+  <!-- 左サイドバー -->
+  <!-- ============================================================================ -->
+  <aside class="w-64 bg-white border-r border-gray-200 flex flex-col shrink-0 shadow-sm z-10">
+    <!-- ヘッダー -->
+    <div class="p-4 border-b border-gray-200 flex justify-between items-center bg-gray-50/50">
+      <h1 class="font-bold text-lg text-blue-600">LuminaDB</h1>
+      <div class="flex items-center gap-2">
+        <!-- 表示言語の切り替え（既定は日本語）。選択は localStorage に残る。
+             SQL エンジンのエラーは元から英語なので切り替えの対象外 -->
+        <div id="langToggle" data-i18n-skip class="flex border border-gray-300 rounded overflow-hidden text-[10px] leading-none" role="group" aria-label="Language">
+          <!-- ラベルは JP / EN。どちらの言語でも同じ幅・同じ読み方で選べるようにする
+               （説明は両言語を併記する。この箱は data-i18n-skip なので訳されない） -->
+          <button type="button" data-lang="ja" class="px-1.5 py-1 hover:bg-gray-100 transition-colors" title="日本語で表示 / Show in Japanese">JP</button>
+          <button type="button" data-lang="en" class="px-1.5 py-1 hover:bg-gray-100 transition-colors border-l border-gray-300" title="英語で表示 / Show in English">EN</button>
+        </div>
+        <button id="openHelpBtn" class="text-sm text-gray-500 hover:text-blue-600 font-medium transition-colors" title="コマンドリファレンス">Help</button>
+      </div>
+    </div>
+
+    <!-- ツールバー
+         v1.24: 説明の無い 4 つのボタン（Export SQL / Import SQL / Import CSV / Test Data）を
+         「Data」1 つへ集約した。
+         v1.34: 残っていた 6 つ（Save DB / Load DB / Clear DB / Open File / Save / Save As）も
+         同じモーダルへ移し、サイドバーの入口を 1 つにした。ボタン名だけでは
+         「このブラウザに保存」と「ファイルへ保存」の違いが判らず、どれを押せば
+         データが残るのかが読み取れなかったため。移した先では 1 件ずつ説明を付けている。
+         よく使う保存は Ctrl+S（このブラウザ）/ Ctrl+Shift+S（ファイル）で直接呼べる -->
+    <div class="p-2 border-b border-gray-200 flex flex-col gap-2 text-xs">
+      <button id="openDataBtn" title="保存・読み込み・書き出し・テストデータ (Ctrl+Shift+D)" class="w-full bg-white hover:bg-gray-100 border border-gray-300 py-2 rounded text-blue-600 font-medium transition-colors shadow-sm flex items-center justify-center gap-1.5">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 1.66 3.58 3 8 3s8-1.34 8-3V7M4 7c0 1.66 3.58 3 8 3s8-1.34 8-3M4 7c0-1.66 3.58-3 8-3s8 1.34 8 3m0 5c0 1.66-3.58 3-8 3s-8-1.34-8-3"/></svg>
+        データ — 保存 / 読み込み / 入出力
+      </button>
+      <input type="file" id="sqlFileInput" accept=".sql,.txt" class="hidden">
+
+      <!-- 自動保存の状態と、開いているファイル名。どちらも「今どこに残るのか」を
+           常に見えるようにするためのもので、操作は上のボタンから行う -->
+      <div id="storageStateLine" data-i18n-skip class="w-full text-[10px] text-gray-500 flex items-center gap-1.5">
+        <span class="inline-block w-1.5 h-1.5 rounded-full bg-green-500 shrink-0"></span>
+        <span>このブラウザへ自動保存</span>
+      </div>
+      <div id="openFileLabel" data-i18n-skip class="hidden w-full text-[10px] text-gray-500 truncate" title="開いているファイル"></div>
+    </div>
+
+    <!-- テーブル一覧 -->
+    <div class="flex-1 overflow-y-auto p-4">
+      <div class="flex items-center justify-between mb-2">
+        <div class="text-xs font-semibold text-gray-400 uppercase tracking-widest">Tables</div>
+        <button id="openErBtn" class="text-[10px] text-gray-500 hover:text-blue-600 border border-gray-200 hover:border-blue-300 bg-white px-1.5 py-0.5 rounded transition-colors" title="外部キーの関係を図で見る">ER図</button>
+      </div>
+      <!-- スキーマ検索: 表名・列名の部分一致で絞り込む（列に当たった表は自動で展開） -->
+      <div class="relative mb-2">
+        <svg class="w-3.5 h-3.5 absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35M17 11a6 6 0 11-12 0 6 6 0 0112 0z"/></svg>
+        <input id="schemaSearch" type="text" autocomplete="off" placeholder="表・列を検索" class="w-full bg-white border border-gray-300 text-gray-700 text-xs rounded pl-7 pr-6 py-1.5 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500">
+        <button id="schemaSearchClear" title="クリア" class="absolute right-1 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-xs px-1 rounded hover:bg-gray-100 leading-none">✕</button>
+      </div>
+      <div id="schemaSearchNote" data-i18n-skip class="hidden text-[11px] text-gray-400 mb-1"></div>
+      <!-- 表の右クリックメニュー。DDL 表示・データ閲覧・削除など、
+           これまでどこからも辿れなかった操作への導線 -->
+      <div id="treeMenu" data-i18n-skip class="hidden fixed z-50 bg-white border border-gray-200 rounded shadow-xl py-1 text-xs min-w-[11rem]"></div>
+      <ul id="tableTree" data-i18n-skip class="space-y-1">
+        <!-- JSで描画 -->
+      </ul>
+    </div>
+  </aside>
+
+  <!-- ============================================================================ -->
+  <!-- メイン領域 -->
+  <!-- ============================================================================ -->
+  <main class="flex-1 flex flex-col overflow-hidden relative bg-gray-50">
+    
+    <!-- エディタ部分 -->
+    <div class="p-4 border-b border-gray-200 bg-white flex flex-col shrink-0 shadow-sm z-0">
+      <div class="flex justify-between items-center mb-2">
+        <label class="text-sm font-semibold text-gray-600">Query Workspace</label>
+        <div class="flex gap-2 items-center text-xs">
+          <button id="formatBtn" class="text-gray-500 hover:text-gray-800 px-2 py-1 rounded border border-gray-200 hover:bg-gray-100 transition-colors" title="SQLを整形 (Ctrl+Shift+F)">Format</button>
+          <button id="explainBtn" class="text-gray-500 hover:text-gray-800 px-2 py-1 rounded border border-gray-200 hover:bg-gray-100 transition-colors" title="実行計画を見る (Ctrl+Shift+E) — 実行はしない">Explain</button>
+          <button id="clearBtn" class="text-gray-500 hover:text-gray-800 px-2 py-1 rounded border border-gray-200 hover:bg-gray-100 transition-colors">Clear</button>
+          <button id="executeBtn" class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-1.5 rounded font-medium shadow-sm transition-colors">Run</button>
+        </div>
+      </div>
+      
+      <!-- エディタタブ: 複数のクエリを並行して書き溜め、localStorage に保存する -->
+      <div class="flex items-end gap-1 mb-1 overflow-x-auto" id="editorTabsWrap">
+        <div id="editorTabs" data-i18n-skip class="flex items-end gap-1 min-w-0"></div>
+        <button id="tabAddBtn" class="shrink-0 text-gray-400 hover:text-gray-700 hover:bg-gray-100 border border-transparent hover:border-gray-200 rounded px-2 py-1 text-sm leading-none transition-colors" title="新しいタブ (Ctrl+Alt+T)">＋</button>
+      </div>
+
+      <!-- 高さは Tailwind の h-32 ではなく下の #editorBox 規則で与える。
+           スプリッタが inline style で上書きするため（Tailwind CDN の
+           ユーティリティは inline style より強く効くことがある） -->
+      <div id="editorBox" class="relative w-full bg-white border border-gray-300 rounded overflow-hidden focus-within:border-blue-500 focus-within:ring-1 focus-within:ring-blue-500 transition-colors shadow-inner">
+        <!-- text-gray-900 でハイライトのベース色を指定 -->
+        <pre id="highlightLayer" aria-hidden="true" class="absolute inset-0 m-0 pointer-events-none text-gray-800 overflow-hidden bg-transparent z-0"></pre>
+        <!-- 入力エリアの文字色は透明にして、ハイライトを見せる -->
+        <textarea id="queryInput" class="absolute inset-0 w-full h-full bg-transparent text-transparent caret-black outline-none resize-none z-10" spellcheck="false"></textarea>
+        <!-- オートコンプリート用サジェストボックス -->
+        <div id="suggestBox" class="absolute hidden bg-white border border-gray-200 shadow-xl rounded-md text-sm z-50 max-h-40 overflow-y-auto w-48 font-mono"></div>
+      </div>
+
+      <!-- エディタと結果ペインの境界。ドラッグでエディタの高さを変えられる -->
+      <div id="editorSplitter" role="separator" aria-orientation="horizontal" tabindex="0"
+           title="ドラッグでエディタの高さを変更（ダブルクリックで既定へ戻す）"
+           class="h-2 -mb-1 mt-0.5 cursor-row-resize group flex items-center justify-center select-none">
+        <div class="h-0.5 w-16 rounded bg-gray-200 group-hover:bg-blue-400 transition-colors"></div>
+      </div>
+    </div>
+
+    <!-- トランザクション操作バー: 実DBクライアント同様に明示的な境界制御を提供する -->
+    <div class="px-4 py-1.5 bg-white flex items-center gap-3 border-b border-gray-200 shrink-0 text-xs">
+      <span id="txnIndicator" class="inline-flex items-center gap-1.5 font-semibold text-gray-400" title="トランザクション状態">
+        <span id="txnDot" class="w-2 h-2 rounded-full bg-gray-300"></span>
+        <span id="txnLabel">AUTOCOMMIT</span>
+      </span>
+      <div class="flex items-center gap-1.5">
+        <button id="txnBeginBtn" class="border border-gray-300 bg-white hover:bg-gray-50 text-gray-700 px-2.5 py-1 rounded shadow-sm transition-colors disabled:opacity-40 disabled:hover:bg-white" title="BEGIN — トランザクションを開始">Begin</button>
+        <button id="txnCommitBtn" class="border border-green-300 bg-green-50 hover:bg-green-100 text-green-700 px-2.5 py-1 rounded shadow-sm transition-colors disabled:opacity-40 disabled:hover:bg-green-50" title="COMMIT — 変更を確定">Commit</button>
+        <button id="txnRollbackBtn" class="border border-red-300 bg-red-50 hover:bg-red-100 text-red-700 px-2.5 py-1 rounded shadow-sm transition-colors disabled:opacity-40 disabled:hover:bg-red-50" title="ROLLBACK — 変更を破棄">Rollback</button>
+      </div>
+      <!-- 結果グリッドの編集可否。編集可なら基底表名を、不可ならその理由を出す -->
+      <span id="editBadge" class="inline-flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded border text-[11px] font-medium border-gray-200 bg-gray-50 text-gray-400" title="結果セルをダブルクリックで直接編集できるかどうか">
+        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+        <span id="editBadgeText">Read-only</span>
+      </span>
+      <!-- 実行時間の上限。ブラウザ DB はクエリが UI スレッドを占有するので、
+           暴走クエリでタブごと固まらないよう既定で上限を掛ける -->
+      <label class="ml-auto flex items-center gap-1.5 text-gray-500" title="1 文あたりの実行時間の上限。超えると中断してエラーになる">
+        <span>上限</span>
+        <select id="stmtTimeout" class="bg-white border border-gray-300 text-gray-700 text-xs rounded px-1.5 py-0.5 outline-none focus:border-blue-500 cursor-pointer">
+          <option value="0">なし</option>
+          <option value="5000">5秒</option>
+          <option value="30000" selected>30秒</option>
+          <option value="120000">2分</option>
+        </select>
+      </label>
+      <span id="txnHint" class="text-gray-400 ml-3">Ctrl+Enter でカーソル位置の文だけ実行 · セルをダブルクリックで編集</span>
+    </div>
+
+    <!-- メトリクス & ツール -->
+    <div class="px-4 py-2 bg-gray-100 flex justify-between items-center border-b border-gray-200 shrink-0 text-sm">
+      <div class="flex gap-6">
+        <div class="flex flex-col">
+          <span class="text-[10px] text-gray-500 uppercase font-semibold">Time</span>
+          <span id="metricTime" class="font-mono text-gray-700 font-medium">---</span>
+        </div>
+        <div class="flex flex-col">
+          <span class="text-[10px] text-gray-500 uppercase font-semibold">Rows</span>
+          <span id="metricRows" class="font-mono text-gray-700 font-medium">---</span>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <!-- 結果セットの絞り込み（全列を対象にした部分一致。商用クライアントのグリッドフィルタ相当） -->
+        <div class="relative">
+          <svg class="w-3.5 h-3.5 text-gray-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+          <input id="resultFilter" type="text" autocomplete="off" placeholder="結果を絞り込み" class="w-44 bg-white border border-gray-300 text-gray-700 text-xs rounded pl-8 pr-7 py-1.5 shadow-sm outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500">
+          <button id="resultFilterClear" title="クリア" class="absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-xs px-1 rounded hover:bg-gray-100 leading-none">✕</button>
+        </div>
+        <button id="exportCsvBtn" class="text-gray-600 hover:text-gray-900 text-xs border border-gray-300 bg-white hover:bg-gray-50 px-3 py-1.5 rounded shadow-sm disabled:opacity-50 disabled:bg-gray-100 transition-colors" disabled>
+          Export CSV
+        </button>
+        <button id="exportJsonBtn" class="text-gray-600 hover:text-gray-900 text-xs border border-gray-300 bg-white hover:bg-gray-50 px-3 py-1.5 rounded shadow-sm disabled:opacity-50 disabled:bg-gray-100 transition-colors" disabled>
+          Export JSON
+        </button>
+        <!-- 結果を他所へ貼るための書式。Markdown は課題票やレビューへ、INSERT は別DBへの移送に使う -->
+        <button id="copyMdBtn" class="text-gray-600 hover:text-gray-900 text-xs border border-gray-300 bg-white hover:bg-gray-50 px-3 py-1.5 rounded shadow-sm disabled:opacity-50 disabled:bg-gray-100 transition-colors" disabled title="結果を Markdown 表としてクリップボードへコピー">
+          Copy MD
+        </button>
+        <button id="copyTsvBtn" class="text-gray-600 hover:text-gray-900 text-xs border border-gray-300 bg-white hover:bg-gray-50 px-3 py-1.5 rounded shadow-sm disabled:opacity-50 disabled:bg-gray-100 transition-colors" disabled title="結果を TSV としてコピー（表計算ソフトへそのまま貼れる）">
+          Copy TSV
+        </button>
+        <button id="copyInsertBtn" class="text-gray-600 hover:text-gray-900 text-xs border border-gray-300 bg-white hover:bg-gray-50 px-3 py-1.5 rounded shadow-sm disabled:opacity-50 disabled:bg-gray-100 transition-colors" disabled title="結果を INSERT 文としてクリップボードへコピー">
+          Copy INSERT
+        </button>
+        <!-- 編集可能な結果グリッドでの行操作。読み取り専用のときは無効化される -->
+        <button id="addRowBtn" class="text-green-700 hover:text-green-900 text-xs border border-green-300 bg-green-50 hover:bg-green-100 px-3 py-1.5 rounded shadow-sm disabled:opacity-40 disabled:bg-gray-100 disabled:text-gray-500 disabled:border-gray-300 transition-colors" disabled title="基底表へ空の行を追加する">+ Row</button>
+        <button id="delRowBtn" class="text-red-700 hover:text-red-900 text-xs border border-red-300 bg-red-50 hover:bg-red-100 px-3 py-1.5 rounded shadow-sm disabled:opacity-40 disabled:bg-gray-100 disabled:text-gray-500 disabled:border-gray-300 transition-colors" disabled title="選択中の行を基底表から削除する">− Row</button>
+        <button id="openHistoryBtn" class="text-gray-600 hover:text-gray-900 text-xs border border-gray-300 bg-white hover:bg-gray-50 px-3 py-1.5 rounded shadow-sm transition-colors" title="クエリ履歴">History</button>
+        <button id="openShortcutsBtn" class="text-gray-500 hover:text-gray-800 text-xs border border-gray-300 bg-white hover:bg-gray-50 px-2 py-1.5 rounded shadow-sm transition-colors" title="キーボードショートカット (?)">?</button>
+        <div class="flex items-center gap-2">
+          <label class="text-[10px] text-gray-500 uppercase font-semibold">Limit</label>
+          <select id="displayLimit" class="bg-white border border-gray-300 text-gray-700 text-xs rounded px-2 py-1 outline-none shadow-sm focus:border-blue-500 cursor-pointer">
+            <option value="100" selected>100</option>
+            <option value="1000">1,000</option>
+            <option value="10000">10,000</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- 複数文スクリプトの結果セット切替タブ（結果セットが2つ以上のときだけ出る） -->
+    <div id="resultTabs" class="hidden flex-wrap items-center gap-1 px-4 pt-2 border-b border-gray-200 bg-gray-50"></div>
+
+    <!-- 結果エリア -->
+    <div id="resultsContainer" class="flex-1 overflow-auto p-4 relative">
+      <div id="resultsArea" data-i18n-skip class="min-h-full flex flex-col">
+        <div class="m-auto text-gray-400 text-sm">Run a query to see results.</div>
+      </div>
+    </div>
+    
+    <!-- システムメッセージ (Toast) -->
+    <!-- トーストは JS が i18nT() で組み立てて流すので、言語切り替えの走査対象にしない
+         （出したあとの文言を後から訳し直しても意味が無い。コンソールのログと同じ扱い） -->
+    <div id="toastMsg" data-i18n-skip class="absolute bottom-4 right-4 px-4 py-2 rounded shadow-lg transition-opacity duration-300 opacity-0 pointer-events-none z-50 text-sm font-medium"></div>
+  </main>
+
+  <!-- ============================================================================ -->
+  <!-- モーダル: スキーマ編集 -->
+  <!-- ============================================================================ -->
+  <div id="schemaModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+    <div class="absolute inset-0 bg-gray-900/40 backdrop-blur-sm closeModalBg cursor-pointer"></div>
+    <div class="relative bg-white border border-gray-200 rounded-lg shadow-2xl w-full max-w-2xl p-6 m-4 flex flex-col gap-4 max-h-[90vh]">
+      <div class="flex justify-between items-center border-b border-gray-100 pb-3 shrink-0">
+        <h2 class="text-lg font-bold text-gray-800 flex items-center gap-2">
+          <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+          Table Editor: <span id="schemaTableName" class="text-blue-600 font-mono"></span>
+        </h2>
+        <button class="closeModalBtn text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">✕</button>
+      </div>
+      
+      <div class="flex-1 overflow-y-auto p-1 space-y-2" id="schemaColumnList">
+         <!-- JSでカラムリストを描画 -->
+      </div>
+      <button id="schemaAddColBtn" class="text-sm text-blue-600 font-medium hover:text-blue-800 text-left w-fit px-2 py-1 hover:bg-blue-50 rounded transition-colors shrink-0">+ Add Column</button>
+
+      <div class="mt-2 shrink-0">
+         <label class="text-xs font-semibold text-gray-500 uppercase tracking-widest flex items-center gap-1 mb-1">
+           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"></path></svg>
+           Dynamic Preview
+         </label>
+         <pre id="schemaPreviewText" class="w-full h-28 bg-gray-800 border-gray-700 rounded-md p-3 text-sm font-mono text-green-400 overflow-y-auto shadow-inner whitespace-pre-wrap select-all"></pre>
+      </div>
+
+      <div id="schemaErrorMsg" class="hidden text-sm text-red-600 bg-red-50 border border-red-200 p-2.5 rounded shrink-0 font-medium"></div>
+
+      <div class="pt-3 flex justify-end gap-2 border-t border-gray-100 shrink-0">
+        <button class="closeModalBtn bg-gray-100 hover:bg-gray-200 text-gray-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">Cancel</button>
+        <button id="execSchemaSaveBtn" class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2 rounded text-sm font-medium transition-colors shadow-sm">Save Schema</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- モーダル: コマンドリファレンス -->
+  <!-- ============================================================================ -->
+  <div id="helpModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+    <div id="helpOverlay" class="absolute inset-0 bg-gray-900/40 backdrop-blur-sm cursor-pointer"></div>
+    <div class="relative bg-white border border-gray-200 rounded-lg shadow-2xl w-full max-w-3xl p-6 m-4 flex flex-col gap-4 max-h-[85vh]">
+      <div class="flex justify-between items-center border-b border-gray-100 pb-3">
+        <h2 class="text-lg font-bold text-gray-800">Command Reference</h2>
+        <button class="closeModalBtn text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">✕</button>
+      </div>
+      <div class="flex items-center gap-2 flex-wrap">
+        <label class="text-sm text-gray-600 font-medium">Target Table:</label>
+        <select id="helpTableSelect" class="bg-gray-50 border border-gray-300 text-gray-800 text-sm rounded px-3 py-1.5 focus:border-blue-500 outline-none cursor-pointer"></select>
+        <span id="helpSearchCount" class="text-xs text-gray-400 ml-auto"></span>
+      </div>
+      <div class="relative">
+        <svg class="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+        <input id="helpSearchInput" type="text" autocomplete="off" placeholder="コマンドを検索 (例: JOIN, DATE, INSERT, JSON)" class="w-full bg-gray-50 border border-gray-300 text-gray-800 text-sm rounded pl-9 pr-9 py-2 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none">
+        <button id="helpSearchClear" title="クリア" class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-sm px-1.5 rounded hover:bg-gray-100 leading-none">✕</button>
+      </div>
+      <div id="helpNoResults" class="hidden text-sm text-gray-400 text-center py-10">一致するコマンドがありません。</div>
+      <div class="overflow-y-auto pr-2 mt-1 space-y-5" id="helpContent" data-i18n-skip></div>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- モーダル: データ入出力（v1.24 で Export SQL / Import SQL / Import CSV /
+       Test Data の 4 ボタンをここへ集約した。それぞれが何をするのか・何が要るのかを
+       画面上で説明する。旧 generatorModal / csvModal の入力要素は ID を保ったまま
+       このモーダルのタブへ移設している） -->
+  <!-- ============================================================================ -->
+  <div id="dataModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+    <div class="absolute inset-0 bg-gray-900/40 backdrop-blur-sm closeModalBg cursor-pointer"></div>
+    <div class="relative bg-white border border-gray-200 rounded-lg shadow-2xl w-full max-w-2xl p-6 m-4 flex flex-col gap-4 max-h-[88vh]">
+      <div class="flex justify-between items-center border-b border-gray-100 pb-3">
+        <h2 class="text-lg font-bold text-gray-800">データ — 保存 / 読み込み / 入出力</h2>
+        <button class="closeModalBtn text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">✕</button>
+      </div>
+
+      <!-- タブ -->
+      <div class="flex gap-1 border-b border-gray-200 -mb-1 flex-wrap" role="tablist">
+        <button class="dataTabBtn px-3 py-2 text-sm font-medium border-b-2 border-blue-600 text-blue-700" data-pane="dataPaneBrowser" role="tab">このブラウザ</button>
+        <button class="dataTabBtn px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800" data-pane="dataPaneFile" role="tab">ファイル</button>
+        <button class="dataTabBtn px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800" data-pane="dataPaneExport" role="tab">書き出し</button>
+        <button class="dataTabBtn px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800" data-pane="dataPaneImport" role="tab">読み込み</button>
+        <button id="openGeneratorBtn" class="dataTabBtn px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800" data-pane="dataPaneGen" role="tab">テストデータ</button>
+      </div>
+
+      <div class="overflow-y-auto pr-1 -mr-1">
+        <!-- ============================================================
+             このブラウザ（IndexedDB）
+             v1.34: サイドバーにあった Save DB / Load DB / Clear DB をここへ移した。
+             3 つとも「このブラウザの中だけ」に効く操作で、ファイルへの保存とは
+             別物であることが名前からは読み取れなかった
+             ============================================================ -->
+        <div id="dataPaneBrowser" class="dataPane flex flex-col gap-3">
+          <div class="rounded border border-blue-100 bg-blue-50/60 p-3">
+            <p class="text-xs text-blue-900 leading-relaxed">
+              <span class="font-semibold">変更は 1 秒後にこのブラウザへ自動保存されます。</span>
+              下のボタンは、その保存を今すぐ行う / 保存した地点へ戻す / 消して作り直すためのものです。
+            </p>
+            <p class="text-xs text-blue-900/80 leading-relaxed mt-1.5">
+              保存先はこのブラウザのこのサイト（IndexedDB）だけです。<span class="font-medium">閲覧データを削除すると消え、他の端末やブラウザからは見えません</span>。
+              持ち出す・バックアップを取るなら <span class="font-medium">ファイル</span> タブか <span class="font-medium">書き出し</span> タブを使ってください。
+            </p>
+          </div>
+
+          <div id="idbStatusLine" data-i18n-skip class="text-[11px] text-gray-500 border border-gray-200 rounded px-3 py-2"></div>
+
+          <div class="border border-gray-200 rounded p-3 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">今すぐ保存 <span class="ml-1 font-mono text-[10px] bg-gray-100 border border-gray-300 rounded px-1 py-0.5 text-gray-600">Ctrl + S</span></div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                現在の状態をこのブラウザへ書き込みます。<span class="font-medium">変更のあった表だけ</span>を書き直すので、
+                表が増えても待たされません。自動保存があるので普段は不要ですが、タブを閉じる直前など
+                確実に書いておきたいときに押してください。
+              </p>
+            </div>
+            <button id="saveIdbBtn" class="shrink-0 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">保存</button>
+          </div>
+
+          <div class="border border-gray-200 rounded p-3 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">保存した状態を読み込む</div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                このブラウザに保存済みの内容で、<span class="font-medium">今の内容を置き換えます</span>。
+                編集を捨てて最後に保存した地点へ戻したいとき、または別のタブが行った更新を取り込むときに使います。
+              </p>
+            </div>
+            <button id="loadIdbBtn" class="shrink-0 bg-white hover:bg-gray-100 border border-gray-300 text-gray-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">読み込む</button>
+          </div>
+
+          <div class="border border-red-200 rounded p-3 flex items-center justify-between gap-3 bg-red-50/40">
+            <div>
+              <div class="text-sm font-semibold text-red-800">保存データを消して初期状態に戻す</div>
+              <p class="text-xs text-red-700/80 leading-relaxed mt-0.5">
+                このブラウザの保存データを削除し、サンプルデータだけの初期状態から作り直します。
+                <span class="font-medium">元に戻せません</span>。押すと確認画面が出ます。
+                残しておきたいものがあるなら、先に <span class="font-medium">ファイル</span> か <span class="font-medium">書き出し</span> で外へ出してください。
+              </p>
+            </div>
+            <button id="clearIdbBtn" class="shrink-0 bg-red-50 hover:bg-red-100 border border-red-300 text-red-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">初期化</button>
+          </div>
+        </div>
+
+        <!-- ============================================================
+             ファイル（File System Access API）
+             ============================================================ -->
+        <div id="dataPaneFile" class="dataPane hidden flex-col gap-3">
+          <div class="rounded border border-gray-200 bg-gray-50 p-3">
+            <p class="text-xs text-gray-600 leading-relaxed">
+              データベース全体を <code class="bg-white border border-gray-200 px-1 rounded">.luminadb</code> ファイルとしてディスクに置きます。
+              普通のアプリと同じ<span class="font-medium">「開く → 編集 → 上書き保存」</span>で、
+              別の端末へ持ち出す・世代のバックアップを取る・チームで共有するといった扱いができます。
+            </p>
+            <p class="text-xs text-gray-500 leading-relaxed mt-1.5">
+              中身は表・ビュー・トリガーなどを含む復元用のテキストです。SQL として読みたいだけなら
+              <span class="font-medium">書き出し</span> タブの SQL ダンプを使ってください。
+            </p>
+          </div>
+
+          <div id="openFileName" data-i18n-skip class="text-[11px] text-gray-500 border border-gray-200 rounded px-3 py-2"></div>
+          <div id="fileApiNote" data-i18n-skip class="hidden text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-3 py-2"></div>
+
+          <div class="border border-gray-200 rounded p-3 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">ファイルを開く</div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                保存済みの <code class="bg-gray-100 px-1 rounded">.luminadb</code> を読み込み、
+                <span class="font-medium">今の内容を置き換えます</span>。以後この画面の「上書き保存」はそのファイルへ書きます。
+              </p>
+            </div>
+            <button id="fileOpenBtn" class="shrink-0 bg-white hover:bg-gray-100 border border-gray-300 text-gray-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">開く</button>
+          </div>
+
+          <div class="border border-gray-200 rounded p-3 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">上書き保存 <span class="ml-1 font-mono text-[10px] bg-gray-100 border border-gray-300 rounded px-1 py-0.5 text-gray-600">Ctrl + Shift + S</span></div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                いま開いているファイルへ書き戻します。<span class="font-medium">ファイルを開くか一度「名前を付けて保存」するまでは押せません</span>
+                （どのファイルへ書くのかが決まらないため）。
+              </p>
+            </div>
+            <button id="fileSaveBtn" class="shrink-0 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm disabled:opacity-40 disabled:bg-gray-300 disabled:text-gray-600" disabled>上書き保存</button>
+          </div>
+
+          <div class="border border-gray-200 rounded p-3 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">名前を付けて保存</div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                保存先を選んで新しいファイルを作ります。日付を付けた世代バックアップを残すときにも使えます。
+              </p>
+            </div>
+            <button id="fileSaveAsBtn" class="shrink-0 bg-white hover:bg-gray-100 border border-gray-300 text-gray-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">名前を付けて保存</button>
+          </div>
+        </div>
+
+        <!-- 書き出し -->
+        <div id="dataPaneExport" class="dataPane hidden flex-col gap-3">
+          <div class="border border-gray-200 rounded p-3 flex flex-col gap-2">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <div class="text-sm font-semibold text-gray-800">SQL ダンプ (.sql)</div>
+                <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                  全テーブルの <code class="bg-gray-100 px-1 rounded">CREATE TABLE</code> と
+                  <code class="bg-gray-100 px-1 rounded">INSERT</code> を 1 つのテキストにします。
+                  別のブラウザや別の DB へ移すとき、または変更をファイルとして残すときに使います。
+                </p>
+              </div>
+              <button id="exportSqlBtn" class="shrink-0 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">書き出す</button>
+            </div>
+            <div id="exportSqlInfo" data-i18n-skip class="text-[11px] text-gray-400"></div>
+          </div>
+
+          <div class="border border-gray-200 rounded p-3 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">JSON (.json)</div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                全テーブルを <code class="bg-gray-100 px-1 rounded">{ 表名: [行, ...] }</code> の形で書き出します。
+                他のツールやスクリプトへ渡すとき向けです。結果セットだけが要るなら、結果ツールバーの
+                <span class="font-medium">Export JSON</span> を使ってください。
+              </p>
+            </div>
+            <button id="exportJsonAllBtn" class="shrink-0 bg-white hover:bg-gray-100 border border-gray-300 text-gray-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">書き出す</button>
+          </div>
+        </div>
+
+        <!-- 読み込み -->
+        <div id="dataPaneImport" class="dataPane hidden flex-col gap-3">
+          <div id="dataDropZone" class="border-2 border-dashed border-gray-300 rounded p-4 text-center text-xs text-gray-500 transition-colors">
+            ここに <span class="font-medium">.sql</span> / <span class="font-medium">.csv</span> ファイルをドラッグ&amp;ドロップしても読み込めます
+          </div>
+
+          <div class="border border-gray-200 rounded p-3 flex flex-col gap-2">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <div class="text-sm font-semibold text-gray-800">SQL ファイル (.sql)</div>
+                <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                  ファイル内の SQL を <code class="bg-gray-100 px-1 rounded">;</code> で区切って上から順に実行します。
+                  書き出した SQL ダンプを戻すときに使います。<span class="font-medium">失敗した文はエラー内容ごと下に表示します</span>。
+                </p>
+              </div>
+              <button id="importSqlBtn" class="shrink-0 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">ファイルを選ぶ</button>
+            </div>
+          </div>
+
+          <div class="border border-gray-200 rounded p-3 flex flex-col gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">CSV ファイル (.csv)</div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                1 行目をヘッダーとして読み、行を取り込みます。引用符の中のカンマ・改行にも対応します。
+                取り込み先に <span class="font-medium">「新しい表を作る」</span>を選ぶと、ヘッダーから列を作り型を推定します。
+              </p>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div class="flex flex-col gap-1">
+                <label class="text-xs text-gray-600 font-medium" for="csvTableSelect">取り込み先</label>
+                <select id="csvTableSelect" data-i18n-skip class="bg-gray-50 border border-gray-300 text-gray-800 text-sm rounded px-3 py-2 w-full focus:border-blue-500 outline-none cursor-pointer"></select>
+              </div>
+              <div class="flex flex-col gap-1">
+                <label class="text-xs text-gray-600 font-medium" for="csvFileInput">CSV ファイル</label>
+                <input type="file" id="csvFileInput" accept=".csv,.txt" class="text-sm text-gray-600 file:mr-3 file:py-1.5 file:px-3 file:rounded file:border-0 file:text-xs file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer">
+              </div>
+            </div>
+            <div id="csvNewTableRow" class="hidden flex-col gap-1">
+              <label class="text-xs text-gray-600 font-medium" for="csvNewTableName">新しい表の名前</label>
+              <input id="csvNewTableName" type="text" autocomplete="off" placeholder="例: sales_2026" class="bg-gray-50 border border-gray-300 text-gray-800 text-sm rounded px-3 py-2 w-full outline-none focus:border-blue-500">
+            </div>
+            <label class="flex items-center gap-2 text-xs text-gray-600">
+              <input id="csvReplaceChk" type="checkbox" class="rounded border-gray-300">
+              取り込む前に既存の行を削除する
+            </label>
+            <div class="flex justify-end">
+              <button id="execCsvImportBtn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">取り込む</button>
+            </div>
+          </div>
+
+          <!-- 取り込み結果（成功件数・失敗した文の内容）。従来は件数しか出さず、
+               失敗した文が何だったのか判らなかった -->
+          <div id="dataImportLog" data-i18n-skip class="hidden text-xs border border-gray-200 rounded p-3 max-h-40 overflow-y-auto font-mono"></div>
+        </div>
+
+        <!-- テストデータ -->
+        <div id="dataPaneGen" class="dataPane hidden flex-col gap-3">
+          <div class="border border-gray-200 rounded p-3 flex flex-col gap-3">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">ダミー行の生成</div>
+              <p class="text-xs text-gray-500 leading-relaxed mt-0.5">
+                選んだ表の列構成に合わせてダミー行を追加します。件数を増やして、
+                索引の効き方や描画の速さを試すのに使います（10 万行まで）。
+              </p>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div class="flex flex-col gap-1">
+                <label class="text-xs text-gray-600 font-medium" for="genTableSelect">対象の表</label>
+                <select id="genTableSelect" data-i18n-skip class="bg-gray-50 border border-gray-300 text-gray-800 text-sm rounded px-3 py-2 w-full focus:border-blue-500 outline-none cursor-pointer"></select>
+              </div>
+              <div class="flex flex-col gap-1">
+                <label class="text-xs text-gray-600 font-medium" for="genRowCount">行数</label>
+                <input type="number" id="genRowCount" value="10000" min="1" max="100000" class="bg-gray-50 border border-gray-300 text-gray-800 text-sm rounded px-3 py-2 w-full outline-none focus:border-blue-500">
+              </div>
+            </div>
+            <div class="flex justify-end">
+              <button id="generateBtn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">行を追加</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- モーダル: クエリ履歴（検索して読み込み / 実行できる） -->
+  <!-- ============================================================================ -->
+  <div id="historyModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+    <div class="absolute inset-0 bg-gray-900/40 backdrop-blur-sm closeModalBg cursor-pointer"></div>
+    <div class="relative bg-white border border-gray-200 rounded-lg shadow-2xl w-full max-w-3xl p-6 m-4 flex flex-col gap-3 max-h-[85vh]">
+      <div class="flex justify-between items-center border-b border-gray-100 pb-3 shrink-0">
+        <h2 class="text-lg font-bold text-gray-800">Query History <span id="historyCount" class="text-sm font-normal text-gray-400"></span></h2>
+        <button class="closeModalBtn text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">✕</button>
+      </div>
+      <div class="relative shrink-0">
+        <svg class="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+        <input id="historySearch" type="text" autocomplete="off" placeholder="履歴を検索" class="w-full bg-gray-50 border border-gray-300 text-gray-800 text-sm rounded pl-9 pr-3 py-2 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500">
+      </div>
+      <div id="historyList" data-i18n-skip class="overflow-y-auto flex-1 divide-y divide-gray-100 min-h-[8rem]"></div>
+      <div class="pt-2 flex justify-between items-center border-t border-gray-100 shrink-0">
+        <button id="historyClearBtn" class="text-red-600 hover:text-red-800 text-xs border border-red-200 bg-red-50 hover:bg-red-100 px-3 py-1.5 rounded transition-colors">履歴を消去</button>
+        <span class="text-xs text-gray-400">クリックでエディタへ読み込み · Run で即実行</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- モーダル: 列プロファイル（テーブルの中身を列ごとに要約する） -->
+  <!-- ============================================================================ -->
+  <div id="profileModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+    <div class="absolute inset-0 bg-gray-900/40 backdrop-blur-sm closeModalBg cursor-pointer"></div>
+    <div class="relative bg-white border border-gray-200 rounded-lg shadow-2xl w-full max-w-5xl p-6 m-4 flex flex-col gap-3 max-h-[85vh]">
+      <div class="flex justify-between items-center border-b border-gray-100 pb-3 shrink-0">
+        <h2 class="text-lg font-bold text-gray-800">Column Profile: <span id="profileTable" class="text-blue-600 font-mono text-base"></span>
+          <span id="profileRows" class="text-sm font-normal text-gray-400"></span></h2>
+        <button class="closeModalBtn text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">✕</button>
+      </div>
+      <div id="profileBody" data-i18n-skip class="overflow-auto flex-1 min-h-[8rem]"></div>
+      <div class="pt-2 flex justify-between items-center border-t border-gray-100 shrink-0 text-xs text-gray-400">
+        <span>列名クリックでその列の分布クエリをエディタへ</span>
+        <span id="profileNote"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- モーダル: ER 図（外部キーの関係を俯瞰する） -->
+  <!-- ============================================================================ -->
+  <div id="erModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+    <div class="absolute inset-0 bg-gray-900/40 backdrop-blur-sm closeModalBg cursor-pointer"></div>
+    <div class="relative bg-white border border-gray-200 rounded-lg shadow-2xl w-full max-w-6xl p-6 m-4 flex flex-col gap-3 max-h-[90vh]">
+      <div class="flex justify-between items-center border-b border-gray-100 pb-3 shrink-0">
+        <h2 class="text-lg font-bold text-gray-800">Schema Diagram <span id="erCount" class="text-sm font-normal text-gray-400"></span></h2>
+        <div class="flex items-center gap-2">
+          <button id="erCopyBtn" class="text-gray-500 hover:text-gray-800 text-xs border border-gray-300 bg-white hover:bg-gray-50 px-2.5 py-1 rounded shadow-sm transition-colors" title="SVG をクリップボードへコピー">Copy SVG</button>
+          <button class="closeModalBtn text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">✕</button>
+        </div>
+      </div>
+      <div id="erBody" data-i18n-skip class="overflow-auto flex-1 bg-gray-50 rounded border border-gray-200 min-h-[12rem]"></div>
+      <div class="pt-2 flex justify-between items-center border-t border-gray-100 shrink-0 text-xs text-gray-400">
+        <span>実線＝外部キー（子 → 親）· 表クリックで SELECT をエディタへ</span>
+        <span id="erNote"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- モーダル: キーボードショートカット一覧 -->
+  <!-- ============================================================================ -->
+  <div id="shortcutModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+    <div class="absolute inset-0 bg-gray-900/40 backdrop-blur-sm closeModalBg cursor-pointer"></div>
+    <div class="relative bg-white border border-gray-200 rounded-lg shadow-2xl w-full max-w-lg p-6 m-4 flex flex-col gap-4 max-h-[85vh]">
+      <div class="flex justify-between items-center border-b border-gray-100 pb-3 shrink-0">
+        <h2 class="text-lg font-bold text-gray-800">Keyboard Shortcuts</h2>
+        <button class="closeModalBtn text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">✕</button>
+      </div>
+      <dl class="overflow-y-auto text-sm divide-y divide-gray-100">
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">カーソル位置の文だけ実行</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Enter</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">エディタ全体を実行</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Shift + Enter</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">SQL を整形</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Shift + F</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">クエリ履歴を遡る / 進む</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + ↑ / ↓</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">新しいエディタタブ</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Alt + T</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">エディタタブを閉じる</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Alt + W</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">n 枚目のエディタタブへ</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Alt + 1 〜 9</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">実行計画を見る（実行しない）</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Shift + E</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">データ画面（保存 / 読み込み / 入出力）</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Shift + D</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">このブラウザへ保存</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + S</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">ファイルへ保存（開いていれば上書き）</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + Shift + S</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">コンソールの開閉</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">Ctrl + `</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">補完の選択 / 確定</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">↑ ↓ / Enter · Tab</kbd></dd></div>
+        <div class="flex justify-between py-2 gap-4"><dt class="text-gray-600">このヘルプ</dt><dd><kbd class="font-mono text-xs bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5">?</kbd></dd></div>
+      </dl>
+      <div class="border-t border-gray-100 pt-3 text-xs text-gray-500 leading-relaxed shrink-0">
+        結果グリッド: セルを<b>クリック</b>で値の詳細、<b>ダブルクリック</b>で直接編集（単一表の SELECT で
+        キー列が結果に含まれる場合のみ）。列見出しのクリックで並び替え。<br>
+        エディタタブ: 名前は SQL から自動で付き、<b>ダブルクリック</b>で任意の名前に変更できる。内容はブラウザに保存される。
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- モーダル: セル値の詳細表示（長いテキスト / JSON をそのまま読むため） -->
+  <!-- ============================================================================ -->
+  <div id="cellModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+    <div class="absolute inset-0 bg-gray-900/40 backdrop-blur-sm closeModalBg cursor-pointer"></div>
+    <div class="relative bg-white border border-gray-200 rounded-lg shadow-2xl w-full max-w-2xl p-6 m-4 flex flex-col gap-3 max-h-[85vh]">
+      <div class="flex justify-between items-center border-b border-gray-100 pb-3 shrink-0">
+        <h2 class="text-lg font-bold text-gray-800">Cell Value: <span id="cellModalCol" class="text-blue-600 font-mono text-base"></span></h2>
+        <button class="closeModalBtn text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">✕</button>
+      </div>
+      <div class="flex items-center gap-3 text-xs text-gray-500 shrink-0">
+        <span>Type: <span id="cellModalType" class="font-mono text-gray-700"></span></span>
+        <span>Length: <span id="cellModalLen" class="font-mono text-gray-700"></span></span>
+        <button id="cellModalPretty" class="hidden ml-auto border border-gray-300 bg-white hover:bg-gray-50 px-2 py-1 rounded shadow-sm transition-colors">JSON整形</button>
+      </div>
+      <pre id="cellModalValue" data-i18n-skip class="flex-1 overflow-auto bg-gray-800 rounded-md p-3 text-xs font-mono text-green-400 whitespace-pre-wrap break-all shadow-inner select-all min-h-[6rem]"></pre>
+      <div class="pt-2 flex justify-end gap-2 border-t border-gray-100 shrink-0">
+        <button id="cellModalCopy" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">Copy</button>
+        <button class="closeModalBtn bg-gray-100 hover:bg-gray-200 text-gray-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- モーダル: データクリア確認 -->
+  <!-- ============================================================================ -->
+  <div id="clearConfirmModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+    <div class="absolute inset-0 bg-gray-900/40 backdrop-blur-sm closeModalBg cursor-pointer"></div>
+    <div class="relative bg-white border border-gray-200 rounded-lg shadow-2xl w-full max-w-sm p-6 m-4 flex flex-col gap-4">
+      <div class="flex justify-between items-center border-b border-gray-100 pb-3">
+        <h2 class="text-lg font-bold text-red-600">Confirm Clear</h2>
+        <button class="closeModalBtn text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">✕</button>
+      </div>
+      <p class="text-sm text-gray-600 leading-relaxed">IndexedDB のデータを完全に削除し、初期状態のデータベースにリセットしますか？この操作は取り消せません。</p>
+      
+      <div class="pt-3 flex justify-end gap-2">
+        <button class="closeModalBtn bg-gray-100 hover:bg-gray-200 text-gray-700 px-4 py-2 rounded text-sm font-medium transition-colors shadow-sm">Cancel</button>
+        <button id="execClearIdbBtn" class="bg-red-600 hover:bg-red-700 text-white px-5 py-2 rounded text-sm font-medium transition-colors shadow-sm">Clear Data</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- コンソール: 画面左下の実行ログ（表示/非表示をトグル可能） -->
+  <!-- ============================================================================ -->
+  <button id="consoleLauncher" class="fixed bottom-4 left-4 z-40 hidden inline-flex items-center gap-2 bg-gray-800 hover:bg-gray-700 text-gray-100 text-xs font-medium pl-3 pr-2.5 py-2 rounded-full shadow-lg border border-gray-700 transition-colors" title="コンソールを開く (Ctrl+`)">
+    <svg class="w-4 h-4 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M4 5h16a1 1 0 011 1v12a1 1 0 01-1 1H4a1 1 0 01-1-1V6a1 1 0 011-1z"></path></svg>
+    Console
+    <span id="consoleBadge" class="bg-gray-700 text-gray-300 text-[10px] px-1.5 py-0.5 rounded-full min-w-[1.25rem] text-center">0</span>
+  </button>
+
+  <div id="consolePanel" class="fixed bottom-4 left-4 z-50 hidden flex flex-col w-[420px] max-w-[calc(100vw-2rem)] h-[45vh] bg-gray-900 border border-gray-700 rounded-lg shadow-2xl overflow-hidden">
+    <div class="flex items-center justify-between px-3 py-2 bg-gray-800 border-b border-gray-700 shrink-0">
+      <div class="flex items-center gap-2 text-gray-200 text-xs font-semibold">
+        <svg class="w-4 h-4 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M4 5h16a1 1 0 011 1v12a1 1 0 01-1 1H4a1 1 0 01-1-1V6a1 1 0 011-1z"></path></svg>
+        Console <span class="text-gray-500 font-normal">(<span id="consoleCount">0</span>)</span>
+      </div>
+      <div class="flex items-center gap-1">
+        <button id="consoleCopyBtn" class="text-gray-400 hover:text-gray-100 text-[11px] px-2 py-1 rounded hover:bg-gray-700 transition-colors" title="ログをコピー">Copy</button>
+        <button id="consoleClearBtn" class="text-gray-400 hover:text-gray-100 text-[11px] px-2 py-1 rounded hover:bg-gray-700 transition-colors">Clear</button>
+        <button id="consoleCloseBtn" class="text-gray-400 hover:text-gray-100 px-2 py-1 rounded hover:bg-gray-700 transition-colors leading-none text-sm" title="閉じる (Ctrl+`)">✕</button>
+      </div>
+    </div>
+    <div id="consoleBody" data-i18n-skip class="flex-1 overflow-y-auto p-3 font-mono text-xs text-gray-300 space-y-0.5"></div>
+  </div>
+
+  <!-- Engine: テーブル構造とSQLエンジン (engine-core が本体、他は prototype 拡張) -->
+  <script src="js/engine/table.js?v=17"></script>
+  <script src="js/engine/engine-core.js?v=51"></script>
+  <script src="js/engine/engine-expression.js?v=54"></script>
+  <script src="js/engine/engine-subquery.js?v=30"></script>
+  <script src="js/engine/engine-select.js?v=55"></script>
+  <script src="js/engine/engine-dml.js?v=35"></script>
+  <script src="js/engine/engine-ddl.js?v=50"></script>
+  <script src="js/engine/engine-transaction.js?v=13"></script>
+  <script src="js/engine/engine-io.js?v=24"></script>
+  <!-- Storage: IndexedDB 永続化 -->
+  <script src="js/storage/idb.js?v=6"></script>
+  <!-- UI: state と i18n を先頭に、描画系 → 入出力系の順で読み込む
+       （i18n の t() は描画時に呼ばれるので、描画系より前に置く必要がある） -->
+  <script src="js/ui/state.js?v=3"></script>
+  <script src="js/ui/i18n.js?v=4"></script>
+  <script src="js/ui/i18n-en.js?v=3"></script>
+  <script src="js/ui/editor.js?v=28"></script>
+  <script src="js/ui/help.js?v=30"></script>
+  <script src="js/ui/modals.js?v=8"></script>
+  <script src="js/ui/schema-editor.js?v=5"></script>
+  <script src="js/ui/results.js?v=10"></script>
+  <script src="js/ui/table-tree.js?v=10"></script>
+  <script src="js/ui/schema-insight.js?v=3"></script>
+  <script src="js/ui/data-io.js?v=11"></script>
+  <script src="js/ui/query-runner.js?v=13"></script>
+  <script src="js/ui/console.js?v=6"></script>
+  <!-- API: 外部クエリ受付 (fetch インターセプト / window.LuminaDB / postMessage) -->
+  <script src="js/api/api.js?v=15"></script>
+  <!-- Tests & Bootstrap -->
+  <script src="js/tests/test-helpers.js?v=2"></script>
+  <script src="js/tests/test-suite-extra.js?v=15"></script>
+  <script src="js/tests/test-suite-features.js?v=5"></script>
+  <script src="js/tests/test-suite-fixes.js?v=3"></script>
+  <script src="js/tests/test-suite-v2.js?v=4"></script>
+  <script src="js/tests/test-suite-v3.js?v=2"></script>
+  <script src="js/tests/test-suite-v4.js?v=2"></script>
+  <script src="js/tests/test-suite-v5.js?v=2"></script>
+  <script src="js/tests/test-suite-v6.js?v=3"></script>
+  <script src="js/tests/test-suite-v7.js?v=3"></script>
+  <script src="js/tests/test-suite-v8.js?v=2"></script>
+  <script src="js/tests/test-suite-v9.js?v=1"></script>
+  <script src="js/tests/test-suite-v10.js?v=2"></script>
+  <script src="js/tests/test-suite-v11.js?v=1"></script>
+  <script src="js/tests/test-suite-v12.js?v=3"></script>
+  <script src="js/tests/test-suite-v13.js?v=5"></script>
+  <script src="js/tests/test-suite-v14.js?v=6"></script>
+  <script src="js/tests/test-suite-v15.js?v=2"></script>
+  <script src="js/tests/test-suite-v16.js?v=3"></script>
+  <script src="js/tests/test-suite-v17.js?v=5"></script>
+  <script src="js/tests/test-suite-v18.js?v=4"></script>
+  <script src="js/tests/test-suite-v19.js?v=3"></script>
+  <script src="js/tests/test-suite-v20.js?v=4"></script>
+  <script src="js/tests/test-suite-v21.js?v=5"></script>
+  <script src="js/tests/test-suite-v22.js?v=3"></script>
+  <script src="js/tests/test-suite-v23.js?v=5"></script>
+  <script src="js/tests/test-suite-v24.js?v=3"></script>
+  <script src="js/tests/test-suite-v25.js?v=4"></script>
+  <script src="js/tests/test-suite-v26.js?v=4"></script>
+  <script src="js/tests/test-suite-v27.js?v=6"></script>
+  <script src="js/tests/test-suite-v28.js?v=4"></script>
+  <script src="js/tests/test-suite-v29.js?v=5"></script>
+  <script src="js/tests/test-suite-v30.js?v=4"></script>
+  <script src="js/tests/test-suite-v31.js?v=4"></script>
+  <script src="js/tests/test-suite-v32.js?v=5"></script>
+  <script src="js/tests/test-suite-v33.js?v=8"></script>
+  <script src="js/tests/test-suite-v34.js?v=3"></script>
+  <script src="js/tests/test-suite-v35.js?v=2"></script>
+  <script src="js/tests/test-suite-v36.js?v=2"></script>
+  <script src="js/tests/test-suite-v37.js?v=2"></script>
+  <script src="js/tests/test-suite-v38.js?v=2"></script>
+  <script src="js/tests/test-suite-v39.js?v=2"></script>
+  <script src="js/tests/test-suite-v40.js?v=2"></script>
+  <script src="js/tests/test-suite-v41.js?v=2"></script>
+  <script src="js/tests/test-suite-v42.js?v=2"></script>
+  <script src="js/tests/test-suite-v43.js?v=2"></script>
+  <script src="js/tests/test-suite-v44.js?v=2"></script>
+  <script src="js/tests/test-suite-v45.js?v=2"></script>
+  <script src="js/tests/test-suite-v46.js?v=2"></script>
+  <script src="js/tests/test-suite-v47.js?v=2"></script>
+  <script src="js/tests/test-suite-v48.js?v=2"></script>
+  <script src="js/tests/test-suite-v49.js?v=2"></script>
+  <script src="js/tests/test-suite-v50.js?v=2"></script>
+  <script src="js/tests/test-suite-v51.js?v=2"></script>
+  <script src="js/tests/test-suite-v52.js?v=2"></script>
+  <script src="js/tests/test-suite-v53.js?v=2"></script>
+  <script src="js/tests/test-suite-v54.js?v=2"></script>
+  <script src="js/tests/test-suite-v55.js?v=2"></script>
+  <script src="js/tests/test-suite-v56.js?v=2"></script>
+  <script src="js/tests/test-suite-v57.js?v=1"></script>
+  <script src="js/tests/test-suite-v58.js?v=1"></script>
+  <script src="js/tests/test-suite-v59.js?v=1"></script>
+  <script src="js/tests/test-suite-v60.js?v=1"></script>
+  <script src="js/tests/test-suite-v61.js?v=1"></script>
+  <script src="js/tests/test-suite-v62.js?v=1"></script>
+  <script src="js/tests/test-suite-v63.js?v=1"></script>
+  <script src="js/tests/test-suite-v64.js?v=2"></script>
+  <script src="js/tests/test-suite-v65.js?v=1"></script>
+  <script src="js/tests/test-suite-v66.js?v=2"></script>
+  <script src="js/tests/test-suite.js?v=55"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>

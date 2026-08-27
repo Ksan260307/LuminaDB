@@ -47,7 +47,129 @@
     // 直前が識別子文字だと my_sum( のような列名を誤検出するため、境界を明示する。
     const AGG_ANYWHERE = new RegExp('(^|[^A-Za-z0-9_.])(' + LUMINA_AGG_NAMES + ')\\s*\\(', 'i');
 
+    // 十進の値を「桁をずらした整数」で足し合わせる。
+    //
+    // SUM は倍精度で素朴に足していたため、DECIMAL(10,2) の列に 0.10 と 0.20 を入れて
+    // SUM を取ると 0.30000000000000004 になり `SUM(price) = 0.30` が偽になっていた
+    // （金額の計算が合わない）。二進小数では 0.1 も 0.2 も表せないのが原因。
+    //
+    // 値はいずれも「小数点以下 d 桁の十進数」として書ける（DECIMAL 列は格納時に
+    // 位取りへ丸めてあり、それ以外も画面や CSV から入る値は有限桁）。そこで
+    // いちばん深い桁 d を値から読み取り、10^d を掛けた整数として足して最後に割る。
+    // 整数の範囲で収まらない・桁が深すぎる場合は倍精度の素朴な和へ戻す
+    // （速さより「答えが変わらないこと」を優先する）。
+    // LUMINA_DEC_PLACES は engine-expression.js（先に読まれる）で定義している。
+    // 同名の const を 2 度宣言すると再宣言エラーになるため、ここでは持たない
+    const LUMINA_EXACT_SUM = (nums) => {
+        let plain = 0;
+        for (let i = 0; i < nums.length; i++) plain += nums[i];
+        let d = 0;
+        for (let i = 0; i < nums.length; i++) {
+            const p = LUMINA_DEC_PLACES(nums[i]);
+            if (p < 0) return plain;                 // Infinity / NaN が混じる
+            if (p > d) d = p;
+        }
+        if (d === 0) return plain;                   // 整数だけなら素朴な和で正確
+        if (d > 12) return plain;                    // 桁が深すぎる（10^d が精度を食う）
+        const f = Math.pow(10, d);
+        let acc = 0;
+        for (let i = 0; i < nums.length; i++) {
+            const scaled = Math.round(nums[i] * f);
+            // 掛けた時点で既に丸めが入っているなら整数化しても正確にならない
+            if (!Number.isSafeInteger(scaled)) return plain;
+            acc += scaled;
+            if (!Number.isSafeInteger(acc)) return plain;
+        }
+        return acc / f;
+    };
+
     Object.assign(DatabaseEngine.prototype, {
+
+      // ORDER BY ... LIMIT n の上位 n 件だけを選ぶ（全体を並べ替えない）。
+      //
+      // 従来は必ず全件を sort してから slice していたので、20 万行から 10 行取る
+      // `ORDER BY amt DESC, id LIMIT 10` が 20 万件ぶんの比較（約 180ms）を払っていた。
+      //
+      // 大きさ k の並んだ配列を持ち回り、満杯の後は「最下位より下なら 1 回の比較で捨てる」
+      // だけにする。比較回数は最悪でも O(N log k)、実データでは大半が 1 回で終わる。
+      //
+      // 並びは「安定ソートして先頭 k 件を取ったもの」と一致させる必要がある。
+      // 同値は既存要素の**後ろ**へ入れ（upper bound へ挿入）、満杯時に最下位と同値なら
+      // 採らない（安定ソートならその行は後ろに回るので上位 k に入らない）
+      _topNRows(rows, cmp, k) {
+          if (k <= 0) return [];        // LIMIT 0。下の out[k-1] が undefined になるため先に返す
+          const out = [];
+          const upper = (row, hi) => {
+              let lo = 0;
+              while (lo < hi) {
+                  const mid = (lo + hi) >> 1;
+                  if (cmp(row, out[mid]) < 0) hi = mid; else lo = mid + 1;
+              }
+              return lo;
+          };
+          for (let i = 0; i < rows.length; i++) {
+              const row = rows[i];
+              if (out.length < k) {
+                  out.splice(upper(row, out.length), 0, row);
+              } else if (cmp(row, out[k - 1]) < 0) {
+                  out.splice(upper(row, k - 1), 0, row);
+                  out.pop();
+              }
+          }
+          return out;
+      },
+
+      // 結合キー 1 個ぶんの「照合候補キー」を列挙する（複合キーのハッシュ結合用）。
+      //
+      // 満たすべき性質はただ一つ: __eq(a, b) が真なら keysOf(a) と keysOf(b) が
+      // 必ず 1 個以上のキーを共有すること。これが成り立つ限り、ハッシュは
+      // 「候補を絞る網」として使えて真の一致を取り落とさない。逆にキーが衝突して
+      // 余計な候補が出るのは構わない（呼び出し側が ON 式そのもので検算するため）。
+      //
+      // __eq は __cpair で型を寄せる（数値らしい文字列と数値が一致する / 日付らしい
+      // 文字列は時刻値で一致する）。だから値が数値にも日付にも読めるとき（'20260101'）は
+      // 両方のキーを出す。生値だけを鍵にすると、この手の行が黙って結合から漏れる
+      _joinKeysOf(v) {
+          if (v === null || v === undefined) return null;   // NULL は等価結合に参加しない
+          const keys = ['s:' + String(v)];                  // 同型どうしの生比較用
+          // 数値への寄せ（__cpair の numOf と同じ規則）
+          let n = NaN;
+          if (typeof v === 'number') n = v;
+          else if (typeof v === 'boolean') n = v ? 1 : 0;
+          else if (typeof v === 'string') {
+              const t = v.trim();
+              if (t !== '') { const x = Number(t); if (isFinite(x)) n = x; }
+          }
+          if (!isNaN(n)) keys.push('n:' + n);
+          // 日付への寄せ（__cpair の __dnum 経路）。列は日付を文字列で返すので
+          // 見るのは文字列だけでよい。
+          //
+          // ここで Date.parse を頼れないことに注意: '2026-01-01' は UTC 深夜、
+          // '2026-01-01 00:00:00' は現地深夜として解釈され、同じ瞬間を指す 2 つの
+          // 綴りが別の数になる。__eq 側（__date_parse）がどちらの流儀でも
+          // 取り落とさないよう、UTC 解釈と現地解釈の両方をキーに出す
+          if (typeof v === 'string') {
+              const m = v.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(Z?))?$/);
+              if (m) {
+                  const y = +m[1], mo = +m[2] - 1, d = +m[3];
+                  const hh = +(m[4] || 0), mi = +(m[5] || 0), ss = +(m[6] || 0);
+                  keys.push('n:' + Date.UTC(y, mo, d, hh, mi, ss));
+                  keys.push('n:' + new Date(y, mo, d, hh, mi, ss).getTime());
+              }
+          }
+          return keys.length === 1 ? keys : [...new Set(keys)];
+      },
+
+      // 複数列ぶんの候補キーの直積を組む。1 列 1 キーの普通の場合は 1 本しか返らない
+      _joinKeyCombos(valueKeys) {
+          let combos = [''];
+          for (const keys of valueKeys) {
+              const next = [];
+              for (const c of combos) for (const k of keys) next.push(c + '\0' + k);
+              combos = next;
+          }
+          return combos;
+      },
 
       // 集計関数呼び出し 1 件を compiledSelects 用の記述子へ変換する
       // （SELECT 句 / HAVING / ORDER BY の集計書き換えで共用）
@@ -958,6 +1080,10 @@
           let indexScanCol = null;
           let indexValStr = null;
           let indexValList = null;   // col IN (...) を索引で引くときの値リスト
+          // 範囲検索を索引で引くときの両端: { lowV, lowInc, highV, highInc }
+          let indexRange = null;
+          // 全文検索の転置索引で絞り込んだ候補行（null なら使っていない）
+          let ftRows = null;
           let residualWhere = whereStr;
 
           let aliases = { [fromTable]: fromTable, [baseAlias]: fromTable };
@@ -1001,6 +1127,178 @@
                       }
                   }
               }
+              // WHERE 全体がちょうど 1 個の等価（または IN）でないと、上の 2 つは
+              // どちらも当たらず全表走査に落ちていた。`WHERE id = 4242 AND g = 42` の
+              // ように主キー 1 本で 1 行に絞れる問い合わせが 5 万行を舐めていた。
+              //
+              // 深さ 0 の AND で分解して、索引のある等価の連言を 1 つ選んで索引で引く。
+              // ここが上の 2 経路と違うのは residualWhere を null にしない点:
+              // 索引は候補を絞る網としてだけ使い、WHERE は元の形のまま候補に対して
+              // 評価する。こうすると全表走査と同じ述語が同じように適用されるので、
+              // 索引を使ったせいで答えが変わることがない（絞る行数だけが変わる）
+              if (!isIndexScan) {
+                  const conj = this._splitTopLevelAnd(whereStr);   // 深さ 0 の OR があれば [] が返る
+                  // 連言が 1 つだけでもここへ来る（`WHERE id > 100` のような単独の範囲）。
+                  // 単独の等価は上の 2 経路で既に決まっているので、ここには落ちてこない
+                  if (conj.length >= 1) {
+                      const cands = [];
+                      for (const c of conj) {
+                          const m = c.match(/^\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$/)
+                                 || c.match(/^\s*([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$/);
+                          if (!m) continue;
+                          const cCol = (m.length === 4 ? m[2] : m[1]).toLowerCase();
+                          const cAlias = m.length === 4 ? m[1].toLowerCase() : null;
+                          const cVal = (m.length === 4 ? m[3] : m[2]).trim();
+                          if (!/^(?:__STR_\d+__|null|true|false|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)$/i.test(cVal)) continue;
+                          if (collated(cCol)) continue;
+                          if (cAlias && cAlias !== baseAlias && cAlias !== fromTable) continue;
+                          if (!baseTbl.indices[cCol]) continue;
+                          cands.push({ col: cCol, val: cVal });
+                      }
+                      // 全文検索を転置索引で引けないか見る。
+                      //
+                      // MATCH ... AGAINST は行ごとに本文を語へ切って走査する関数なので、
+                      // 表が大きいほど正比例して遅くなっていた。CREATE FULLTEXT INDEX が
+                      // 張ってあれば、語 -> 行の対応から候補行だけを取り出せる。
+                      //
+                      // 索引は候補を絞る網としてだけ使い、判定は MATCH 式そのもので行う
+                      // （residualWhere を残す）。だから索引側は「取りこぼさない」ことだけ
+                      // 満たせばよく、余分に拾うのは構わない:
+                      //   - 語句 "a b" は全語を含む行の積（隣接判定は検算側）
+                      //   - 前方一致 `語*` はその接頭辞を持つ全語の和
+                      //   - 除外 `-語` は候補を狭めない（検算側で落ちる）
+                      // 正の語が 1 つも無い問い合わせ（全部 `-`）は候補を作れないので使わない
+                      if (cands.length === 0 && !indexRange) {
+                          for (const c of conj) {
+                              const fm = c.match(/^\s*MATCH\s*\(([^()]+)\)\s*AGAINST\s*\(\s*(__STR_\d+__)\s*(?:IN\s+([A-Za-z ]+?)\s+MODE\s*)?\)\s*$/i);
+                              if (!fm) continue;
+                              const mCols = fm[1].split(',').map(x => x.trim().replace(/^[a-zA-Z0-9_]+\./, '').toLowerCase());
+                              const sm = fm[2].match(/^__STR_(\d+)__$/);
+                              if (!sm || !strMap || strMap[Number(sm[1])] === undefined) continue;
+                              const qText = this._unquoteLiteral(strMap[Number(sm[1])]);
+                              // MATCH の列とちょうど同じ組み合わせの索引だけを使う（MySQL と同じ規則）
+                              let ftCols = null;
+                              for (const nm in (baseTbl.ftIndexes || {})) {
+                                  const ic = baseTbl.ftIndexes[nm].cols;
+                                  if (ic.length === mCols.length && ic.every(x => mCols.includes(x))) { ftCols = ic; break; }
+                              }
+                              if (!ftCols) continue;
+                              const parsedFt = LUMINA_FT_PARSE(qText, fm[3] || '');
+                              const positive = parsedFt.terms.filter(x => x.sign !== '-');
+                              if (positive.length === 0) continue;
+                              const postings = baseTbl.ftPostings(ftCols);
+                              const cand = new Set();
+                              let usable = true;
+                              for (const term of positive) {
+                                  let rows = null;
+                                  const toks = term.toks;
+                                  for (let ti = 0; ti < toks.length; ti++) {
+                                      const isLast = ti === toks.length - 1;
+                                      let got;
+                                      if (term.prefix && isLast) {
+                                          got = new Set();
+                                          for (const k of postings.keys()) {
+                                              if (k.startsWith(toks[ti])) for (const r of postings.get(k)) got.add(r);
+                                          }
+                                      } else {
+                                          got = new Set(postings.get(toks[ti]) || []);
+                                      }
+                                      rows = rows === null ? got : new Set([...rows].filter(r => got.has(r)));
+                                      if (rows.size === 0) break;
+                                  }
+                                  if (rows === null) { usable = false; break; }
+                                  for (const r of rows) cand.add(r);
+                              }
+                              if (!usable) continue;
+                              ftRows = [...cand].sort((a, b) => a - b);   // 行順は表の物理順へ戻す
+                              residualWhere = whereStr;                   // MATCH 式そのもので検算する
+                              break;
+                          }
+                      }
+
+                      // 等価が無ければ範囲（>, >=, <, <=, BETWEEN）を索引で引けないか見る。
+                      // ハッシュ索引に並べたキーを持たせたので、両端を二分探索で求めて
+                      // その区間のキーだけを引けば済む（従来はここが全表走査だった）
+                      if (cands.length === 0) {
+                          let rCol = null, lowV = null, lowInc = false, highV = null, highInc = false;
+                          const litOf = (txt) => {
+                              const s = txt.trim();
+                              if (/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(s)) return Number(s);
+                              const sm = s.match(/^__STR_(\d+)__$/);
+                              if (sm && strMap && strMap[Number(sm[1])] !== undefined) return this._unquoteLiteral(strMap[Number(sm[1])]);
+                              return undefined;
+                          };
+                          for (const c of conj) {
+                              const bm = c.match(/^\s*(?:([a-zA-Z0-9_]+)\.)?([a-zA-Z0-9_]+)\s+BETWEEN\s+(.+?)\s+AND\s+(.+?)\s*$/i);
+                              const cm = bm ? null : c.match(/^\s*(?:([a-zA-Z0-9_]+)\.)?([a-zA-Z0-9_]+)\s*(>=|<=|>|<)\s*(.+?)\s*$/);
+                              const m = bm || cm;
+                              if (!m) continue;
+                              const cCol = m[2].toLowerCase();
+                              const cAlias = m[1] ? m[1].toLowerCase() : null;
+                              if (cAlias && cAlias !== baseAlias && cAlias !== fromTable) continue;
+                              if (collated(cCol) || !baseTbl.indices[cCol]) continue;
+                              if (rCol !== null && rCol !== cCol) continue;
+                              if (bm) {
+                                  const a = litOf(bm[3]), b = litOf(bm[4]);
+                                  if (a === undefined || b === undefined) continue;
+                                  rCol = cCol; lowV = a; lowInc = true; highV = b; highInc = true;
+                              } else {
+                                  const v = litOf(cm[4]);
+                                  if (v === undefined) continue;
+                                  rCol = cCol;
+                                  if (cm[3][0] === '>') { lowV = v; lowInc = cm[3] === '>='; }
+                                  else { highV = v; highInc = cm[3] === '<='; }
+                              }
+                          }
+                          if (rCol !== null && (lowV !== null || highV !== null)) {
+                              const sorted = baseTbl.sortedIndexKeys(rCol);
+                              if (sorted && sorted.length > 0 && typeof sorted[0] === typeof (lowV !== null ? lowV : highV)) {
+                                  // 両端の位置をここで確定させる。区間の広さが判るので、
+                                  // 「索引で引くほうが高い」ケースを先に弾ける
+                                  let from = 0, to = sorted.length;
+                                  if (lowV !== null) {
+                                      from = Table.lowerBound(sorted, lowV);
+                                      if (!lowInc) while (from < sorted.length && sorted[from] === lowV) from++;
+                                  }
+                                  if (highV !== null) {
+                                      to = Table.lowerBound(sorted, highV);
+                                      if (highInc) while (to < sorted.length && sorted[to] === highV) to++;
+                                  }
+                                  if (to < from) to = from;
+                                  // 索引経路はキー 1 個ごとに Map を引いて行番号の配列を継ぐので、
+                                  // 区間が広いと素直に 1 回走査するほうが速い。実測では表の半分を
+                                  // 拾う `id > 100000` が索引 43.7ms / 全表走査 13.6ms だった。
+                                  // 相異なりキーの 1/4 を超えたら全表走査に任せる
+                                  if ((to - from) <= sorted.length * 0.25) {
+                                      isIndexScan = true;
+                                      indexScanCol = rCol;
+                                      indexValStr = null;
+                                      indexRange = { from, to };
+                                      residualWhere = whereStr;   // 元の WHERE で検算する
+                                  }
+                              }
+                          }
+                      }
+                      if (cands.length > 0) {
+                          // 索引が複数あるなら、いちばん細かく割れているものを選ぶ。
+                          // 統計は持っていないので、主キー / UNIQUE を最優先し、あとは
+                          // 相異なりキー数（Map の大きさ）を選択率の代わりに使う
+                          const uniq = new Set([
+                              ...(baseTbl.primaryKey ? [String(baseTbl.primaryKey).toLowerCase()] : []),
+                              ...((baseTbl.uniqueCols || []).map(c => String(c).toLowerCase()))
+                          ]);
+                          cands.sort((a, b) => {
+                              const ua = uniq.has(a.col) ? 1 : 0, ub = uniq.has(b.col) ? 1 : 0;
+                              if (ua !== ub) return ub - ua;
+                              return (baseTbl.indices[b.col].size || 0) - (baseTbl.indices[a.col].size || 0);
+                          });
+                          isIndexScan = true;
+                          indexScanCol = cands[0].col;
+                          indexValStr = cands[0].val;
+                          residualWhere = whereStr;      // 元の WHERE で検算する
+                      }
+                  }
+              }
           }
 
           let explainPlan = [];
@@ -1040,14 +1338,21 @@
           };
           if (isExplain) {
               if (isIndexScan) {
-                  // 索引一致は等価なので、平均バケット長 × 引く値の数で見積る
+                  // 索引で何行に絞れるかを見積る。等価なら「平均バケット長 × 引く値の数」、
+                  // 範囲なら「区間に入るキー数 × 平均バケット長」。範囲を等価扱いで
+                  // 1 キー分と見積ると、後段の FILTER と掛け合わさって 0 行になっていた
                   const idx = this.tables[fromTable] && this.tables[fromTable].indices[indexScanCol];
                   const buckets = idx ? idx.size : 0;
                   const avg = buckets > 0 ? exRows / buckets : 1;
-                  const n = indexValList ? indexValList.length : 1;
+                  const n = indexRange ? Math.max(0, indexRange.to - indexRange.from)
+                          : (indexValList ? indexValList.length : 1);
                   exPush('INDEX SCAN',
-                      `Index ${indexValList ? `lookup of ${indexValList.length} value(s)` : 'scan'} on '${fromTable}(${indexScanCol})'`,
-                      Math.min(exRows, Math.max(1, avg * n)));
+                      `Index ${indexRange ? `range over ${n} key(s)` : indexValList ? `lookup of ${indexValList.length} value(s)` : 'scan'} on '${fromTable}(${indexScanCol})'`,
+                      Math.min(exRows, Math.max(n > 0 ? 1 : 0, avg * n)));
+              } else if (ftRows) {
+                  exPush('FULLTEXT INDEX SCAN',
+                      `Fulltext index on '${fromTable}' narrowed to ${ftRows.length} candidate row(s)`,
+                      ftRows.length);
               } else {
                   exPush('TABLE SCAN', `Full scan on ${exName(fromTable)}`, exRows);
               }
@@ -1089,6 +1394,9 @@
 
               let isHashJoin = false;
               let leftAliasMatch, leftColMatch, rightAliasMatch, rightColMatch;
+              // 複合キーのハッシュ結合。[{leftAlias, leftCol, rightCol}, ...] と、
+              // キーに出来なかった残りの条件（`x.id < y.id` など）
+              let hashKeys = null, hashResidual = null;
 
               const eqMatch = join.onCond.match(/^\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*=\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*$/);
               if (eqMatch) {
@@ -1117,8 +1425,61 @@
                   if (isHashJoin && (collAt(leftAliasMatch, leftColMatch) || collAt(rightAliasMatch, rightColMatch))) isHashJoin = false;
               }
 
+              // ON が「ちょうど 1 個の a.x = b.y」でないとき（複合キー・等価 + 範囲）は
+              // 従来すべて入れ子ループへ落ちていた。正規化されたスキーマで最も普通に
+              // 書かれる複合主キーの結合が 30,000 x 3,000 行で 16 秒かかっていたのはこれが原因。
+              // 深さ 0 の AND で分解し、等価な連言をハッシュキーに、残りを検算条件に回す。
+              //
+              // 単一等価の場合は上の分岐が既に決めているので触らない（既存の索引利用と
+              // エラー文言をそのまま保つため）
+              if (!isHashJoin) {
+                  const conj = this._splitTopLevelAnd(join.onCond);   // 深さ 0 の OR があれば [] が返る
+                  if (conj.length > 1) {
+                      const collAt2 = (al, c) => {
+                          const t = this.tables[aliases[al]];
+                          return !!(t && t.collations && t.collations[c]);
+                      };
+                      const colAt2 = (al, c) => {
+                          const t = this.tables[aliases[al]];
+                          return !!(t && t.cols && t.cols[c]);
+                      };
+                      const keys = [], rest = [];
+                      for (const c of conj) {
+                          const em = c.match(/^\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*=\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*$/);
+                          if (!em) { rest.push(c); continue; }
+                          const a1 = em[1].toLowerCase(), c1 = em[2].toLowerCase();
+                          const a2 = em[3].toLowerCase(), c2 = em[4].toLowerCase();
+                          // 片側がこの結合で加わる表、もう片側が既に出ている表のときだけキーになる。
+                          // `y.a = y.b`（右表内の絞り込み）や `x.a = z.b`（既出同士）は検算側へ回す
+                          let lA, lC, rC;
+                          if (a2 === join.alias && aliases[a1] && a1 !== join.alias) { lA = a1; lC = c1; rC = c2; }
+                          else if (a1 === join.alias && aliases[a2] && a2 !== join.alias) { lA = a2; lC = c2; rC = c1; }
+                          else { rest.push(c); continue; }
+                          // 列が無い / 照合順序付き（生値では一致を拾えない）ものはキーにしない。
+                          // 検算は ON 式そのもので行うので、回しても答えは変わらない
+                          if (!colAt2(lA, lC) || !colAt2(join.alias, rC)) { rest.push(c); continue; }
+                          if (collAt2(lA, lC) || collAt2(join.alias, rC)) { rest.push(c); continue; }
+                          keys.push({ leftAlias: lA, leftCol: lC, rightCol: rC });
+                      }
+                      if (keys.length > 0) {
+                          isHashJoin = true;
+                          hashKeys = keys;
+                          hashResidual = rest.length > 0 ? rest.join(' AND ') : null;
+                          // EXPLAIN の見積りと索引判定に使う代表キー
+                          leftAliasMatch = keys[0].leftAlias; leftColMatch = keys[0].leftCol;
+                          rightAliasMatch = join.alias; rightColMatch = keys[0].rightCol;
+                      }
+                  }
+              }
+
               if (isExplain) {
-                  if (isHashJoin) {
+                  if (hashKeys) {
+                      const on = hashKeys.map(k => `${k.leftAlias}.${k.leftCol} = ${join.alias}.${k.rightCol}`).join(' AND ');
+                      exPush('HASH JOIN',
+                          `Build hash on '${join.table}(${hashKeys.map(k => k.rightCol).join(', ')})', probe with ${on}`
+                          + (hashResidual ? `, then verify ${hashResidual}` : ''),
+                          exRows * exJoinFanout(join, rightColMatch));
+                  } else if (isHashJoin) {
                       if (jTbl.indices[rightColMatch]) {
                           exPush('INDEX HASH JOIN', `Join '${join.table}' using index on '${rightColMatch}'`, exRows * exJoinFanout(join, rightColMatch));
                       } else {
@@ -1129,7 +1490,7 @@
                   }
               }
 
-              return { ...join, isHashJoin, leftAliasMatch, leftColMatch, rightAliasMatch, rightColMatch };
+              return { ...join, isHashJoin, leftAliasMatch, leftColMatch, rightAliasMatch, rightColMatch, hashKeys, hashResidual };
           });
 
           if (isExplain) {
@@ -1138,7 +1499,74 @@
               // 押し下げた分と結合後に残る分を分けて出す（実行と同じ判定を使う）
               const exSplit = this._splitPushdownWhere(residualWhere, fromTable, baseAlias, joinPlans);
               if (residualWhere) {
-                  const selOf = (w) => (/[<>]|between/i.test(w) ? 0.33 : 0.1);
+                  // 索引がある列なら見積りを推測で済ませない。
+                  //
+                  // 従来は固定の選択率（等価 0.1 / 範囲 0.33）だけだったので、
+                  // `id > 49990`（実際 10 行）を 16,500 行と見積るなど、EXPLAIN の
+                  // Rows が読む価値のない数字になっていた。索引は相異なりキー数を
+                  // 知っているし、範囲は並べたキーの位置で「何キー分か」が判る。
+                  // 統計を別に集める（ANALYZE）必要はなく、常に最新の実測値が使える
+                  const statSel = (w) => {
+                      const m = w.match(/^\s*(?:([a-zA-Z0-9_]+)\.)?([a-zA-Z0-9_]+)\s*(=|>=|<=|>|<)\s*(.+?)\s*$/)
+                             || w.match(/^\s*(?:([a-zA-Z0-9_]+)\.)?([a-zA-Z0-9_]+)\s+(BETWEEN)\s+(.+?)\s*$/i);
+                      if (!m) return null;
+                      const al = m[1] ? m[1].toLowerCase() : null;
+                      if (al && al !== baseAlias && al !== fromTable) return null;
+                      const col = m[2].toLowerCase();
+                      const idx = baseTbl.indices[col];
+                      if (!idx || idx.size === 0) return null;
+                      if (m[3] === '=') {
+                          // 等価: 平均バケット長 / 全行 = 1 キー分の割合
+                          return 1 / idx.size;
+                      }
+                      const sorted = baseTbl.sortedIndexKeys(col);
+                      if (!sorted || sorted.length === 0) return null;
+                      const lit = (txt) => {
+                          const t2 = String(txt).trim();
+                          if (/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(t2)) return Number(t2);
+                          const sm = t2.match(/^__STR_(\d+)__$/);
+                          if (sm && strMap && strMap[Number(sm[1])] !== undefined) return this._unquoteLiteral(strMap[Number(sm[1])]);
+                          return undefined;
+                      };
+                      if (/^between$/i.test(m[3])) {
+                          const bm = m[4].match(/^(.+?)\s+AND\s+(.+)$/i);
+                          if (!bm) return null;
+                          const a = lit(bm[1]), b = lit(bm[2]);
+                          if (a === undefined || b === undefined || typeof a !== typeof sorted[0]) return null;
+                          const from = Table.lowerBound(sorted, a), to = Table.lowerBound(sorted, b);
+                          return Math.max(0, to - from + 1) / sorted.length;
+                      }
+                      const v = lit(m[4]);
+                      if (v === undefined || typeof v !== typeof sorted[0]) return null;
+                      const at = Table.lowerBound(sorted, v);
+                      const frac = m[3][0] === '>' ? (sorted.length - at) / sorted.length : at / sorted.length;
+                      return Math.min(1, Math.max(0, frac));
+                  };
+                  // 索引経路が既に絞った列の条件は、FILTER 段で二重に掛けない。
+                  // residualWhere には検算のため元の WHERE がそのまま入っているので、
+                  // そのぶんを 1.0 として扱わないと見積りが 0 行に潰れる
+                  const servedCol = isIndexScan ? indexScanCol : null;
+                  const isServed = (p) => {
+                      if (!servedCol) return false;
+                      const m = p.match(/^\s*(?:([a-zA-Z0-9_]+)\.)?([a-zA-Z0-9_]+)\s*(?:=|>=|<=|>|<|\s+BETWEEN\s+|\s+IN\s*\()/i);
+                      return !!m && m[2].toLowerCase() === servedCol;
+                  };
+                  const selOf = (w) => {
+                      // 連言はそれぞれの選択率を掛ける（独立と仮定する）
+                      const parts = this._splitTopLevelAnd(w);
+                      if (parts.length > 0) {
+                          let acc = 1, used = false;
+                          for (const p of parts) {
+                              if (isServed(p)) { used = true; continue; }
+                              const s2 = statSel(p);
+                              if (s2 !== null) { acc *= s2; used = true; }
+                              else acc *= (/[<>]|between/i.test(p) ? 0.33 : 0.1);
+                          }
+                          if (used) return acc;
+                      }
+                      if (isServed(w)) return 1;
+                      return /[<>]|between/i.test(w) ? 0.33 : 0.1;
+                  };
                   if (exSplit.pushed) {
                       // 表示位置は結合の後ろになるが、実際には結合の前に効いている
                       exPush('FILTER (pushed down)', `Apply WHERE ${exSplit.pushed} before the join`, exRows * selOf(exSplit.pushed));
@@ -1173,7 +1601,7 @@
               }
           }
 
-          return { parsed, isIndexScan, indexScanCol, indexValStr, indexValList, residualWhere, aliases, joinPlans, explainPlan, isExplain };
+          return { parsed, isIndexScan, indexScanCol, indexValStr, indexValList, indexRange, ftRows, residualWhere, aliases, joinPlans, explainPlan, isExplain };
       },
 
       // ------------------------------------------------------------------
@@ -1242,7 +1670,7 @@
               return { data: plan.explainPlan, affectedRows: plan.explainPlan.length };
           }
 
-          const { parsed, isIndexScan, indexScanCol, indexValStr, indexValList, residualWhere, aliases, joinPlans } = plan;
+          const { parsed, isIndexScan, indexScanCol, indexValStr, indexValList, indexRange, ftRows, residualWhere, aliases, joinPlans } = plan;
           const { isDistinct, distinctOn, withTies, selectClause, fromTable, baseAlias, groupByStr, havingStr, qualifyStr, orderByStr, limitVal, offsetVal } = parsed;
 
           let rowPtrs = [];
@@ -1280,8 +1708,51 @@
                   }
                   return v;
               };
-              // IN (...) は各値を索引で引いて和集合を取る（行の重複は除く）
-              const keys = (indexValList ? indexValList.map(toVal) : [toVal(indexValStr)]).map(normKey);
+              // IN (...) は各値を索引で引いて和集合を取る（行の重複は除く）。
+              //
+              // 索引は生値をキーに持つのに比較側（__eq）は型を寄せるので、引く値を
+              // 1 個に決めると寄せたぶんを取り落とす。normKey は宣言型の名前を
+              // 数え上げて補正していたが 'INTEGER' と 'FLOAT' しか見ておらず、
+              // **`INT` と書いた列は素通り**していた:
+              //   CREATE TABLE t (g INT); CREATE INDEX ix ON t(g);
+              //   SELECT * FROM t WHERE g = '2'    -- 索引経路で 0 件
+              //   SELECT * FROM t WHERE (g = '2')  -- 全表走査で 2 件
+              // BIGINT / SMALLINT / DECIMAL / REAL なども同じ穴に落ちていた。
+              // 型名を足すのではなく、__eq が同値と見る候補値を全部引いて和集合を取る
+              // （余分に引いても後段の比較で落ちるだけなので、取り落とさない側に倒す）
+              const probeKeys = (v) => {
+                  const out = [normKey(v)];
+                  const add = (x) => { if (!out.some(y => y === x)) out.push(x); };
+                  add(v);
+                  if (typeof v === 'number') {
+                      add(String(v));
+                      if (v === 0) add(false);
+                      if (v === 1) add(true);
+                  } else if (typeof v === 'boolean') {
+                      add(v ? 1 : 0); add(v ? '1' : '0');
+                  } else if (typeof v === 'string') {
+                      const t = v.trim();
+                      if (t !== '') {
+                          const n = Number(t);
+                          if (isFinite(n)) {
+                              add(n);
+                              if (n === 0) add(false);
+                              if (n === 1) add(true);
+                          }
+                      }
+                  }
+                  return out;
+              };
+              const keys = [];
+              if (indexRange) {
+                  // 範囲検索: 両端は計画時に二分探索で確定済み。その区間のキーだけを引く
+                  const sorted = baseTbl.sortedIndexKeys(indexScanCol) || [];
+                  for (let i = indexRange.from; i < indexRange.to && i < sorted.length; i++) keys.push(sorted[i]);
+              } else {
+                  for (const v of (indexValList ? indexValList.map(toVal) : [toVal(indexValStr)])) {
+                      for (const k of probeKeys(v)) keys.push(k);
+                  }
+              }
               const seenRow = keys.length > 1 ? new Set() : null;
               for (const val of keys) {
                   const matchedIndices = baseTbl.indices[indexScanCol].get(val);
@@ -1293,6 +1764,9 @@
               }
               // 索引は挿入順を保つとは限らないので、行順を表の物理順へ戻す
               if (seenRow) rowPtrs.sort((a, b) => a[fromTable] - b[fromTable]);
+          } else if (ftRows) {
+              // 転置索引が出した候補行だけを並べる（判定は後段の WHERE がやる）
+              for (const i of ftRows) rowPtrs.push({ [fromTable]: i, [baseAlias]: i });
           } else {
               for(let i=0; i<baseTbl.rowCount; i++) {
                   rowPtrs.push({ [fromTable]: i, [baseAlias]: i });
@@ -1336,7 +1810,72 @@
               // LEFT / FULL JOIN: 右にマッチしない左行を NULL 補完で残す
               const keepUnmatchedLeft = (join.type === 'LEFT' || join.type === 'FULL');
               let newPtrs = [];
-              if (join.isHashJoin) {
+              if (join.hashKeys) {
+                  // 複合キー（または等価 + 残余条件）のハッシュ結合。
+                  //
+                  // ハッシュは「候補を絞る網」でしかない。__eq の型寄せをキー側で
+                  // 完全に再現するのは難しいので、_joinKeysOf は寄せの候補を多めに
+                  // 出しておき（取り落としが無い側に倒す）、拾った候補は ON 式そのもので
+                  // 検算する。入れ子ループと同じ onFunc を使うので答えは一致する
+                  const onFunc = this.compileCondition(this._applyDateColumns(this._applyColumnCollations(this._assertNoAmbiguousColumns(join.onCond, aliases), aliases), aliases), strMap);
+                  const keySpecs = join.hashKeys;
+                  const rightMap = new Map();
+                  for (let j = 0; j < jTbl.rowCount; j++) {
+                      const perCol = [];
+                      let hasNull = false;
+                      for (const k of keySpecs) {
+                          const ks = this._joinKeysOf(jTbl.getValue(k.rightCol, j));
+                          if (!ks) { hasNull = true; break; }
+                          perCol.push(ks);
+                      }
+                      if (hasNull) continue;               // NULL を含む行は等価結合に参加しない
+                      for (const combo of this._joinKeyCombos(perCol)) {
+                          let arr = rightMap.get(combo);
+                          if (!arr) { arr = []; rightMap.set(combo, arr); }
+                          arr.push(j);
+                      }
+                  }
+                  const tickH = this._mkTick();
+                  rowPtrs.forEach(ptr => {
+                      const perCol = [];
+                      let hasNull = false;
+                      for (const k of keySpecs) {
+                          const lt = this.tables[aliases[k.leftAlias]];
+                          const ks = this._joinKeysOf(lt.getValue(k.leftCol, ptr[k.leftAlias]));
+                          if (!ks) { hasNull = true; break; }
+                          perCol.push(ks);
+                      }
+                      let matched = false;
+                      if (!hasNull) {
+                          const combos = this._joinKeyCombos(perCol);
+                          let cand;
+                          if (combos.length === 1) {
+                              cand = rightMap.get(combos[0]) || [];
+                          } else {
+                              // 候補キーが複数あると同じ右行を二度拾えるので重複を除き、
+                              // 行順を表の物理順へ戻す（入れ子ループと同じ並びを保つため）
+                              const set = new Set();
+                              for (const combo of combos) {
+                                  const c = rightMap.get(combo);
+                                  if (c) for (const j of c) set.add(j);
+                              }
+                              cand = [...set].sort((a, b) => a - b);
+                          }
+                          for (const j of cand) {
+                              tickH();
+                              const combPtr = { ...ptr, [join.table]: j, [join.alias]: j };
+                              if (onFunc(combPtr, this.tables, aliases)) {
+                                  newPtrs.push(combPtr);
+                                  matched = true;
+                                  if (matchedRight) matchedRight.add(j);
+                              }
+                          }
+                      }
+                      if (!matched && keepUnmatchedLeft) {
+                          newPtrs.push({ ...ptr, [join.table]: -1, [join.alias]: -1 });
+                      }
+                  });
+              } else if (join.isHashJoin) {
                   let rightMap = new Map();
                   if (jTbl.indices[join.rightColMatch]) {
                       rightMap = jTbl.indices[join.rightColMatch];
@@ -2006,6 +2545,84 @@
                           ordNum = pRows.map(p => wf.oFuncs[0].eval(p, this.tables, aliases));
                       }
 
+                      // ------------------------------------------------------------------
+                      // フレーム集計の前計算。
+                      //
+                      // 従来は行ごとに [lo..hi] の配列を作り直し、そのたびに引数式を
+                      // フレーム内の全行へ評価していた。既定フレーム
+                      // （UNBOUNDED PRECEDING → CURRENT ROW）だと 1 行目は 1 行、
+                      // n 行目は n 行を見るので、合計 n^2/2 回。行数を倍にすると
+                      // 時間が 4 倍になり、累計や移動平均が実用にならなかった
+                      // （32,000 行の SUM(x) OVER (ORDER BY id) で 27 秒）。
+                      //
+                      // ここで 2 つ用意する:
+                      //   1. 引数値を 1 行 1 回だけ評価した配列（式評価が n^2/2 → n 回）
+                      //   2. 累積和・累積件数（区間の和が引き算 1 回で出る）
+                      // これで [lo..hi] がどれだけ広くても 1 行あたり O(1) になる。
+                      // EXCLUDE 指定があるときは飛ばす行があるので前計算を使わない
+                      // ------------------------------------------------------------------
+                      const FRAMED_AGG = ['SUM', 'COUNT', 'AVG', 'MIN', 'MAX', 'FIRST_VALUE', 'LAST_VALUE'];
+                      const useFast = wf.frame && FRAMED_AGG.includes(wf.funcName)
+                                      && (wf.frame.exclude || 'NO OTHERS') === 'NO OTHERS';
+                      let fArg = null, pfSum = null, pfCnt = null, pfScale = 1, runBest = null;
+                      if (useFast) {
+                          const n = pRows.length;
+                          fArg = new Array(n);
+                          for (let i = 0; i < n; i++) {
+                              fArg[i] = wf.argFunc ? wf.argFunc(pRows[i], this.tables, aliases) : null;
+                          }
+                          if (wf.funcName === 'SUM' || wf.funcName === 'AVG' || wf.funcName === 'COUNT') {
+                              // 十進の桁を揃えて整数で積む（集計側の LUMINA_EXACT_SUM と同じ考え方）。
+                              // 累積和の差で区間和を出すので、途中の丸めが残ると差にも残る
+                              let d = 0, scalable = true;
+                              for (let i = 0; i < n; i++) {
+                                  const x = LUMINA_AGG_NUM(fArg[i]);
+                                  if (x === null) continue;
+                                  const p = LUMINA_DEC_PLACES(x);
+                                  if (p < 0 || p > 12) { scalable = false; break; }
+                                  if (p > d) d = p;
+                              }
+                              pfScale = (scalable && d > 0) ? Math.pow(10, d) : 1;
+                              if (pfScale !== 1) {
+                                  // 桁をずらすと整数の範囲を出るなら倍精度のまま積む
+                                  let acc = 0;
+                                  for (let i = 0; i < n && pfScale !== 1; i++) {
+                                      const x = LUMINA_AGG_NUM(fArg[i]);
+                                      if (x === null) continue;
+                                      const s = Math.round(x * pfScale);
+                                      acc += s;
+                                      if (!Number.isSafeInteger(s) || !Number.isSafeInteger(acc)) pfScale = 1;
+                                  }
+                              }
+                              pfSum = new Float64Array(n + 1);
+                              pfCnt = new Int32Array(n + 1);
+                              for (let i = 0; i < n; i++) {
+                                  const v = fArg[i];
+                                  let add = 0, c = 0;
+                                  if (v !== null && v !== undefined) {
+                                      const x = LUMINA_AGG_NUM(v);
+                                      if (x !== null) add = pfScale === 1 ? x : Math.round(x * pfScale);
+                                      c = 1;
+                                  }
+                                  pfSum[i + 1] = pfSum[i] + add;
+                                  pfCnt[i + 1] = pfCnt[i] + c;
+                              }
+                          } else if (wf.funcName === 'MIN' || wf.funcName === 'MAX') {
+                              // 下端が 0 に貼り付く（UNBOUNDED PRECEDING）フレームは、
+                              // 先頭からの最良値を持ち回れば 1 行あたり O(1) で引ける。
+                              // 生値の比較なので、文字列の MIN/MAX も従来と同じ結果になる
+                              runBest = new Array(n);
+                              let b = null;
+                              for (let i = 0; i < n; i++) {
+                                  const v = fArg[i];
+                                  if (v !== null && v !== undefined) {
+                                      if (b === null || (wf.funcName === 'MIN' ? v < b : v > b)) b = v;
+                                  }
+                                  runBest[i] = b;
+                              }
+                          }
+                      }
+
                       pRows.forEach((ptr, idx) => {
                           let val = null;
                           if (wf.frame && ['SUM', 'COUNT', 'AVG', 'MIN', 'MAX', 'FIRST_VALUE', 'LAST_VALUE'].includes(wf.funcName)) {
@@ -2082,6 +2699,40 @@
                                       }
                                       if (exMode === 'TIES') skip.delete(idx);   // 自分自身は残す
                                   }
+                              }
+                              // 前計算が使える形なら、フレームの広さに関係なく O(1) で引く
+                              if (useFast) {
+                                  if (lo > hi) {
+                                      val = wf.funcName === 'COUNT' ? 0 : null;
+                                  } else if (wf.funcName === 'COUNT') {
+                                      val = wf.argFunc ? (pfCnt[hi + 1] - pfCnt[lo]) : (hi - lo + 1);
+                                  } else if (wf.funcName === 'SUM' || wf.funcName === 'AVG') {
+                                      const c = pfCnt[hi + 1] - pfCnt[lo];
+                                      if (c === 0) val = null;
+                                      else {
+                                          const s = (pfSum[hi + 1] - pfSum[lo]) / pfScale;
+                                          val = wf.funcName === 'SUM' ? s : s / c;
+                                      }
+                                  } else if (wf.funcName === 'FIRST_VALUE') {
+                                      val = fArg[lo];
+                                  } else if (wf.funcName === 'LAST_VALUE') {
+                                      val = fArg[hi];
+                                  } else if (lo === 0) {
+                                      // MIN / MAX は下端が 0 のときだけ持ち回りで引ける
+                                      val = runBest[hi];
+                                  } else {
+                                      // 両端が動く MIN / MAX は区間を見る。引数式は評価済みなので
+                                      // 配列を読むだけで済む（従来は式を毎回評価し直していた）
+                                      let b = null;
+                                      for (let i2 = lo; i2 <= hi; i2++) {
+                                          const v = fArg[i2];
+                                          if (v === null || v === undefined) continue;
+                                          if (b === null || (wf.funcName === 'MIN' ? v < b : v > b)) b = v;
+                                      }
+                                      val = b;
+                                  }
+                                  ptr[wf.wfId] = val;
+                                  return;
                               }
                               const inFrame = (i2) => i2 >= lo && i2 <= hi && !(skip && skip.has(i2));
                               const framed = [];
@@ -2527,16 +3178,19 @@
                               });
                               aggRow[sel.alias] = any ? JSON.stringify(obj) : null;
                           } else if (sel.func === 'MAX' || sel.func === 'MIN') {
-                              let vals = [];
+                              // 全件を配列に集めて sort し、端の 1 個だけを取っていた
+                              // （20 万行で O(n log n) の並べ替え）。1 度なめれば足りる。
+                              // 比較は生値のまま（従来の比較子と同じ規則）にして、
+                              // 文字列の MIN / MAX が数値へ寄らないようにする
+                              const isMax = sel.func === 'MAX';
+                              let best = null, seen = false;
                               groupPtrs.forEach(ptr => {
-                                  let v = sel.argFunc(ptr, this.tables, aliases);
-                                  if (v !== null && v !== undefined) vals.push(v);
+                                  const v = sel.argFunc(ptr, this.tables, aliases);
+                                  if (v === null || v === undefined) return;
+                                  if (!seen) { best = v; seen = true; return; }
+                                  if (isMax ? (v > best) : (v < best)) best = v;
                               });
-                              if (vals.length === 0) aggRow[sel.alias] = null;
-                              else {
-                                  let sorted = vals.sort((a,b) => a<b ? -1 : (a>b ? 1 : 0));
-                                  aggRow[sel.alias] = sel.func === 'MAX' ? sorted[sorted.length-1] : sorted[0];
-                              }
+                              aggRow[sel.alias] = seen ? best : null;
                           } else if (['STDDEV', 'STDDEV_POP', 'STDDEV_SAMP', 'VARIANCE', 'VAR_POP', 'VAR_SAMP', 'MEDIAN'].includes(sel.func)) {
                               let vals = [];
                               groupPtrs.forEach(ptr => {
@@ -2708,7 +3362,8 @@
                                   }
                               }
                           } else {
-                              let sum = 0, cnt = 0;
+                              // 値を集めてから足す（十進の桁を読み取って正確に和を出すため）
+                              const nums = [];
                               if (sel.distinct) {
                                   // SUM(DISTINCT) / AVG(DISTINCT): 重複値を除外して集計
                                   const seen = new Set();
@@ -2716,13 +3371,15 @@
                                       const n = LUMINA_AGG_NUM(sel.argFunc(ptr, this.tables, aliases));
                                       if (n !== null) seen.add(n);
                                   });
-                                  seen.forEach(v => { sum += v; cnt++; });
+                                  seen.forEach(v => nums.push(v));
                               } else {
                                   groupPtrs.forEach(ptr => {
                                       const n = LUMINA_AGG_NUM(sel.argFunc(ptr, this.tables, aliases));
-                                      if (n !== null) { sum += n; cnt++; }
+                                      if (n !== null) nums.push(n);
                                   });
                               }
+                              const cnt = nums.length;
+                              const sum = LUMINA_EXACT_SUM(nums);
                               // AVG は倍精度のまま返す。以前は 2 桁へ丸めていたため
                               // 0.000001 台の平均が 0 になり、率や単価が壊れていた。
                               // 2 桁で欲しい場合は ROUND(AVG(x), 2) と書く
@@ -2781,7 +3438,7 @@
                   const superGroups = Object.create(null);
                   const orderKeys = [];
                   rowPtrs.forEach(ptr => {
-                      const key = groupFuncs.map((f, i) => active.has(i) ? f(ptr, this.tables, aliases) : ' ').join('|||');
+                      const key = groupFuncs.map((f, i) => active.has(i) ? f(ptr, this.tables, aliases) : '\0').join('|||');
                       if (!superGroups[key]) { superGroups[key] = []; orderKeys.push(key); }
                       superGroups[key].push(ptr);
                   });
@@ -2869,6 +3526,28 @@
                       const a = ptrKeys[i];
                       if (a === undefined || seenAl.has(a)) continue;
                       seenAl.add(a); starAliases.push(a);
+                  }
+              }
+              // LIMIT が付いているだけの問い合わせは、必要な行数まで組み立てれば足りる。
+              //
+              // 従来はここで全行を出力オブジェクトへ変換してから最後に slice していたので、
+              // `SELECT * FROM t LIMIT 10` が表のサイズに比例していた（40 万行で 164ms。
+              // 走査自体は COUNT(*) が 4ms で終わるので、費用はぜんぶ 40 万個の
+              // オブジェクトを作って 39 万 9,990 個を捨てるところにあった）。
+              // 表の先頭を覗くのは画面でいちばん多い操作なので、ここを打ち切る。
+              //
+              // 打ち切れるのは「出力が rowPtrs と 1 対 1 で、並びも変わらない」ときだけ。
+              // 並べ替え・グループ化・DISTINCT・ウィンドウ・QUALIFY・WITH TIES が
+              // 絡むと、後段で行が減ったり順番が変わったりして先頭 k 行では足りない
+              if (limitVal !== null && !withTies && !orderByStr && !groupByStr && !havingStr
+                  && !qualifyStr && !isDistinct && !distinctOn
+                  && !(windowFuncs && windowFuncs.length > 0)
+                  && !compiledSelects.some(s => s.type === 'agg' || s.type === 'aggexpr' || s.type === 'window')
+                  && !/%$/.test(String(limitVal)) && String(limitVal).toLowerCase() !== 'all') {
+                  const lim = parseInt(limitVal, 10);
+                  const off = offsetVal !== null ? Math.max(0, parseInt(offsetVal, 10)) : 0;
+                  if (isFinite(lim) && lim >= 0 && isFinite(off) && off + lim < rowPtrs.length) {
+                      rowPtrs = rowPtrs.slice(0, off + lim);
                   }
               }
               resultSet = rowPtrs.map(ptr => {
@@ -3048,7 +3727,7 @@
                   return { col: key, desc: item.desc, nulls: item.nulls };
               });
 
-              resultSet.sort((a, b) => {
+              const orderCmp = (a, b) => {
                   for (let oc of orderCols) {
                       let valA = a[oc.col]; let valB = b[oc.col];
                       // 照合順序付きの列は正規化した値どうしで比較する
@@ -3061,7 +3740,25 @@
                       return oc.desc ? -1 : 1;
                   }
                   return 0;
-              });
+              };
+              // LIMIT が付いていて上位数件しか要らないなら、全件を並べ替えずに選ぶ。
+              // 使えるのは「並べ替えた後の先頭から数える」場合だけ:
+              //   - TOP n PERCENT は全体件数が要る
+              //   - WITH TIES は打ち切り位置の次の行と比べる
+              //   - DISTINCT ON は並べ替えの後で行を落とすので、k 件では足りない
+              let topK = null;
+              if (limitVal !== null && !withTies && !distinctOn && !/%$/.test(String(limitVal))
+                  && String(limitVal).toLowerCase() !== 'all') {
+                  const lim = parseInt(limitVal, 10);
+                  const off = offsetVal !== null ? Math.max(0, parseInt(offsetVal, 10)) : 0;
+                  if (isFinite(lim) && lim >= 0 && isFinite(off)) {
+                      const k = off + lim;
+                      // 小さい結果では全件 sort の方が速い（挿入の splice が効いてくる）
+                      if (k >= 0 && resultSet.length > Math.max(64, k * 4)) topK = k;
+                  }
+              }
+              if (topK !== null) resultSet = this._topNRows(resultSet, orderCmp, topK);
+              else resultSet.sort(orderCmp);
               sortCols = orderCols;
           }
 

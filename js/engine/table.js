@@ -47,12 +47,20 @@
             // 宣言が単なる飾りになっていた（CAST は正しく丸める / 切り詰めるのに、
             // 格納時は素通し）。IDB 保存・cloneFull・列の改名 / 削除に追随させる
             this.colTypeSpec = Object.create(null);
+            // 全文検索の索引: name -> { cols: [...] }。実体（語 -> 行）は ftPostings が
+            // 遅延で作るので、ここに持つのは「どの列を検索対象にするか」だけ
+            this.ftIndexes = Object.create(null);
+            // 列ごとの変更世代。自動保存の粒度をこれで決める。
+            // 表全体の version だけだと、1 列を直しただけで全列を書き直していた
+            // （20 万行 4 列で 86ms / 12.3MB）
+            this.colVersion = Object.create(null);
         }
 
         addColumn(col, type = 'ANY') {
             col = col.toLowerCase();
             if (this.cols[col]) return;
             this.version++;
+            this.colVersion[col] = (this.colVersion[col] || 0) + 1;
             this.colTypes[col] = type;
             // 32-bit packing for Memory efficiency and Cache Locality
             // Type(8bit) + String Index(24bit) packed into a single Uint32Array
@@ -278,17 +286,40 @@
             const c = this.cols[col];
             if (!c) return;
             this.version++;   // 差分保存用の変更世代（整数 1 加算のみ）
+            this.colVersion[col] = (this.colVersion[col] || 0) + 1;
             const expectedType = Table._canonType(this.colTypes[col]);
 
             // Type Checking & Casting
             if (val === null || val === undefined || (val === '' && expectedType !== 'TEXT' && expectedType !== 'ANY')) {
                 val = null;
             } else if (expectedType === 'INTEGER') {
+                // 文字列は数値へ寄せる前に桁を見る。Number へ通してからでは
+                // 既に丸まっているので「元の綴りと違う値が入った」ことが判らない
+                if (typeof val === 'string' && /^-?\d+$/.test(val.trim())) {
+                    const t = val.trim();
+                    const n = parseInt(t, 10);
+                    if (!Number.isSafeInteger(n)) {
+                        throw new Error(`Integer out of exact range for column '${col}': |value| must be`
+                            + ` <= ${Number.MAX_SAFE_INTEGER}, but '${t}' would be silently rounded to ${n}`
+                            + ` (numbers are held as 64-bit floats).`
+                            + ` Store such identifiers as TEXT to keep every digit.`);
+                    }
+                    val = n;
+                }
                 if (typeof val === 'number') {
                     if (!Number.isInteger(val)) throw new Error(`Type mismatch: Cannot cast '${val}' to INTEGER for column '${col}'`);
-                } else if (typeof val === 'string' && /^-?\d+$/.test(val.trim())) {
-                    val = parseInt(val, 10);
-                } else {
+                    // 2^53 を超える整数は float64 で表しきれない。従来は黙って丸めた値を
+                    // 格納していたので、9007199254740993 が ...992 になり、
+                    // 9223372036854775807（BIGINT の上限）は 9223372036854776000 になっていた。
+                    // 外部システムの ID（Snowflake ID・Java の long・伝票番号）を入れた
+                    // 瞬間にデータが壊れる類なので、黙って壊さずに断る
+                    if (!Number.isSafeInteger(val)) {
+                        throw new Error(`Integer out of exact range for column '${col}': |value| must be`
+                            + ` <= ${Number.MAX_SAFE_INTEGER}, but this one reached the engine as ${val}`
+                            + ` (already rounded, since numbers are held as 64-bit floats).`
+                            + ` Store such identifiers as TEXT to keep every digit.`);
+                    }
+                } else if (typeof val !== 'number') {
                     throw new Error(`Type mismatch: Cannot cast '${val}' to INTEGER for column '${col}'`);
                 }
             } else if (expectedType === 'FLOAT') {
@@ -383,6 +414,15 @@
                     // データが静かに壊れるため、上限到達時は明示的にエラーにする
                     if (sIdx > 0xFFFFFF) throw new Error(`String pool overflow: column '${col}' exceeds 16,777,215 distinct strings. Run VACUUM to reclaim unused entries.`);
                     this.strPools[col].push(s);
+                    // UPDATE で書き換えられた古い文字列は誰も参照しなくなるが、プールからは
+                    // 消えない。同じ列を繰り返し更新するだけでプールが伸び続け（5,000 行の
+                    // 列を 6 回更新すると 35,000 件）、最後は上の 1,677 万件の上限に当たって
+                    // 挿入が失敗していた。VACUUM は 1.4ms で完全に戻せるのに、自動では
+                    // 走っていなかった。生きている値に対して膨らみすぎたら印を付け、
+                    // 文の成功後にエンジンが回収する（ここで詰めるとロールバックが壊れる）
+                    if (this.strPools[col].length > 1024 && this.strPools[col].length > this.rowCount * 4) {
+                        this._poolBloat = true;
+                    }
                     this.strMaps[col][s] = sIdx;
                 }
                 c.meta[idx] = (2 << 24) | (sIdx & 0xFFFFFF); // type 2 = String + 24bit index
@@ -549,6 +589,124 @@
             };
         }
 
+        // 全文検索の転置索引（語 -> 行番号の配列）を返す。
+        //
+        // MATCH ... AGAINST は行ごとに本文を語へ切って走査していたので、
+        // 20 万行の表なら毎回 20 万回の語切りが走っていた。CREATE FULLTEXT INDEX で
+        // 対象列を登録しておくと、ここで語 -> 行の対応を 1 度だけ作って引けるようになる。
+        //
+        // 作り直しは遅延で、表の変更世代が進んでいたら次に引くときに作り直す
+        // （sortedIndexKeys と同じ方式。setValue の増分保守やロールバックに
+        // 手を入れずに済むので、巻き戻しの整合性を壊さない）。
+        //
+        // 語切りは照合側と同じ LUMINA_FT_TOKENS を使う。ここが食い違うと
+        // 「索引では拾えないが全表走査では一致する」行が出る
+        ftPostings(cols) {
+            const key = cols.join('\0');
+            if (!this._ftCache) this._ftCache = Object.create(null);
+            const hit = this._ftCache[key];
+            if (hit && hit.version === this.version) return hit.map;
+
+            const map = new Map();
+            for (let i = 0; i < this.rowCount; i++) {
+                const seen = new Set();
+                for (const c of cols) {
+                    if (!this.cols[c]) continue;
+                    const v = this.getValue(c, i);
+                    if (v === null || v === undefined) continue;
+                    for (const tok of LUMINA_FT_TOKENS(v)) {
+                        if (seen.has(tok)) continue;
+                        seen.add(tok);
+                        let arr = map.get(tok);
+                        if (!arr) { arr = []; map.set(tok, arr); }
+                        arr.push(i);
+                    }
+                }
+            }
+            this._ftCache[key] = { version: this.version, map };
+            return map;
+        }
+
+        // 索引キーを並べた配列を返す（範囲検索・MIN/MAX 用）。
+        //
+        // indices[col] はハッシュ（Map）なので等価一致しか引けない。`col > 100` や
+        // `MIN(col)` は索引があっても全表走査に落ちていた。ここでキーを並べた配列を
+        // 作って持ち、二分探索で範囲の両端を求められるようにする。
+        //
+        // 作り直しは遅延。表の変更世代が進んでいたら次に必要になったときだけ並べ直す
+        // （相異なりキー数ぶんの並べ替えなので、値が偏っている列では非常に軽い）。
+        //
+        // 型が混ざっている列は使わない。比較側（__lt / __eq）は数値らしい文字列を
+        // 数値へ寄せるので、生値を素の `<` で並べた順序と食い違う。混在を見つけたら
+        // usable=false にして、呼ぶ側は全表走査へ落ちる（速さより一致を採る）
+        sortedIndexKeys(col) {
+            if (!this.indices[col]) return null;
+            if (!this._sortedKeys) this._sortedKeys = Object.create(null);
+            const cached = this._sortedKeys[col];
+            if (cached && cached.version === this.version) return cached.usable ? cached.keys : null;
+
+            const keys = [];
+            let kind = null, usable = true;
+            for (const k of this.indices[col].keys()) {
+                if (k === null || k === undefined) continue;   // NULL は範囲比較に参加しない
+                const t = typeof k;
+                if (t !== 'number' && t !== 'string') { usable = false; break; }
+                if (kind === null) kind = t;
+                else if (kind !== t) { usable = false; break; }
+                keys.push(k);
+            }
+            if (usable) {
+                keys.sort(kind === 'number' ? (a, b) => a - b : undefined);
+            }
+            this._sortedKeys[col] = { version: this.version, keys, usable, kind };
+            return usable ? keys : null;
+        }
+
+        // 並べたキーの中で「v 以上の最初の位置」（下限）を二分探索で求める
+        static lowerBound(keys, v) {
+            let lo = 0, hi = keys.length;
+            while (lo < hi) {
+                const mid = (lo + hi) >> 1;
+                if (keys[mid] < v) lo = mid + 1; else hi = mid;
+            }
+            return lo;
+        }
+
+        // 未参照文字列だけを回収する（予約容量は触らない）。
+        //
+        // vacuum() は容量の縮小も行うので、増えている途中の表に対して自動で呼ぶと
+        // 縮めては伸ばすの繰り返しになる。自動回収はプールだけを対象にする。
+        //
+        // 注意: 文単位ロールバックとトランザクションは「プールの長さ」を控えて
+        // splice で巻き戻すので、その控えが生きている間にプールを詰めると
+        // 復元が壊れる。呼ぶ側（エンジン）が文の成功後・トランザクション外で
+        // だけ呼ぶこと
+        compactStringPools() {
+            this._poolBloat = false;
+            let freedStrings = 0;
+            for (const col in this.cols) {
+                const oldPool = this.strPools[col];
+                if (!oldPool || oldPool.length === 0) continue;
+                const newPool = [];
+                const newMap = Object.create(null);
+                const meta = this.cols[col].meta;
+                for (let i = 0; i < this.rowCount; i++) {
+                    if ((meta[i] >>> 24) !== 2) continue;
+                    const s = oldPool[meta[i] & 0xFFFFFF];
+                    let idx = newMap[s];
+                    if (idx === undefined) { idx = newPool.length; newPool.push(s); newMap[s] = idx; }
+                    meta[i] = (2 << 24) | (idx & 0xFFFFFF);
+                }
+                if (newPool.length !== oldPool.length) {
+                    freedStrings += oldPool.length - newPool.length;
+                    this.strPools[col] = newPool;
+                    this.strMaps[col] = newMap;
+                    this.version++;
+                }
+            }
+            return freedStrings;
+        }
+
         // 未参照文字列のGCと予約容量の縮小（VACUUM / OPTIMIZE 用）
         vacuum() {
             this.version++;
@@ -589,6 +747,7 @@
         restoreData(snapshot) {
             this.capacity = snapshot.capacity;
             this.rowCount = snapshot.rowCount;
+            this.version++;   // 復元も内容の変更なので世代を進める
             this.cols = snapshot.cols;
             for (let col in snapshot.strPoolsSizes) {
                 const size = snapshot.strPoolsSizes[col];

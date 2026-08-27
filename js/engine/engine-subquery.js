@@ -188,14 +188,28 @@
                   // _rewriteRowConstructors が「括弧付きグループ」を要求するため）
                   const arity = this._rowCtorArityBefore(beforeStr);
                   let valsStr;
+                  // 重複は落とす。`IN` は集合の所属を見るだけなので同じ値が何度あっても
+                  // 答えは変わらない（NULL も 1 つ残れば三値論理は保たれる）。
+                  //
+                  // ここを素通しにすると副問い合わせの行数ぶんのリテラルが SQL 文へ
+                  // 展開され、そのまま式コンパイルの正規表現を何百本も通り、さらに
+                  // 生成コードの配列リテラルとして **1 行評価ごとに** 確保される。
+                  // 20 万行返す `IN (SELECT g FROM t)` は相異なり値が 1,000 個しか
+                  // 無いのに 20 万要素を毎行作っていた（実測 810ms / 同義の JOIN は 3ms）
+                  const dedup = (arr) => {
+                      const seen = new Set();
+                      const out = [];
+                      for (const x of arr) { if (seen.has(x)) continue; seen.add(x); out.push(x); }
+                      return out;
+                  };
                   if (arity > 1) {
-                      valsStr = subResult.data.map(r => {
+                      valsStr = dedup(subResult.data.map(r => {
                           const cells = Object.values(r);
                           if (cells.length !== arity) {
                               throw new Error(`Row constructor IN requires equal arity (${arity} vs ${cells.length}).`);
                           }
                           return '(' + cells.map(lit).join(', ') + ')';
-                      }).join(', ');
+                      })).join(', ');
                   } else {
                       // 単一オペランドの IN / 量化比較に 2 列以上返すサブクエリを渡すのは
                       // 誤り。従来は 1 列目だけを使って残りを黙って捨てていた
@@ -203,7 +217,7 @@
                       if (ncols !== 1) {
                           throw new Error(`Operand should contain 1 column(s), but the subquery returns ${ncols}.`);
                       }
-                      valsStr = subResult.data.map(r => lit(Object.values(r)[0])).join(', ');
+                      valsStr = dedup(subResult.data.map(r => lit(Object.values(r)[0]))).join(', ');
                   }
                   expandedSql = expandedSql.slice(0, match.start) + `(${valsStr})` + expandedSql.slice(match.end + 1);
               } else if (/\bFROM\s*$/i.test(beforeStr.trim()) || /\bJOIN\s*$/i.test(beforeStr.trim())) {

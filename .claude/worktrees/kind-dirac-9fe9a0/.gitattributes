@@ -1,0 +1,9 @@
+# Store and check out every text file with LF, on every platform.
+#
+# core.autocrlf is enabled on the author's machine, so without this a fresh
+# clone would be handed CRLF and the next commit would show whole-file diffs.
+#
+# Note: some sources deliberately contain a NUL character (used as a
+# composite-key separator, and exercised as a test value). Those are written
+# as \0 escapes, not raw bytes, so git keeps treating them as text.
+* text=auto eol=lf

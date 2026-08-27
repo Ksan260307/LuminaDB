@@ -30,15 +30,24 @@
             identityFloor: t.identityFloor || 1,
             collations: t.collations,
             colTypeSpec: t.colTypeSpec,
+            ftIndexes: t.ftIndexes,
             // 差分保存用の指紋。前回保存時と同じなら中身は書き直さない
             // （変更世代・行数・容量の3点。値の上書きは version、行の増減は rowCount が拾う）
             fp: `${t.version || 0}:${t.rowCount}:${t.capacity}`,
+            // 変更世代そのものも保存する。取り込み時に作り直すと採番が 0 から
+            // やり直しになり、保存済みの指紋と**偶然一致**して「変わっていない」と
+            // 判定されうる（実際 addColumn 2 回で colVersion が 2 になる表を読み直すと
+            // 1 に戻り、その後 1 回書き換えて 2 になった列が保存を飛ばされていた）
+            version: t.version || 0,
+            colVersion: Object.assign(Object.create(null), t.colVersion || {}),
             indexCols: Object.keys(t.indices)
           };
           for(const c of Object.keys(t.cols)) {
             dump[tName].cols[c] = {
               num: t.cols[c].num.slice(0, t.rowCount),
-              meta: t.cols[c].meta.slice(0, t.rowCount)
+              meta: t.cols[c].meta.slice(0, t.rowCount),
+              // 列単位の差分保存用の指紋。行数も混ぜるので、行の増減でも変わる
+              fp: `${(t.colVersion && t.colVersion[c]) || 0}:${t.rowCount}`
             };
           }
         }
@@ -111,6 +120,10 @@
           t.identityFloor = dt.identityFloor || 1;
           t.collations = Object.assign(Object.create(null), dt.collations || {});
           t.colTypeSpec = Object.assign(Object.create(null), dt.colTypeSpec || {});
+          t.ftIndexes = Object.assign(Object.create(null), dt.ftIndexes || {});
+          // 変更世代は addColumn などで進んでしまうので、列を作り終えてから戻す
+          if (typeof dt.version === 'number') t.version = dt.version;
+          t.colVersion = Object.assign(Object.create(null), dt.colVersion || {});
           t.rebuildIndices();
           // PK / UNIQUE の自動インデックスに加え、ユーザー作成インデックスも復元する
           [...(t.primaryKey ? [t.primaryKey] : []), ...t.uniqueCols, ...(dt.indexCols || [])].forEach(c => { if (t.cols[c]) t.createIndex(c); });
@@ -262,14 +275,18 @@
           return `CREATE ${t.isTemp ? 'TEMPORARY ' : ''}TABLE ${tName} (${colDefs.join(', ')})`;
       },
 
-      exportSQL() {
-          let sqlLines = [];
+      // SQL ダンプの本体。1 文ずつ emit へ渡す。
+      //
+      // 従来は全部を配列へ積んで最後に join していたので、20 万行の表で 5.5MB の
+      // 文字列が 1 本できていた（配列と合わせて山が二重になる）。書き出し先が
+      // Blob なら断片の配列をそのまま渡せるので、連結を挟まずに済む
+      _exportSQLTo(emit) {
           for (let tName in this.tables) {
               if (tName.startsWith('__tmp_')) continue;
               if (this.tables[tName].isTemp) continue; // TEMPORARY テーブルはエクスポート対象外
               const t = this.tables[tName];
               const cols = t.getColumnNames();
-              sqlLines.push(`${this.buildCreateTableSQL(tName)};`);
+              emit(`${this.buildCreateTableSQL(tName)};`);
 
               if (t.rowCount > 0) {
                   for (let i = 0; i < t.rowCount; i += 100) {
@@ -291,7 +308,7 @@
                           });
                           values.push(`(${rowVals.join(', ')})`);
                       }
-                      sqlLines.push(`INSERT INTO ${tName} (${cols.join(', ')}) VALUES ${values.join(', ')};`);
+                      emit(`INSERT INTO ${tName} (${cols.join(', ')}) VALUES ${values.join(', ')};`);
                   }
               }
 
@@ -306,7 +323,7 @@
               const implicitIdx = new Set([t.primaryKey].concat(t.uniqueCols || []).filter(Boolean));
               for (let c in t.indices) {
                   if (implicitIdx.has(c) && !namedIdx[c]) continue;
-                  sqlLines.push(`CREATE INDEX ${namedIdx[c] || `idx_${tName}_${c}`} ON ${tName} (${c});`);
+                  emit(`CREATE INDEX ${namedIdx[c] || `idx_${tName}_${c}`} ON ${tName} (${c});`);
               }
           }
           // ビュー定義を出力（プロシージャは本体に';'を含むためSQLエクスポート対象外）
@@ -314,13 +331,13 @@
               const meta = (this.viewMeta && this.viewMeta[vName]) || null;
               if (meta && meta.temp) continue;   // TEMPORARY VIEW はエクスポートしない
               const vm = (meta && meta.checkOption) ? ` WITH ${meta.checkOption} CHECK OPTION` : '';
-              sqlLines.push(`CREATE VIEW ${vName} AS ${this.views[vName]}${vm};`);
+              emit(`CREATE VIEW ${vName} AS ${this.views[vName]}${vm};`);
           }
           // シーケンス定義と現在値（SETVAL で再インポート時に採番位置を復元する）
           for (const sn in this.sequences) {
               const s = this.sequences[sn];
-              sqlLines.push(`CREATE SEQUENCE ${sn} START WITH ${s.start} INCREMENT BY ${s.increment};`);
-              if (s.value !== null) sqlLines.push(`SELECT SETVAL('${sn}', ${s.value});`);
+              emit(`CREATE SEQUENCE ${sn} START WITH ${s.start} INCREMENT BY ${s.increment};`);
+              if (s.value !== null) emit(`SELECT SETVAL('${sn}', ${s.value});`);
           }
           // ユーザー定義関数 / プロシージャ / トリガー / コメント。
           // 従来はどれも出力されず、SQL ダンプがスキーマの完全なバックアップに
@@ -330,26 +347,41 @@
           for (const fn in (this.functions || {})) {
               const f = this.functions[fn];
               const params = (f.params || []).map(p => (typeof p === 'string' ? `${p} ANY` : `${p.name} ${p.type || 'ANY'}`)).join(', ');
-              sqlLines.push(`CREATE FUNCTION ${fn}(${params}) RETURNS ${f.returns || 'ANY'} AS RETURN ${f.body};`);
+              emit(`CREATE FUNCTION ${fn}(${params}) RETURNS ${f.returns || 'ANY'} AS RETURN ${f.body};`);
           }
           for (const pn in (this.procedures || {})) {
               const body = this.procedures[pn];
               const stmts = Array.isArray(body) ? body : [String(body)];
               const params = (this.procParams && this.procParams[pn]) ? this.procParams[pn].join(', ') : '';
-              sqlLines.push(`CREATE PROCEDURE ${pn}(${params}) BEGIN ${stmts.map(x => `${x};`).join(' ')} END;`);
+              emit(`CREATE PROCEDURE ${pn}(${params}) BEGIN ${stmts.map(x => `${x};`).join(' ')} END;`);
           }
           for (const tn in (this.triggers || {})) {
               const tr = this.triggers[tn];
               const stmts = Array.isArray(tr.statements) ? tr.statements : [String(tr.statements)];
-              sqlLines.push(`CREATE TRIGGER ${tn} ${String(tr.timing).toUpperCase()} ${String(tr.event).toUpperCase()} ON ${tr.table} FOR EACH ROW BEGIN ${stmts.map(x => `${x};`).join(' ')} END;`);
+              emit(`CREATE TRIGGER ${tn} ${String(tr.timing).toUpperCase()} ${String(tr.event).toUpperCase()} ON ${tr.table} FOR EACH ROW BEGIN ${stmts.map(x => `${x};`).join(' ')} END;`);
           }
           for (const key in (this.comments || {})) {
               const i = key.indexOf(':');
               if (i === -1) continue;
               const kind = key.slice(0, i).toUpperCase(), target = key.slice(i + 1);
-              sqlLines.push(`COMMENT ON ${kind} ${target} IS ${this._quoteLiteral(this.comments[key])};`);
+              emit(`COMMENT ON ${kind} ${target} IS ${this._quoteLiteral(this.comments[key])};`);
           }
-          return sqlLines.join('\n');
+      },
+
+      // 互換のため 1 本の文字列を返す（外部 API とテストが使う）
+      exportSQL() {
+          const out = [];
+          this._exportSQLTo(s => out.push(s));
+          return out.join('\n');
+      },
+
+      // Blob へそのまま渡せる断片の配列（巨大な連結を作らない）。
+      // 行区切りを含めて返すので new Blob(parts) がダンプそのものになる
+      exportSQLParts() {
+          const parts = [];
+          let first = true;
+          this._exportSQLTo(s => { if (!first) parts.push('\n'); first = false; parts.push(s); });
+          return parts;
       },
 
       // ダミーデータ生成: 制約（PK/UNIQUE/FK/NOT NULL/型）を尊重した値を組み立て、

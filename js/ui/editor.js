@@ -317,7 +317,7 @@
             : `(${items.length} / ${all.length})`;
         list.innerHTML = '';
         if (items.length === 0) {
-            list.innerHTML = `<div class="text-sm text-gray-400 text-center py-10">${all.length === 0 ? '履歴はまだありません。' : '一致する履歴がありません。'}</div>`;
+            list.innerHTML = `<div class="text-sm text-gray-400 text-center py-10">${all.length === 0 ? i18nT('履歴はまだありません。') : i18nT('一致する履歴がありません。')}</div>`;
             return;
         }
         items.forEach(sql => {
@@ -451,24 +451,25 @@
         const wrap = document.getElementById('editorTabs');
         if (!wrap) return;
         wrap.innerHTML = '';
-        tabs.forEach((t, i) => {
-            const on = t.id === activeTabId;
+        // 仮引数は tab（i18nT と紛れないよう t を避ける）
+        tabs.forEach((tab, i) => {
+            const on = tab.id === activeTabId;
             const el = document.createElement('div');
             el.className = 'shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-t border-b-2 text-xs cursor-pointer select-none transition-colors '
                 + (on ? 'bg-white border-blue-500 text-gray-800 font-medium shadow-sm'
                       : 'bg-gray-50 border-transparent text-gray-500 hover:bg-gray-100 hover:text-gray-700');
-            el.dataset.tabId = t.id;
-            el.title = `${t.name}${i < 9 ? ` (Alt+${i + 1})` : ''} — ダブルクリックで名前を変更`;
+            el.dataset.tabId = tab.id;
+            el.title = i18nT('{0}{1} — ダブルクリックで名前を変更', tab.name, i < 9 ? ` (Alt+${i + 1})` : '');
             const label = document.createElement('span');
             label.className = 'truncate max-w-[10rem]';
-            label.textContent = t.name;
+            label.textContent = tab.name;
             el.appendChild(label);
             if (tabs.length > 1) {
                 const x = document.createElement('button');
                 x.className = 'text-gray-400 hover:text-red-600 leading-none px-0.5';
                 x.textContent = '×';
-                x.title = 'このタブを閉じる';
-                x.dataset.closeId = t.id;
+                x.title = i18nT('このタブを閉じる');
+                x.dataset.closeId = tab.id;
                 el.appendChild(x);
             }
             wrap.appendChild(el);
@@ -493,7 +494,7 @@
     }
 
     function addTab(sql) {
-        if (tabs.length >= TABS_MAX) { showToast(`タブは最大 ${TABS_MAX} 枚までです。`, true); return; }
+        if (tabs.length >= TABS_MAX) { showToast(i18nT('タブは最大 {0} 枚までです。', TABS_MAX), true); return; }
         clearTimeout(saveTimeout);
         syncActiveTab();
         const t = { id: ++tabSeq, name: deriveTabName(sql), custom: false, sql: sql || '', undoStack: [sql || ''], redoStack: [] };
@@ -527,13 +528,13 @@
     }
 
     function renameTab(id) {
-        const t = tabs.find(x => x.id === id);
-        if (!t) return;
-        const name = window.prompt('タブ名', t.name);
+        const tab = tabs.find(x => x.id === id);
+        if (!tab) return;
+        const name = window.prompt(i18nT('タブ名'), tab.name);
         if (name === null) return;
         const trimmed = name.trim();
-        if (trimmed === '') { t.custom = false; t.name = deriveTabName(t.sql); }
-        else { t.custom = true; t.name = trimmed.slice(0, 40); }
+        if (trimmed === '') { tab.custom = false; tab.name = deriveTabName(tab.sql); }
+        else { tab.custom = true; tab.name = trimmed.slice(0, 40); }
         renderTabs();
         persistTabs();
     }
@@ -706,6 +707,9 @@
         if (e.key === 'Enter' && cmdKey) {
             e.preventDefault();
             clearTimeout(saveTimeout); saveQueryState();
+            // Ctrl+Alt+Enter はワーカーで実行する（画面が固まらず、途中で止められる）。
+            // Ctrl+Shift+Enter は既に「全文を実行」なので取らない
+            if (e.altKey) { if (typeof runQueryInWorker === 'function') runQueryInWorker(); return; }
             // Ctrl+Enter はカーソル位置の 1 文だけ、Ctrl+Shift+Enter は全文を実行する。
             // 複数文を書き溜めたスクラッチパッドから 1 文ずつ試せるようにするため
             if (e.shiftKey) runQuery();

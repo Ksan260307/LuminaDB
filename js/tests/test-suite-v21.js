@@ -259,6 +259,72 @@
           if (original !== undefined) { await clearDB(); await saveDB(original); } else { await clearDB(); }
         }
       });
+      // --- 列単位の差分保存（chunked-v2） ---------------------------------
+      // 1 列を直しただけで全列を暗号化し直していたので、列ごとにレコードを分けた。
+      // 見るのは「書いた列数」と「読み直して同じ値が戻るか」の 2 点
+      fn('V21Ps 1 列だけ直したら 1 列だけ書く', async () => {
+        const original = await loadDB().catch(() => undefined);
+        try {
+          await clearDB();
+          db.executeQuery("DROP TABLE IF EXISTS v21_gran");
+          db.executeQuery("CREATE TABLE v21_gran (id INTEGER, a TEXT, b TEXT, c INTEGER)");
+          db.executeQuery("INSERT INTO v21_gran VALUES (1,'x','y',10),(2,'z','w',20)");
+          await saveDB(db.exportForIDB());
+          const full = LuminaDB.saveStats();
+          db.executeQuery("UPDATE v21_gran SET a = 'changed' WHERE id = 1");
+          await saveDB(db.exportForIDB());
+          const one = LuminaDB.saveStats();
+          db.executeQuery("DROP TABLE v21_gran");
+          // 初回は DB 全体（他の表も含む）を書くので、この表の 4 列以上になる
+          if (full.writtenColumns < 4) throw new Error('初回は全列を書くはず: ' + full.writtenColumns);
+          // 2 回目は 1 列だけ直したので、書かれる列はちょうど 1 つ
+          if (one.writtenColumns !== 1) throw new Error('1 列だけ書くはず: ' + one.writtenColumns);
+          return true;
+        } finally {
+          if (original !== undefined) { await clearDB(); await saveDB(original); } else { await clearDB(); }
+        }
+      });
+      fn('V21Ps 何も変えなければ 1 列も書かない', async () => {
+        const original = await loadDB().catch(() => undefined);
+        try {
+          await clearDB();
+          db.executeQuery("DROP TABLE IF EXISTS v21_gran2");
+          db.executeQuery("CREATE TABLE v21_gran2 (id INTEGER, a TEXT)");
+          db.executeQuery("INSERT INTO v21_gran2 VALUES (1,'x')");
+          await saveDB(db.exportForIDB());
+          await saveDB(db.exportForIDB());
+          const st = LuminaDB.saveStats();
+          db.executeQuery("DROP TABLE v21_gran2");
+          if (st.writtenColumns !== 0) throw new Error('書き直すべきではない: ' + st.writtenColumns);
+          return true;
+        } finally {
+          if (original !== undefined) { await clearDB(); await saveDB(original); } else { await clearDB(); }
+        }
+      });
+      fn('V21Ps 取り込み後に直した列が保存される', async () => {
+        // 変更世代を保存しないと、取り込みで採番が 0 からやり直しになり、
+        // 保存済みの指紋と偶然一致して「変わっていない」と判定されうる
+        const original = await loadDB().catch(() => undefined);
+        try {
+          await clearDB();
+          db.executeQuery("DROP TABLE IF EXISTS v21_rt");
+          db.executeQuery("CREATE TABLE v21_rt (id INTEGER, info TEXT)");
+          db.executeQuery("INSERT INTO v21_rt VALUES (1,'Created')");
+          await saveDB(db.exportForIDB());
+          const eng = new DatabaseEngine();
+          eng.importFromIDB(await loadDB());
+          eng.tables['v21_rt'].setValue('info', 0, 'Updated');
+          await saveDB(eng.exportForIDB());
+          const eng2 = new DatabaseEngine();
+          eng2.importFromIDB(await loadDB());
+          const got = eng2.tables['v21_rt'].getValue('info', 0);
+          db.executeQuery("DROP TABLE v21_rt");
+          if (got !== 'Updated') throw new Error('取り込み後の変更が保存されていない: ' + got);
+          return true;
+        } finally {
+          if (original !== undefined) { await clearDB(); await saveDB(original); } else { await clearDB(); }
+        }
+      });
       fn('V21Ps roundtrip after incremental save', async () => {
         const original = await loadDB().catch(() => undefined);
         try {

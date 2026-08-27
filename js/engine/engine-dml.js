@@ -1170,6 +1170,10 @@
               w++;
           }
           tData.rowCount = w;
+          // 行を詰めたら変更世代を進める。従来ここが抜けていたため、世代で無効化する
+          // 派生構造（並べたキー・転置索引）が DELETE 後も古いままになり、
+          // 消したはずの行が全文検索に出ていた
+          tData.version++;
           if (Object.keys(tData.indices).length > 0) tData.rebuildIndices();
       },
 
@@ -1470,7 +1474,7 @@
               });
           } catch (e) {
               // 部分挿入のロールバック
-              tData.rowCount = startRowCount;
+              tData.rowCount = startRowCount; tData.version++;
               for (const c in startPoolSizes) {
                   if (tData.strPools[c] && tData.strPools[c].length > startPoolSizes[c]) {
                       const removed = tData.strPools[c].splice(startPoolSizes[c]);
@@ -1513,7 +1517,7 @@
               } catch (e) {
                   try { this._stmtRollback(insMark); } catch (e2) { /* 元の例外を隠さない */ }
                   // 自表へ書き込んだ行を取り消す（上の部分挿入ロールバックと同じ手順）
-                  tData.rowCount = startRowCount;
+                  tData.rowCount = startRowCount; tData.version++;
                   for (const c in startPoolSizes) {
                       if (tData.strPools[c] && tData.strPools[c].length > startPoolSizes[c]) {
                           const removed = tData.strPools[c].splice(startPoolSizes[c]);

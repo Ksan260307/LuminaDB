@@ -1,0 +1,2 @@
+# Machine-local Claude Code settings (launch.json is shared)
+.claude/settings.local.json

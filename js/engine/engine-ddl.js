@@ -1348,7 +1348,7 @@
                   for (let r = 0; r < t.rowCount; r++) {
                       for (let c = 0; c < cols.length; c++) {
                           const v = t.getValue(cols[c], r);
-                          feed('' + (v === null || v === undefined ? ' ' : (typeof v) + ':' + String(v)));
+                          feed('' + (v === null || v === undefined ? '\0' : (typeof v) + ':' + String(v)));
                       }
                   }
                   return { Table: name, Checksum: h >>> 0, Rows: t.rowCount };
@@ -2155,7 +2155,35 @@
               }
               sql = 'CREATE OR REPLACE VIEW ' + sql.replace(/^alter\s+view\s+/i, '');
           }
-          if (/^create\s+(unique\s+)?index/i.test(sql)) {
+          // CREATE FULLTEXT INDEX <name> ON <table>(<col>[, ...])
+          //
+          // 従来は構文エラーだった。MATCH ... AGAINST は索引を持たず毎回全行を
+          // 語へ切って走査していたので、全文検索が表の大きさに正比例していた。
+          // ここで登録した列に対して Table.ftPostings が語 -> 行の対応を作る
+          if (/^create\s+fulltext\s+index\b/i.test(sql)) {
+             const m = sql.match(/^create\s+fulltext\s+index\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+on\s+([a-zA-Z0-9_]+)\s*\(([^()]+)\)\s*$/i);
+             if (!m) throw new Error("Syntax Error in CREATE FULLTEXT INDEX. Use CREATE FULLTEXT INDEX [IF NOT EXISTS] name ON table (col[, col...]).");
+             const ifNotExists = !!m[1];
+             const idxName = m[2].toLowerCase();
+             const table = m[3].toLowerCase();
+             const t = this.tables[table];
+             if (!t) throw this._tableNotFound(table);
+             const cols = m[4].split(',').map(c => c.trim().toLowerCase()).filter(c => c !== '');
+             if (cols.length === 0) throw new Error("Syntax Error in CREATE FULLTEXT INDEX: no columns given.");
+             cols.forEach(c => {
+                 if (!t.cols[c]) throw new Error(`Column '${c}' not found in table '${table}'.`);
+             });
+             this.indexNames = this.indexNames || Object.create(null);
+             if (t.ftIndexes[idxName] || this.indexNames[idxName]) {
+                 if (ifNotExists) return { data: [{ Result: "Success", Message: `Index '${idxName}' already exists. Skipped.` }], affectedRows: 0 };
+                 throw new Error(`Index '${idxName}' already exists.`);
+             }
+             t.ftIndexes[idxName] = { cols };
+             t.version++;                       // 転置索引の作り直しを促す
+             this.indexNames[idxName] = { table, cols, keys: cols.map(c => ({ col: c })), unique: false, where: null, include: null, fulltext: true };
+             resultSet = [{ Result: "Success", Message: `Fulltext index '${idxName}' created on ${table}(${cols.join(', ')}).` }];
+          }
+          else if (/^create\s+(unique\s+)?index/i.test(sql)) {
              // 複数列指定に対応する。LuminaDB のインデックスは単一列ハッシュなので、
              // 複合指定は各列に個別のインデックスを張る（先頭列で絞れれば十分効く）
              // 末尾の WHERE 句は部分インデックス（PostgreSQL / SQLite）。
@@ -2225,7 +2253,7 @@
                     for (let r = 0; r < t.rowCount; r++) {
                         const vals = cols.map(c => t.getValue(c, r));
                         if (vals.some(v => v === null || v === undefined)) continue;   // NULL を含む組は検査しない
-                        const k = vals.map(v => String(v)).join(' ');
+                        const k = vals.map(v => String(v)).join('\0');
                         if (seen.has(k)) throw new Error(`Cannot create UNIQUE index '${idxName}': duplicate key (${vals.join(', ')}) in ${table}(${cols.join(', ')}).`);
                         seen.add(k);
                     }
@@ -2691,9 +2719,36 @@
 
              const m = sql.match(/create\s+(?:(?:global|local)\s+)?(temp(?:orary)?\s+)?table\s+(if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s*\(([\s\S]+)\)([\s\S]*)$/i);
              if (m) {
+                // 列定義の括弧は「最初の ( に対応する )」で閉じる。
+                //
+                // 上の正規表現は `\(([\s\S]+)\)` と貪欲なので、文末の ) まで飲み込む。
+                // 列定義しか無い普通の CREATE TABLE では結果的に正しいが、括弧を含む
+                // 後置オプションがあると壊れていた:
+                //   CREATE TABLE t (id INT) PARTITION BY RANGE (id)
+                // では列定義が `id INT) PARTITION BY RANGE (id` になり、後置オプションは
+                // 空になる。そのため下の警告は一度も出たことが無く（括弧の無い
+                // ENGINE=... だけが引っかかっていた）、PARTITION BY は文字どおり
+                // 黙って捨てられていた。対応する括弧を数えて切り直す
+                const pm = sql.match(/create\s+(?:(?:global|local)\s+)?(?:temp(?:orary)?\s+)?table\s+(?:if\s+not\s+exists\s+)?[a-zA-Z0-9_]+\s*\(/i);
+                let colsText = m[4], tailText = m[5] || '';
+                if (pm) {
+                    const open = pm.index + pm[0].length - 1;
+                    let depth = 0, close = -1, quote = null;
+                    for (let i = open; i < sql.length; i++) {
+                        const ch = sql[i];
+                        if (quote) { if (ch === quote) quote = null; continue; }
+                        if (ch === "'" || ch === '"' || ch === '`') { quote = ch; continue; }
+                        if (ch === '(') depth++;
+                        else if (ch === ')') { depth--; if (depth === 0) { close = i; break; } }
+                    }
+                    if (close !== -1) {
+                        colsText = sql.slice(open + 1, close);
+                        tailText = sql.slice(close + 1);
+                    }
+                }
                 // 列定義の閉じ括弧より後ろ（ENGINE=... / WITH SYSTEM VERSIONING / PARTITION BY ...）は
                 // 実装が無いので黙って捨てていた。受理はするが「効いていない」ことを警告に残す
-                const tailOpts = (m[5] || '').trim().replace(/;$/, '').trim();
+                const tailOpts = tailText.trim().replace(/;$/, '').trim();
                 if (tailOpts !== '') {
                     if (/^with\s+system\s+versioning$/i.test(tailOpts)) {
                         this._warn('NO_SYSTEM_VERSIONING', `WITH SYSTEM VERSIONING on '${m[3].toLowerCase()}' is accepted but no row history is kept; FOR SYSTEM_TIME queries are not supported.`);
@@ -2716,7 +2771,7 @@
                 this._logCreateTable(tableName);
 
                 // 列定義は括弧を考慮して分割する（CHECK(x IN (1,2)) 等の内部カンマを保護）
-                const defs = this.splitSelectClause(m[4]);
+                const defs = this.splitSelectClause(colsText);
                 const colDefs = [];
                 const foreignKeys = [];
                 const tableLevelPks = [];
@@ -3669,6 +3724,7 @@
                     if (restartIdentity) t.identityFloor = 1;
                     affectedRows += t.rowCount;
                     t.rowCount = 0;
+                    t.version++;   // 派生構造の作り直しを促す
                     if (Object.keys(t.indices).length > 0) t.rebuildIndices();
                     if (t.autoIncrementCol && continueIdentity) notes.push(`${table} identity continues at ${t.identityFloor}`);
                     else if (t.autoIncrementCol && restartIdentity) notes.push(`${table} identity restarted`);

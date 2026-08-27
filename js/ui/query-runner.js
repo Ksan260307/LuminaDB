@@ -110,8 +110,13 @@
       if (!sql) return;
 
       if (sql.toLowerCase() === 'runtest') {
-          logToConsole('info', 'runtest — テストスイートを実行');
-          runTestSuite();
+          logToConsole('info', i18nT('runtest — テストスイートを実行'));
+          // テストは製品ページに同梱していないので、初回だけ取り寄せる
+          loadTestSuites()
+              .then(() => runTestSuite())
+              .catch(e => {
+                  logToConsole('error', i18nT('テストの読み込みに失敗しました: {0}', e.message));
+              });
           return;
       }
 
@@ -138,24 +143,24 @@
           if (errors.length > 0) {
               // XSS対策: SQL・エラーメッセージともユーザー入力由来のためエスケープする
               els.resArea.innerHTML = `<div class="m-auto text-sm font-mono max-w-full overflow-auto p-4">`
-                  + `<div class="text-red-600 font-medium mb-2">${script.succeeded} / ${script.total} 文が成功（エラー ${errors.length} 件）</div>`
+                  + `<div class="text-red-600 font-medium mb-2">${i18nT('{0} / {1} 文が成功（エラー {2} 件）', script.succeeded, script.total, errors.length)}</div>`
                   + errors.map(e2 => `<div class="text-red-500 text-xs mb-1">${escapeHtml(e2.sql.slice(0, 80))} → ${escapeHtml(e2.error)}</div>`).join('')
                   + `</div>`;
               setResultExportEnabled(false);
               clearResultTabs();
-              logToConsole('error', `Script: ${script.succeeded}/${script.total} 文成功`, `${errors.length} 件のエラー: ${errors[0] ? errors[0].error : ''}`, sql);
+              logToConsole('error', i18nT('Script: {0}/{1} 文成功', script.succeeded, script.total), i18nT('{0} 件のエラー: {1}', errors.length, errors[0] ? errors[0].error : ''), sql);
           } else if (lastData) {
               // 末尾の結果セットを既定で見せる（0 件でも「0 件だった」と分かるように出す）
               showResultSet(scriptActiveSet);
               const label = lastData.data.length === 0
-                  ? '最終結果 0 件'
-                  : `最終結果 ${lastData.data.length.toLocaleString()} 件`;
-              const tabs = scriptResultSets.length > 1 ? `／結果セット ${scriptResultSets.length} 個` : '';
-              showToast(`${script.succeeded} / ${script.total} 文を実行しました（${label}${tabs}）。`);
+                  ? i18nT('最終結果 0 件')
+                  : i18nT('最終結果 {0} 件', lastData.data.length.toLocaleString());
+              const tabs = scriptResultSets.length > 1 ? i18nT('／結果セット {0} 個', scriptResultSets.length) : '';
+              showToast(i18nT('{0} / {1} 文を実行しました（{2}{3}）。', script.succeeded, script.total, label, tabs));
           } else {
               els.resArea.innerHTML = `<div class="m-auto text-gray-400 text-sm">${script.succeeded} / ${script.total} statements executed.</div>`;
               clearResultTabs();
-              showToast(`${script.succeeded} / ${script.total} 文を実行しました。`);
+              showToast(i18nT('{0} / {1} 文を実行しました。', script.succeeded, script.total));
           }
           // 実行時間は各文の合計、件数は表示中の結果セットの件数（showResultSet が設定する）
           const totalMs = script.results.reduce((a, r) => a + (Number(r.executionTime) || 0), 0);
@@ -182,8 +187,8 @@
         // 結果セット(SELECT等)は取得件数、DML/DDLは処理行数を表示する
         const isSet = isResultSet(res.data);
         const detail = isSet
-            ? `${res.data.length.toLocaleString()} 件取得 · ${res.executionTime} ms`
-            : `${(res.scannedRows || 0).toLocaleString()} 行処理 · ${res.executionTime} ms`;
+            ? i18nT('{0} 件取得 · {1} ms', res.data.length.toLocaleString(), res.executionTime)
+            : i18nT('{0} 行処理 · {1} ms', (res.scannedRows || 0).toLocaleString(), res.executionTime);
         logToConsole('query', sqlSummary(sql), detail, sql);
         // 文が出した警告（黙って無視された DDL・WHERE なしの全行更新など）を
         // コンソールへ出す。SQL からは SHOW WARNINGS でも読める
@@ -204,7 +209,102 @@
       }
       renderTxnState();
     }
+    // ============================================================================
+    // ワーカーで実行する（Run ⧉ / Ctrl+Shift+Enter）
+    //
+    // JavaScript は単一スレッドなので、メインスレッドで走っているクエリを Cancel
+    // ボタンで止めることはできない — クリックのイベントがそもそも処理されない。
+    // 重いクエリを止めたいなら、実行そのものを別スレッドへ出すしかない。
+    //
+    // ここでは読み取り専用の文だけをワーカーへ送る。書き込みをワーカー側でやると
+    // 「どちらが本物のデータか」が二つに割れるので、メインスレッドを唯一の正とし、
+    // ワーカーには実行の直前に複製を渡す（前回の複製から中身が変わっていなければ省く）。
+    // Cancel はワーカーを terminate する。走っている行ループごと消えるので確実に止まる
+    // ============================================================================
+    let bgSyncedVersion = null;      // 最後にワーカーへ渡した内容の目印
+    let bgRunning = false;
+
+    // 表ごとの変更世代を集めた目印。1 つでも変わっていれば複製し直す
+    function dbStateSignature() {
+        const parts = [];
+        for (const n of Object.keys(db.tables)) {
+            const t = db.tables[n];
+            parts.push(`${n}:${t.version}:${t.rowCount}`);
+        }
+        return parts.join('|');
+    }
+
+    function setBgRunning(on) {
+        bgRunning = on;
+        const cancel = document.getElementById('cancelRunBtn');
+        const bg = document.getElementById('bgRunBtn');
+        const run = document.getElementById('executeBtn');
+        if (cancel) cancel.classList.toggle('hidden', !on);
+        if (bg) bg.disabled = on;
+        if (run) run.disabled = on;
+    }
+
+    async function runQueryInWorker(sqlOverride) {
+        if (bgRunning) return;
+        const sql = (sqlOverride === undefined ? els.query.value : sqlOverride).trim();
+        if (!sql) return;
+        if (!LuminaDB.worker.supported()) {
+            showToast(i18nT('この環境では Worker を使えません。'), true);
+            return;
+        }
+        // 書き込みはメインスレッドの担当（唯一の正を割らないため）
+        const statements = db.splitStatements(sql);
+        if (statements.some(st => !db._isReadOnlyStatement(st))) {
+            showToast(i18nT('ワーカー実行は参照系の文だけです。書き込みは Run を使ってください。'), true);
+            return;
+        }
+        setBgRunning(true);
+        const started = performance.now();
+        try {
+            if (!LuminaDB.worker.running()) await LuminaDB.worker.start();
+            const sig = dbStateSignature();
+            if (sig !== bgSyncedVersion) {
+                await LuminaDB.worker.sync();
+                bgSyncedVersion = sig;
+            }
+            const res = await LuminaDB.worker.query(sql);
+            const ms = (performance.now() - started).toFixed(2);
+            els.mTime.textContent = `${ms} ms`;
+            els.mRows.textContent = (res.scannedRows || 0).toLocaleString();
+            const isSet = isResultSet(res.data);
+            currentResultData = res.data;
+            setEditContext(null);        // ワーカー由来の結果は行の直接編集に使わない
+            renderDisplay(true);
+            setResultExportEnabled(isSet && res.data.length > 0);
+            logToConsole('query', sqlSummary(sql),
+                i18nT('{0} 件取得 · {1} ms（ワーカー）', (res.data || []).length.toLocaleString(), ms), sql);
+        } catch (e) {
+            const msg = (e && e.message) || String(e);
+            if (/stopped/i.test(msg)) {
+                els.resArea.innerHTML = `<div class="m-auto text-gray-500 text-sm">${escapeHtml(i18nT('実行を中止しました。'))}</div>`;
+                logToConsole('warn', sqlSummary(sql), i18nT('実行を中止しました。'), sql);
+            } else {
+                els.resArea.innerHTML = `<div class="m-auto text-red-600 text-sm font-mono font-medium">${escapeHtml(msg)}</div>`;
+                logToConsole('error', sqlSummary(sql), msg, sql);
+            }
+            setEditContext(null);
+        } finally {
+            setBgRunning(false);
+        }
+    }
+
+    function cancelWorkerRun() {
+        if (!bgRunning) return;
+        // terminate なので、走っている行ループごと消える。次回は起動し直す
+        LuminaDB.worker.stop();
+        bgSyncedVersion = null;
+        setBgRunning(false);
+        showToast(i18nT('実行を中止しました。'));
+    }
+
     document.getElementById('executeBtn').addEventListener('click', () => { saveQueryState(); runQuery(); });
+    document.getElementById('bgRunBtn').addEventListener('click', () => { saveQueryState(); runQueryInWorker(); });
+    document.getElementById('cancelRunBtn').addEventListener('click', cancelWorkerRun);
 
     // ============================================================================
     // Explain: カーソル位置（無ければ全体）の SELECT の実行計画だけを見る。
@@ -216,7 +316,7 @@
       if (!stmt) return;
       if (/^explain\b/i.test(stmt)) { runQuery(stmt); return; }
       if (!/^(select|with|table|values)\b/i.test(stmt)) {
-        showToast('Explain は SELECT / WITH の文にだけ使えます。', true);
+        showToast(i18nT('Explain は SELECT / WITH の文にだけ使えます。'), true);
         return;
       }
       runQuery(`EXPLAIN ${stmt}`);
@@ -236,7 +336,7 @@
       const ind = document.getElementById('txnIndicator');
       if (!dot || !label || !ind) return;
       dot.className = `w-2 h-2 rounded-full ${inTx ? 'bg-amber-500 animate-pulse' : 'bg-gray-300'}`;
-      label.textContent = inTx ? `IN TRANSACTION (${db.undoLog.length} 変更)` : 'AUTOCOMMIT';
+      label.textContent = inTx ? i18nT('IN TRANSACTION ({0} 変更)', db.undoLog.length) : 'AUTOCOMMIT';
       ind.className = `inline-flex items-center gap-1.5 font-semibold ${inTx ? 'text-amber-600' : 'text-gray-400'}`;
       document.getElementById('txnBeginBtn').disabled = inTx;
       document.getElementById('txnCommitBtn').disabled = !inTx;
@@ -280,8 +380,8 @@
         apply(sel.value);
         try { localStorage.setItem(KEY, String(db.statementTimeoutMs)); } catch (e) { /* 保存できなくても動く */ }
         showToast(db.statementTimeoutMs === 0
-            ? '実行時間の上限を外しました。'
-            : `実行時間の上限を ${db.statementTimeoutMs / 1000} 秒にしました。`);
+            ? i18nT('実行時間の上限を外しました。')
+            : i18nT('実行時間の上限を {0} 秒にしました。', db.statementTimeoutMs / 1000));
       });
       // Clear DB などで db インスタンスが作り直されても設定を引き継ぐ
       window.reapplyStatementTimeout = () => { db.statementTimeoutMs = Number(sel.value) || 0; };

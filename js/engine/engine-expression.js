@@ -20,6 +20,62 @@
     // 表に無い名前は従来どおり寛容なままなので、この表は「増やすほど厳しくなる」だけで
     // 既存の動作を狭めることはない
     // ------------------------------------------------------------------------
+    // `IN (...)` の照合を O(1) にするための、リストごとの索引。
+    //
+    // __in はリストを線形に走査していた。`IN (1, 2, 3)` なら何でもないが、
+    // `WHERE k IN (SELECT g FROM t)` は同じ 20 万件の配列を 1 行ごとに舐めるので
+    // 外側 400 行 × 20 万件 = 8,000 万回の比較になっていた（実測 810ms。
+    // 同じ意味を JOIN で書くと 3ms なので、書き方だけで 270 倍違っていた）。
+    //
+    // WeakMap のキーはリスト配列そのものなので、その配列が生きている間だけ索引も残る。
+    // ヘルパーは状態を持たない方針だが、これは配列の同一性に紐づく純粋なメモなので
+    // クエリ間へ漏れることはない
+    // 全文検索の語切り。転置索引（Table.ftPostings）と照合（__match_against）が
+    // 同じ規則で切らないと、索引で拾えない行が出て「索引の有無で答えが変わる」。
+    // 1 箇所に置いて両方から使う
+    const LUMINA_DEC_PLACES = (v) => {
+        if (!isFinite(v)) return -1;
+        if (Number.isInteger(v)) return 0;
+        const s = String(v);
+        const e = s.indexOf('e') !== -1 ? s.indexOf('e') : s.indexOf('E');
+        if (e !== -1) {
+            const exp = Number(s.slice(e + 1));
+            const mant = s.slice(0, e);
+            const dot = mant.indexOf('.');
+            const mantDec = dot === -1 ? 0 : mant.length - dot - 1;
+            const d = mantDec - exp;
+            return d > 0 ? d : 0;
+        }
+        const dot = s.indexOf('.');
+        return dot === -1 ? 0 : s.length - dot - 1;
+    };
+    const LUMINA_FT_TOKENS = (s) => {
+        if (s == null) return [];
+        return String(s).toLowerCase()
+            .replace(/[　-〿・]/g, ' ')
+            .split(/[^0-9a-z_À-ɏ぀-ヿ一-鿿]+/)
+            .filter(t => t !== '');
+    };
+
+    // 検索語の切り出し。転置索引で候補を絞る側（engine-select）と、実際に一致を判定する
+    // 側（__match_against）が同じ解釈をしないと、索引経路だけ取りこぼす行が出る
+    const LUMINA_FT_PARSE = (query, mode) => {
+        const raw = String(query == null ? '' : query);
+        const boolean = /bool/i.test(String(mode || ''));
+        const terms = [];
+        const re = /([+-]?)(?:"([^"]*)"|(\S+))/g;
+        let m;
+        while ((m = re.exec(raw))) {
+            const body = m[2] !== undefined ? m[2] : m[3];
+            const toks = LUMINA_FT_TOKENS(body);
+            if (toks.length === 0) continue;
+            terms.push({ sign: boolean ? m[1] : '', phrase: ' ' + toks.join(' '), prefix: /\*$/.test(body), toks });
+        }
+        return { boolean, terms };
+    };
+
+    const LUMINA_IN_SETS = new WeakMap();
+
     const LUMINA_FN_ARITY = {
         // 数値
         ABS: [1, 1], SIGN: [1, 1], CEIL: [1, 1], CEILING: [1, 1], FLOOR: [1, 1],
@@ -235,8 +291,50 @@
               const __nul = (v) => v === null || v === undefined;
               // IN の 3 値論理: 左辺が NULL なら UNKNOWN。一致が無くてもリストに
               // NULL が含まれていれば UNKNOWN（NOT IN が真にならない＝実DBと同じ）
+              // ある値と __eq が「等しい」と見なす候補値を並べる。
+              // 生値をキーにした集合・索引を引くとき、寄せたぶんを取り落とさないために使う
+              const __eq_probe_values = (v) => {
+                  const out = [];
+                  if (typeof v === 'number') {
+                      out.push(String(v));
+                      if (v === 0) out.push(false);
+                      if (v === 1) out.push(true);
+                  } else if (typeof v === 'boolean') {
+                      out.push(v ? 1 : 0, v ? '1' : '0');
+                  } else if (typeof v === 'string') {
+                      const t = v.trim();
+                      if (t !== '') {
+                          const n = Number(t);
+                          if (isFinite(n)) {
+                              out.push(n);
+                              if (n === 0) out.push(false);
+                              if (n === 1) out.push(true);
+                          }
+                      }
+                  }
+                  return out;
+              };
               const __in = (v, list) => {
                   if (v === null || v === undefined) return null;
+                  // 長いリストは 1 度だけ集合へ起こして使い回す（副問い合わせの IN が効く）。
+                  // 短いリストは線形のままにする — 集合を作る方が高くつく
+                  if (Array.isArray(list) && list.length >= 32) {
+                      let ix = LUMINA_IN_SETS.get(list);
+                      if (ix === undefined) {
+                          const set = new Set();
+                          let hasNull = false;
+                          for (const x of list) {
+                              if (x === null || x === undefined) hasNull = true; else set.add(x);
+                          }
+                          ix = { set, hasNull };
+                          LUMINA_IN_SETS.set(list, ix);
+                      }
+                      // Set は NaN を「同じ」と見るが、元の実装は `x === v` なので
+                      // NaN はどの要素にも一致しなかった。そこだけ合わせる
+                      if (typeof v === 'number' && Number.isNaN(v)) return ix.hasNull ? null : false;
+                      if (ix.set.has(v)) return true;
+                      return ix.hasNull ? null : false;
+                  }
                   let sawNull = false;
                   for (const x of list) {
                       if (x === null || x === undefined) { sawNull = true; continue; }
@@ -246,9 +344,31 @@
               };
               // 算術の NULL 伝播。SQL では被演算子に NULL があれば結果は NULL
               const __num = (v) => (typeof v === 'number') ? v : Number(v);
-              const __add = (a, b) => (__nul(a) || __nul(b)) ? null : __num(a) + __num(b);
-              const __sub = (a, b) => (__nul(a) || __nul(b)) ? null : __num(a) - __num(b);
-              const __mul = (a, b) => (__nul(a) || __nul(b)) ? null : __num(a) * __num(b);
+              // 十進の値どうしの加減乗は、二進小数の誤差を持ち込まずに返す。
+              //
+              // SUM は桁をずらした整数で足すことで既に十進で合っていたが、式の中の
+              // 演算は素の倍精度のままだった（`0.1 + 0.2` が 0.30000000000000004、
+              // `price * 3` が 0.30000000000000004 のような値になる）。
+              //
+              // 十進で s1 桁と s2 桁の値なら、真の答えの桁数は加減で max(s1, s2)、
+              // 乗で s1 + s2 に必ず収まる。倍精度の計算結果はその桁数へ丸めれば
+              // 真の十進値へ戻る（誤差は最下位よりはるかに小さい）。
+              // 桁が深い / 大きすぎて丸めが効かない場合は素の結果をそのまま返す
+              const __dec_fix = (r, a, b, mul) => {
+                  if (!isFinite(r)) return r;
+                  const sa = LUMINA_DEC_PLACES(a), sb = LUMINA_DEC_PLACES(b);
+                  if (sa < 0 || sb < 0) return r;
+                  const sc = mul ? sa + sb : (sa > sb ? sa : sb);
+                  if (sc === 0 || sc > 12) return r;             // 整数だけ / 深すぎる桁
+                  // 桁をずらした値が正確な整数の範囲に収まらないと、丸めが逆に値を壊す。
+                  // 例: 999999999999999.5 を 1 桁へ丸めようとすると 10 倍した
+                  // 9999999999999995 が倍精度で表せず、999999999999999.6 になっていた
+                  if (!(Math.abs(r) * Math.pow(10, sc) <= Number.MAX_SAFE_INTEGER)) return r;
+                  return __round_scale(r, sc);
+              };
+              const __add = (a, b) => { if (__nul(a) || __nul(b)) return null; const x = __num(a), y = __num(b); return __dec_fix(x + y, x, y, false); };
+              const __sub = (a, b) => { if (__nul(a) || __nul(b)) return null; const x = __num(a), y = __num(b); return __dec_fix(x - y, x, y, false); };
+              const __mul = (a, b) => { if (__nul(a) || __nul(b)) return null; const x = __num(a), y = __num(b); return __dec_fix(x * y, x, y, true); };
               // 0 除算は MySQL 同様 NULL（例外にすると行評価の catch に飲まれて判らなくなる）
               const __divf = (a, b) => (__nul(a) || __nul(b) || __num(b) === 0) ? null : __num(a) / __num(b);
               const __modf = (a, b) => (__nul(a) || __nul(b) || __num(b) === 0) ? null : __num(a) % __num(b);
@@ -744,26 +864,62 @@
               // ブラウザは IANA タイムゾーン DB を持つが、ここでは 'UTC' / '+09:00' 形式と
               // 主要な別名だけを扱う（実行環境差で結果がぶれないようにするため）
               const __TZ_OFFSETS = { UTC: 0, GMT: 0, Z: 0, JST: 540, KST: 540, IST: 330, CET: 60, EET: 120, EST: -300, CST: -360, MST: -420, PST: -480 };
-              // タイムゾーン名 → UTC からの分。AT TIME ZONE と CONVERT_TZ で共有する
-              const __tz_minutes = (tz) => {
-                  const name = String(tz).trim().toUpperCase();
+              // IANA 名（'Asia/Tokyo'）は Intl から引く。'JST' のような略称は上の固定表を
+              // 使い続ける（略称は地域によって指す時刻が違うので、固定値のままにする）。
+              //
+              // 夏時間があるので、オフセットは「その瞬間」に対して求めなければならない。
+              // 固定値を持つと 'America/New_York' が年間ずっと -5 時間になり、夏の
+              // 時刻が 1 時間ずれる。DateTimeFormat は生成が重いので名前ごとに使い回す
+              const __tzFmtCache = Object.create(null);
+              const __tz_fmt = (name) => {
+                  if (name in __tzFmtCache) return __tzFmtCache[name];
+                  let f = null;
+                  try {
+                      f = new Intl.DateTimeFormat('en-US', {
+                          timeZone: name, hour12: false,
+                          year: 'numeric', month: '2-digit', day: '2-digit',
+                          hour: '2-digit', minute: '2-digit', second: '2-digit'
+                      });
+                  } catch (e) { f = null; }        // 未知の地名は null を覚えて二度試さない
+                  __tzFmtCache[name] = f;
+                  return f;
+              };
+              const __tz_iana_minutes = (name, atMs) => {
+                  const f = __tz_fmt(name);
+                  if (!f) return null;
+                  const p = Object.create(null);
+                  for (const part of f.formatToParts(new Date(atMs))) p[part.type] = part.value;
+                  if (!p.year || !p.hour) return null;
+                  // その地域の壁時計を UTC として読み直し、実際の瞬間との差を取る
+                  const wall = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day),
+                                        Number(p.hour) % 24, Number(p.minute), Number(p.second));
+                  return Math.round((wall - atMs) / 60000);
+              };
+              // タイムゾーン名 → UTC からの分。AT TIME ZONE と CONVERT_TZ で共有する。
+              // atMs はオフセットを求める瞬間（夏時間の判定に使う）
+              const __tz_minutes = (tz, atMs) => {
+                  const raw = String(tz).trim();
+                  const name = raw.toUpperCase();
                   const om = name.match(/^([+-])(\d{1,2}):?(\d{2})?$/);
                   if (om) return (om[1] === '-' ? -1 : 1) * (Number(om[2]) * 60 + Number(om[3] || 0));
                   if (Object.prototype.hasOwnProperty.call(__TZ_OFFSETS, name)) return __TZ_OFFSETS[name];
-                  throw new Error(`Unknown time zone '${tz}'. Use 'UTC', '+09:00' or a common abbreviation.`);
+                  const at = (atMs === undefined || atMs === null || isNaN(atMs)) ? Date.now() : atMs;
+                  const ia = __tz_iana_minutes(raw, at);
+                  if (ia !== null) return ia;
+                  throw new Error(`Unknown time zone '${tz}'. Use an IANA name like 'Asia/Tokyo', 'UTC', '+09:00' or a common abbreviation.`);
               };
               const __at_time_zone = (v, tz) => {
                   if (v == null || tz == null) return null;
                   const d = __date_parse(v);
                   if (!d || isNaN(d.getTime())) return null;
-                  return new Date(d.getTime() + __tz_minutes(tz) * 60000).toISOString().replace('T', ' ').slice(0, 19);
+                  return new Date(d.getTime() + __tz_minutes(tz, d.getTime()) * 60000).toISOString().replace('T', ' ').slice(0, 19);
               };
               // CONVERT_TZ(ts, from, to): MySQL。from の壁時計を to の壁時計へ読み替える
               const __convert_tz = (v, from, to) => {
                   if (v == null || from == null || to == null) return null;
                   const d = __date_parse(v);
                   if (!d || isNaN(d.getTime())) return null;
-                  const diff = __tz_minutes(to) - __tz_minutes(from);
+                  const diff = __tz_minutes(to, d.getTime()) - __tz_minutes(from, d.getTime());
                   return new Date(d.getTime() + diff * 60000).toISOString().replace('T', ' ').slice(0, 19);
               };
 
@@ -808,26 +964,12 @@
               // 全文検索 MATCH(cols) AGAINST(query [IN BOOLEAN MODE])。
               // 語単位（英数字と CJK は文字単位）に分解し、真偽値または簡易スコアを返す。
               // ブール記法: +必須 / -除外 / "句" / 語末 *（前方一致）
-              const __ft_tokens = (s) => {
-                  if (s == null) return [];
-                  return String(s).toLowerCase()
-                      .replace(/[　-〿・]/g, ' ')
-                      .split(/[^0-9a-z_À-ɏ぀-ヿ一-鿿]+/)
-                      .filter(t => t !== '');
-              };
+              const __ft_tokens = LUMINA_FT_TOKENS;
               const __match_against = (haystack, query, mode) => {
                   const text = ' ' + __ft_tokens(haystack).join(' ') + ' ';
-                  const raw = String(query == null ? '' : query);
-                  const boolean = /bool/i.test(String(mode || ''));
-                  const terms = [];
-                  const re = /([+-]?)(?:"([^"]*)"|(\S+))/g;
-                  let m;
-                  while ((m = re.exec(raw))) {
-                      const body = m[2] !== undefined ? m[2] : m[3];
-                      const toks = __ft_tokens(body);
-                      if (toks.length === 0) continue;
-                      terms.push({ sign: boolean ? m[1] : '', phrase: ' ' + toks.join(' '), prefix: /\*$/.test(body) });
-                  }
+                  const parsed = LUMINA_FT_PARSE(query, mode);
+                  const boolean = parsed.boolean;
+                  const terms = parsed.terms;
                   if (terms.length === 0) return 0;
                   let hits = 0;
                   for (const t of terms) {
@@ -939,7 +1081,17 @@
               // 行評価ごとの型名パースは発生しない
               const __cast = (v, t, p, s) => {
                   if (v === null || v === undefined) return null;
-                  if (t === 'INTEGER') { const n = Math.trunc(Number(v)); return isNaN(n) ? null : n; }
+                  if (t === 'INTEGER') {
+                      const n = Math.trunc(Number(v));
+                      if (isNaN(n)) return null;
+                      // 2^53 を超える整数は float64 で表しきれないので、丸めた値を返さず
+                      // NULL にする。CAST('9223372036854775807' AS BIGINT) は
+                      // 9223372036854776000 という「入力に無い数」を返していた。
+                      // 変換不能を NULL で表すのは下の DECIMAL / BOOLEAN 分岐と同じ規約
+                      // （式評価中の throw は行単位の catch に飲まれて結局 NULL になる）
+                      if (!Number.isSafeInteger(n)) return null;
+                      return n;
+                  }
                   if (t === 'FLOAT') { const n = Number(v); return isNaN(n) ? null : n; }
                   if (t === 'DECIMAL') {
                       const n = Number(v);
@@ -2091,7 +2243,59 @@
                   }
                   return res;
               };
-              const __corr_exists = (k, ptrs, dbTables, aliases) => __corr_run(k, ptrs, dbTables, aliases).n > 0;
+              // 相関 EXISTS のうち「内側が 1 表の等価 1 本だけ」という形は、
+              // 値ごとに問い合わせを回さずに済む。
+              //
+              // __corr_run は相異なる相関値ごとに結果を覚えるが、覚えるだけで
+              // 1 回目は内側を実行する。内側の列に索引が無いとそれが毎回の全表走査になり、
+              // 相異なり 400 通り × 20 万行で 4.8 秒かかっていた（索引があれば 21ms）。
+              //
+              // 形が合えば、その列の値の集合を文の中で 1 度だけ作って所属を見る。
+              // 集合は「その列に現れる値」そのものなので、EXISTS の答えと一致する
+              const __corr_exists_set = (spec, eng, dbTables) => {
+                  if (spec.existsSet !== undefined) return spec.existsSet;
+                  spec.existsSet = null;                       // 既定は「使えない」
+                  if (!spec.refs || spec.refs.length !== 1) return null;
+                  // SELECT ... FROM <表> [AS <別名>] WHERE <表|別名>.<列> = __OREF_0__
+                  const m = String(spec.sql).match(
+                      /^\s*select\s+[\s\S]+?\s+from\s+([a-zA-Z0-9_]+)(?:\s+(?:as\s+)?([a-zA-Z0-9_]+))?\s+where\s+(?:([a-zA-Z0-9_]+)\.)?([a-zA-Z0-9_]+)\s*=\s*__OREF_0__\s*$/i);
+                  if (!m) return null;
+                  const tbl = m[1].toLowerCase(), alias = (m[2] || m[1]).toLowerCase();
+                  const qual = m[3] ? m[3].toLowerCase() : null;
+                  const col = m[4].toLowerCase();
+                  if (qual && qual !== alias && qual !== tbl) return null;
+                  const t = dbTables[tbl];
+                  if (!t || !t.cols || !t.cols[col]) return null;
+                  // 照合順序付きの列は生値の集合では判定できない
+                  if (t.collations && t.collations[col]) return null;
+                  const set = new Set();
+                  if (t.indices && t.indices[col]) {
+                      for (const key of t.indices[col].keys()) { if (key !== null && key !== undefined) set.add(key); }
+                  } else {
+                      for (let i = 0; i < t.rowCount; i++) {
+                          const v = t.getValue(col, i);
+                          if (v !== null && v !== undefined) set.add(v);
+                      }
+                  }
+                  spec.existsSet = set;
+                  return set;
+              };
+              const __corr_exists = (k, ptrs, dbTables, aliases) => {
+                  const eng = dbTables.__engine__;
+                  const spec = (eng && eng._corrSubs) ? eng._corrSubs[k] : null;
+                  if (spec) {
+                      const set = __corr_exists_set(spec, eng, dbTables);
+                      if (set) {
+                          const v = __resolve(spec.refs[0], ptrs, dbTables, aliases);
+                          if (v === null || v === undefined) return false;   // NULL = NULL は真にならない
+                          if (set.has(v)) return true;
+                          // 比較側は型を寄せるので、寄せた候補も引く（__in と同じ考え方）
+                          for (const cand of __eq_probe_values(v)) { if (set.has(cand)) return true; }
+                          return false;
+                      }
+                  }
+                  return __corr_run(k, ptrs, dbTables, aliases).n > 0;
+              };
               // 相関スカラーサブクエリ。2 行以上返したらエラー（非相関側と同じ規則）。
               // 行評価の catch に飲まれて NULL に化けないよう __fatal を立てて上位へ伝播させる
               const __corr_scalar = (k, ptrs, dbTables, aliases) => {
@@ -2662,7 +2866,7 @@
                   return JSON.stringify(acc);
               };
               // 配列: 重複除去 / 連結 / 反転
-              const __array_key = (x) => (x === null || x === undefined) ? ' n' : (typeof x) + ':' + String(x);
+              const __array_key = (x) => (x === null || x === undefined) ? '\0n' : (typeof x) + ':' + String(x);
               const __array_distinct = (a) => {
                   const arr = __toArray(a);
                   if (arr == null) return null;

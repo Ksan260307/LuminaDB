@@ -21,7 +21,7 @@ const ENGINE = ['table.js', 'engine-core.js', 'engine-expression.js', 'engine-su
 const SQL_ONLY = ['v13', 'v15', 'v16', 'v34', 'v36', 'v37', 'v38', 'v39', 'v40', 'v41', 'v42',
                   'v43', 'v44', 'v45', 'v46', 'v47', 'v48', 'v49', 'v50',
                   'v51', 'v52', 'v53', 'v54', 'v55', 'v56',
-                  'v57', 'v58', 'v59', 'v60', 'v61', 'v62'];
+                  'v57', 'v58', 'v59', 'v60', 'v61', 'v62', 'v65', 'v66', 'v67', 'v68', 'v69', 'v70', 'v71'];
 
 const argv = process.argv.slice(2);
 const slowAt = (() => {

@@ -106,7 +106,10 @@ async function main() {
     // 5) awaitPromise で runTestSuite の完了を待って結果を取得
     const EXPR = `(async () => {
         const wait = (ms) => new Promise(r => setTimeout(r, ms));
-        for (let i = 0; i < 300 && typeof runTestSuite !== 'function'; i++) await wait(50);
+        // テストは製品ページに同梱していないので、まず取り寄せる（js/tests/manifest.js）
+        for (let i = 0; i < 300 && typeof loadTestSuites !== 'function'; i++) await wait(50);
+        if (typeof loadTestSuites !== 'function') return { ok: false, error: 'loadTestSuites not loaded (js/tests/manifest.js)' };
+        try { await loadTestSuites(); } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
         if (typeof runTestSuite !== 'function') return { ok: false, error: 'runTestSuite not loaded' };
         await runTestSuite();
         const d = (typeof currentResultData !== 'undefined' && currentResultData) ? currentResultData : [];
@@ -116,7 +119,8 @@ async function main() {
             fails: fails.map(f => ({ name: f.TestName, error: String(f.Error) })).slice(0, 100) };
     })()`;
 
-    const evalRes = await send('Runtime.evaluate', { expression: EXPR, awaitPromise: true, returnByValue: true }, 180000);
+    // 実行時間の上限。件数が増えるほど伸びるので広めに取る（既定 3 分では足りなくなった）
+    const evalRes = await send('Runtime.evaluate', { expression: EXPR, awaitPromise: true, returnByValue: true }, 900000);
     if (evalRes.exceptionDetails) { console.error('RUN ERROR:', evalRes.exceptionDetails.text); process.exit(2); }
     const result = evalRes.result && evalRes.result.value;
     ws.close();

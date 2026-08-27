@@ -548,7 +548,10 @@
 
         // --- 数値境界 ---
         { name: "XBnd: Zero Equals Negative Zero", sql: "SELECT 0 = -0 AS v", check: r => r.data[0].v === true },
-        { name: "XBnd: Float Precision Inequality", sql: "SELECT 0.1 + 0.2 = 0.3 AS v", check: r => r.data[0].v === false },
+        // v1.38 から式の中の加減乗も十進で合わせるので、ここは true になる
+        // （二進小数の 0.30000000000000004 を「そういうもの」として固定していた項目）
+        { name: "XBnd: Decimal Addition Is Exact", sql: "SELECT 0.1 + 0.2 = 0.3 AS v", check: r => r.data[0].v === true },
+        { name: "XBnd: Division Still Binary", sql: "SELECT 1.0 / 3.0 * 3.0 = 1.0 AS v", check: r => typeof r.data[0].v === 'boolean' },
         { name: "XBnd: Float Epsilon Compare", sql: "SELECT ABS(0.1 + 0.2 - 0.3) < 0.0000001 AS v", check: r => r.data[0].v === true },
         { name: "XBnd: Types Setup", sql: "CREATE TABLE bx_types (i INTEGER, f FLOAT)", check: r => r.data[0].Result === "Success" },
         { name: "XBnd: Max Safe Integer Roundtrip", fn: () => {

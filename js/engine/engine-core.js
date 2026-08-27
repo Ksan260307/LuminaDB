@@ -3,7 +3,7 @@
     // 各機能メソッドは engine-*.js で prototype 拡張として定義される
     // ============================================================================
     // エンジンバージョン（VERSION() 関数 / SHOW STATUS / 外部APIが参照する）
-    var LUMINA_VERSION = '1.34.0';
+    var LUMINA_VERSION = '1.38.0';
 
     class DatabaseEngine {
       constructor() {
@@ -696,6 +696,16 @@
 
         const executionTime = performance.now() - startTime;
         if (isTopLevel) { this._deadline = 0; this._recordProfile(rawSql, startTime, resultSet ? resultSet.length : 0, null); }
+        // 文字列プールの自動回収。UPDATE を繰り返すと参照されない文字列が溜まり続けるので、
+        // 膨らみに印が付いた表をここで詰める。文が成功した後・トランザクションの外だけ:
+        // 巻き戻しはプールの長さを控えて splice で戻すため、控えが生きている間に詰めると
+        // 復元が壊れる（Table.compactStringPools の注意書きと同じ理由）
+        if (isTopLevel && !this.inTransaction) {
+            for (const tn in this.tables) {
+                const tb = this.tables[tn];
+                if (tb && tb._poolBloat) tb.compactStringPools();
+            }
+        }
         const out = {
           data: resultSet,
           executionTime: Math.max(0.01, executionTime).toFixed(2),

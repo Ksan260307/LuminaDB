@@ -84,6 +84,8 @@
 
     // 楽観ロック用: このタブが最後に読み込み/保存したスナップショットのバージョン番号
     let dbSnapshotVersion = 0;
+    // 列ごとの指紋: table -> col -> fp
+    let storedColFingerprints = Object.create(null);
 
     // 保存済みの世代番号を読む。新形式は 'meta'、旧形式は 'latest' に入っている
     function readStoredVersion(idb) {
@@ -130,7 +132,13 @@
     // ------------------------------------------------------------------------
     const META_KEY = 'meta';
     const CHUNK_FORMAT = 'chunked-v1';
+    // 列単位の差分保存。chunked-v1 は表 1 つを 1 レコードに書いていたので、
+    // 1 列を直しただけでも全列を直列化 + 暗号化していた（20 万行 4 列で 86ms / 12.3MB）。
+    // v2 は列ごとにレコードを分け、指紋の変わった列だけを書く。
+    // 読み込みは v1 も受けるので、既に保存してある DB はそのまま開ける
+    const CHUNK_FORMAT_V2 = 'chunked-v2';
     const tableKey = (name) => 'tbl:' + name;
+    const colKey = (name, col) => 'col:' + name + '|' + col;
     // 直近に保存したテーブルの指紋（このタブが把握している保存済みの状態）
     let storedFingerprints = Object.create(null);
     // 統計（テストと SHOW STORAGE 用）: 直近保存で何テーブル書いたか
@@ -184,17 +192,57 @@
         });
         const removed = Object.keys(storedFingerprints).filter(n => !(n in fps));
 
-        // 変更のあったテーブルだけ暗号化する（暗号化は保存コストの大半を占める）
+        // 変更のあった列だけ暗号化する（暗号化は保存コストの大半を占める）。
+        // 表のレコードには列データ以外（スキーマ・制約・文字列プール）を入れ、
+        // 列データは 1 列 1 レコードに分ける
         const records = [];
-        for (const n of changed) records.push([tableKey(n), await encryptRecord(idb, dataObj[n], version)]);
-        const metaRecord = await encryptRecord(idb, { __format__: CHUNK_FORMAT, tables: fps, catalog }, version);
-        metaRecord.__format__ = CHUNK_FORMAT;   // 復号せずに形式を判別できるよう外側にも置く
+        const colFps = Object.create(null);
+        const writtenCols = [];
+        for (const n of tableNames) {
+            const t = dataObj[n];
+            const cols = Object.keys(t.cols || {});
+            colFps[n] = Object.create(null);
+            let wroteAnyCol = false;
+            for (const c of cols) {
+                const cf = t.cols[c].fp !== undefined ? String(t.cols[c].fp) : null;
+                colFps[n][c] = cf;
+                const prev = storedColFingerprints[n] && storedColFingerprints[n][c];
+                // 指紋が取れない列（旧ダンプ由来）は毎回書く
+                if (cf === null || prev !== cf) {
+                    writtenCols.push([n, c]);
+                    wroteAnyCol = true;
+                    // 文字列プールも列に属するので一緒に置く。表側に残すと
+                    // テキスト列のある表で毎回プール全体を書き直すことになる
+                    records.push([colKey(n, c), await encryptRecord(idb,
+                        { num: t.cols[c].num, meta: t.cols[c].meta, pool: (t.strPools || {})[c] || [] }, version)]);
+                }
+            }
+            // 表そのものの記述（列データ以外）を書く条件。
+            //
+            // 列を 1 つでも書いたなら必ず書く。ここを「表の指紋が変わったとき」だけに
+            // していると、v1 で保存された DB を開いた直後の初回保存で崩れる:
+            // 表の指紋は v1 の meta から引き継がれて「変わっていない」のに、列の指紋は
+            // 未知なので全列が書かれる。すると tbl: レコードだけ v1 のまま残り、
+            // 読み込み側が __cols__ の無い殻を v2 として読んで列が全部消える
+            if (changed.includes(n) || wroteAnyCol || !storedColFingerprints[n]) {
+                const shell = Object.create(null);
+                for (const k of Object.keys(t)) { if (k !== 'cols' && k !== 'strPools' && k !== 'strMaps') shell[k] = t[k]; }
+                shell.__cols__ = cols;
+                records.push([tableKey(n), await encryptRecord(idb, shell, version)]);
+            }
+        }
+        const metaRecord = await encryptRecord(idb, { __format__: CHUNK_FORMAT_V2, tables: fps, cols: colFps, catalog }, version);
+        metaRecord.__format__ = CHUNK_FORMAT_V2;   // 復号せずに形式を判別できるよう外側にも置く
 
         await new Promise((resolve, reject) => {
             const tx = idb.transaction(IDB_STORE, 'readwrite');
             const store = tx.objectStore(IDB_STORE);
             records.forEach(([k, v]) => store.put(v, k));
-            removed.forEach(n => store.delete(tableKey(n)));
+            removed.forEach(n => {
+                store.delete(tableKey(n));
+                const cf = storedColFingerprints[n] || {};
+                Object.keys(cf).forEach(c => store.delete(colKey(n, c)));
+            });
             store.put(metaRecord, META_KEY);
             // 旧形式の全体レコードが残っていれば、新形式への移行後に片付ける
             store.delete('latest');
@@ -211,8 +259,9 @@
         });
 
         storedFingerprints = fps;
+        storedColFingerprints = colFps;
         lastSaveStats = {
-            tables: tableNames.length, written: changed.length,
+            tables: tableNames.length, written: changed.length, writtenColumns: writtenCols.length,
             skipped: tableNames.length - changed.length, removed: removed.length,
             full: changed.length === tableNames.length
         };
@@ -243,12 +292,36 @@
             const dump = Object.create(null);
             Object.keys(m.catalog || {}).forEach(k => { dump[k] = m.catalog[k]; });
             const names = Object.keys(m.tables || {});
+            const isV2 = m.__format__ === CHUNK_FORMAT_V2;
             for (const n of names) {
                 const rec = await idbGet(idb, tableKey(n));
                 if (rec === undefined) continue;   // 破損時はその表だけ落とす（全損より良い）
-                dump[n] = await decryptRecord(idb, rec);
+                const shell = await decryptRecord(idb, rec);
+                if (!isV2) { dump[n] = shell; continue; }
+                // v2: 列データは 1 列 1 レコード。表のレコードには列以外が入っている
+                const cols = Object.create(null);
+                const pools = Object.create(null);
+                let broken = false;
+                for (const c of (shell.__cols__ || [])) {
+                    const cr = await idbGet(idb, colKey(n, c));
+                    if (cr === undefined) { broken = true; break; }
+                    const dec = await decryptRecord(idb, cr);
+                    cols[c] = { num: dec.num, meta: dec.meta };
+                    pools[c] = dec.pool || [];
+                }
+                if (broken) continue;              // 列が欠けた表は落とす（半分だけ復元しない）
+                delete shell.__cols__;
+                shell.cols = cols;
+                shell.strPools = pools;            // strMaps は取り込み側がプールから作り直す
+                dump[n] = shell;
             }
             storedFingerprints = Object.assign(Object.create(null), m.tables || {});
+            storedColFingerprints = Object.create(null);
+            if (isV2) {
+                for (const n of Object.keys(m.cols || {})) {
+                    storedColFingerprints[n] = Object.assign(Object.create(null), m.cols[n]);
+                }
+            }
             dump.__version__ = dbSnapshotVersion;
             return dump;
         }
@@ -257,6 +330,7 @@
         if (data !== undefined) {
             dbSnapshotVersion = (typeof data.__version__ === 'number') ? data.__version__ : 0;
             storedFingerprints = Object.create(null);
+            storedColFingerprints = Object.create(null);   // 表側と必ず一緒に捨てる
             if (data.__encrypted__) return decryptRecord(idb, data);
             return data;
         }
@@ -304,6 +378,7 @@
         });
         dbSnapshotVersion = 0;
         storedFingerprints = Object.create(null);
+        storedColFingerprints = Object.create(null);   // 表側と必ず一緒に捨てる
         lastSaveStats = { tables: 0, written: 0, skipped: 0, removed: 0, full: true };
     }
 

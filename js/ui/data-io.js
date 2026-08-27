@@ -81,10 +81,10 @@
         const dot = line.querySelector('span');
         const text = line.querySelector('span:last-child');
         if (dot) dot.className = `inline-block w-1.5 h-1.5 rounded-full shrink-0 ${pending ? 'bg-amber-500' : 'bg-green-500'}`;
-        if (text) text.textContent = pending ? 'このブラウザへ保存中…' : 'このブラウザへ自動保存';
+        if (text) text.textContent = pending ? i18nT('このブラウザへ保存中…') : i18nT('このブラウザへ自動保存');
         line.title = pending
-            ? '変更を検知しました。まもなくこのブラウザ（IndexedDB）へ書き込みます。Ctrl + S で今すぐ保存できます。'
-            : '変更は 1 秒後にこのブラウザ（IndexedDB）へ自動保存されます。Ctrl + S で今すぐ保存できます。';
+            ? i18nT('変更を検知しました。まもなくこのブラウザ（IndexedDB）へ書き込みます。Ctrl + S で今すぐ保存できます。')
+            : i18nT('変更は 1 秒後にこのブラウザ（IndexedDB）へ自動保存されます。Ctrl + S で今すぐ保存できます。');
     }
     window.refreshStorageState = refreshStorageState;
 
@@ -95,9 +95,9 @@
             const { tables, rows } = currentDbScale();
             const st = (typeof getSaveStats === 'function') ? getSaveStats() : null;
             const saved = st && st.tables
-                ? `前回の保存: ${st.tables} 表中 ${st.written} 表を書き込み（${st.skipped} 表は変更なしで省略）`
-                : 'このセッションではまだ手動保存していません（自動保存は動いています）';
-            line.textContent = `いまのデータ: ${tables} 表 / ${rows.toLocaleString()} 行 — ${saved}`;
+                ? i18nT('前回の保存: {0} 表中 {1} 表を書き込み（{2} 表は変更なしで省略）', st.tables, st.written, st.skipped)
+                : i18nT('このセッションではまだ手動保存していません（自動保存は動いています）');
+            line.textContent = i18nT('いまのデータ: {0} 表 / {1} 行 — {2}', tables, rows.toLocaleString(), saved);
         }
         updateFileLabel();
     }
@@ -107,9 +107,9 @@
       try {
         await saveDB(db.exportForIDB());
         refreshStorageInfo();
-        showToast('IndexedDB にデータを保存しました。');
+        showToast(i18nT('IndexedDB にデータを保存しました。'));
       } catch (e) {
-        showToast(`保存エラー: ${e.message}`, true);
+        showToast(i18nT('保存エラー: {0}', e.message), true);
       }
     });
 
@@ -120,11 +120,11 @@
             db.importFromIDB(dump);
             renderTree();
             refreshStorageInfo();
-            showToast('IndexedDB からデータを読み込みました。');
+            showToast(i18nT('IndexedDB からデータを読み込みました。'));
         } else {
-            showToast('保存されたデータがありません。', true);
+            showToast(i18nT('保存されたデータがありません。'), true);
         }
-      } catch(e) { showToast(`読み込みエラー: ${e.message}`, true); }
+      } catch(e) { showToast(i18nT('読み込みエラー: {0}', e.message), true); }
     });
 
     document.getElementById('clearIdbBtn').addEventListener('click', () => {
@@ -139,13 +139,15 @@
       currentResultData = null;
       renderTree();
       els.resArea.innerHTML = `<div class="m-auto text-gray-400 text-sm">Run a query to see results.</div>`;
-      showToast('IndexedDB のデータを削除し、初期状態にリセットしました。');
+      showToast(i18nT('IndexedDB のデータを削除し、初期状態にリセットしました。'));
       document.getElementById('clearConfirmModal').classList.add('hidden');
     });
 
     // ファイルを 1 本のヘルパーで落とす（従来は書き出しごとに同じ 5 行を書いていた）
+    // text は文字列でも「断片の配列」でもよい。大きなダンプは配列で渡すと
+    // 巨大な 1 本の文字列を作らずに済む（Blob は断片をそのまま連結できる）
     function downloadText(text, filename, mime) {
-        const blob = new Blob([text], { type: `${mime};charset=utf-8;` });
+        const blob = new Blob(Array.isArray(text) ? text : [text], { type: `${mime};charset=utf-8;` });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -186,7 +188,7 @@
         const text = dbFileText();
         if (!fsSupported()) {
             downloadText(text, 'luminadb.luminadb.json', 'application/json');
-            showToast('このブラウザはファイルへの直接保存に未対応のため、ダウンロードしました。');
+            showToast(i18nT('このブラウザはファイルへの直接保存に未対応のため、ダウンロードしました。'));
             return { fallback: true };
         }
         try {
@@ -202,12 +204,12 @@
             await w.close();
             currentFileHandle = handle;
             updateFileLabel();
-            showToast(`${handle.name} に保存しました（${text.length.toLocaleString()} 文字）。`);
+            showToast(i18nT('{0} に保存しました（{1} 文字）。', handle.name, text.length.toLocaleString()));
             return { name: handle.name, bytes: text.length };
         } catch (e) {
             // ユーザーがダイアログを閉じただけならエラー扱いにしない
             if (e && e.name === 'AbortError') return { cancelled: true };
-            showToast(`ファイルに保存できませんでした: ${e && e.message}`, true);
+            showToast(i18nT('ファイルに保存できませんでした: {0}', e && e.message), true);
             return { error: String(e && e.message) };
         }
     }
@@ -215,10 +217,10 @@
     async function openDbFromFile() {
         const load = (text, name) => {
             const res = LuminaDB.restoreBackup(text);
-            if (res && res.error) { showToast(`読み込めませんでした: ${res.error}`, true); return false; }
+            if (res && res.error) { showToast(i18nT('読み込めませんでした: {0}', res.error), true); return false; }
             renderTree();
             if (typeof reapplyStatementTimeout === 'function') reapplyStatementTimeout();
-            showToast(`${name} を読み込みました。`);
+            showToast(i18nT('{0} を読み込みました。', name));
             return true;
         };
         if (!fsSupported()) {
@@ -246,7 +248,7 @@
             return { name: handle.name, bytes: text.length };
         } catch (e) {
             if (e && e.name === 'AbortError') return { cancelled: true };
-            showToast(`ファイルを開けませんでした: ${e && e.message}`, true);
+            showToast(i18nT('ファイルを開けませんでした: {0}', e && e.message), true);
             return { error: String(e && e.message) };
         }
     }
@@ -257,23 +259,23 @@
         const el = document.getElementById('openFileLabel');
         const saveBtn = document.getElementById('fileSaveBtn');
         if (el) {
-            el.textContent = currentFileHandle ? `ファイル: ${currentFileHandle.name}` : '';
+            el.textContent = currentFileHandle ? i18nT('ファイル: {0}', currentFileHandle.name) : '';
             el.classList.toggle('hidden', !currentFileHandle);
         }
         if (saveBtn) saveBtn.disabled = !currentFileHandle;
         const name = document.getElementById('openFileName');
         if (name) {
             name.textContent = currentFileHandle
-                ? `開いているファイル: ${currentFileHandle.name}`
-                : '開いているファイルはありません（「名前を付けて保存」または「開く」から始めます）';
+                ? i18nT('開いているファイル: {0}', currentFileHandle.name)
+                : i18nT('開いているファイルはありません（「名前を付けて保存」または「開く」から始めます）');
         }
         const note = document.getElementById('fileApiNote');
         if (note) {
             const unsupported = !fsSupported();
             note.classList.toggle('hidden', !unsupported);
             if (unsupported) {
-                note.textContent = 'このブラウザ（または file:// で開いた場合）はファイルを直接読み書きできません。'
-                    + '「保存」はダウンロード、「開く」はファイル選択に切り替わります。上書き保存はできないため、毎回新しいファイルになります。';
+                note.textContent = i18nT('このブラウザ（または file:// で開いた場合）はファイルを直接読み書きできません。')
+                    + i18nT('「保存」はダウンロード、「開く」はファイル選択に切り替わります。上書き保存はできないため、毎回新しいファイルになります。');
             }
         }
     }
@@ -305,8 +307,8 @@
             return;
         }
         saveDB(db.exportForIDB())
-            .then(() => { refreshStorageInfo(); showToast('IndexedDB にデータを保存しました。'); })
-            .catch(err => showToast(`保存エラー: ${err.message}`, true));
+            .then(() => { refreshStorageInfo(); showToast(i18nT('IndexedDB にデータを保存しました。')); })
+            .catch(err => showToast(i18nT('保存エラー: {0}', err.message), true));
     });
 
     // 取り込み結果をモーダル内に出す。従来は件数だけをトーストで流していたため、
@@ -326,12 +328,15 @@
     }
 
     document.getElementById('exportSqlBtn').addEventListener('click', () => {
-        const sqlStr = db.exportSQL();
-        downloadText(sqlStr, 'luminadb_export.sql', 'text/sql');
+        // 断片のまま Blob へ渡す（20 万行のダンプで 5.5MB の文字列を作らない）
+        const parts = db.exportSQLParts();
+        downloadText(parts, 'luminadb_export.sql', 'text/sql');
+        let sqlLen = 0;
+        for (const p of parts) sqlLen += p.length;
         const info = document.getElementById('exportSqlInfo');
         const tables = Object.keys(db.tables).filter(t => !t.startsWith('__tmp_') && !db.tables[t].isTemp).length;
-        if (info) info.textContent = `${tables} 表 / ${sqlStr.length.toLocaleString()} 文字を luminadb_export.sql として保存しました。`;
-        showToast(`SQL ダンプを書き出しました（${tables} 表）。`);
+        if (info) info.textContent = i18nT('{0} 表 / {1} 文字を luminadb_export.sql として保存しました。', tables, sqlLen.toLocaleString());
+        showToast(i18nT('SQL ダンプを書き出しました（{0} 表）。', tables));
     });
 
     // 全テーブルを JSON で書き出す（結果セットではなくデータベース全体）
@@ -344,9 +349,9 @@
             out[t] = r.error ? { __error: r.error } : r.data;
         });
         const names = Object.keys(out);
-        if (names.length === 0) { showToast('書き出せるテーブルがありません。', true); return; }
+        if (names.length === 0) { showToast(i18nT('書き出せるテーブルがありません。'), true); return; }
         downloadText(JSON.stringify(out, null, 2), 'luminadb_export.json', 'application/json');
-        showToast(`${names.length} 表を JSON として書き出しました。`);
+        showToast(i18nT('{0} 表を JSON として書き出しました。', names.length));
     });
 
     document.getElementById('importSqlBtn').addEventListener('click', () => {
@@ -367,23 +372,23 @@
 
             renderTree();
             if (failures.length === 0) {
-                showImportLog([`${label}: ${successCount} 件の SQL 文をすべて実行しました。`], false);
-                showToast(`${successCount} 件の SQL 文を実行しました。`);
+                showImportLog([i18nT('{0}: {1} 件の SQL 文をすべて実行しました。', label, successCount)], false);
+                showToast(i18nT('{0} 件の SQL 文を実行しました。', successCount));
             } else {
                 // 失敗した文は「何行目のどの文がなぜ落ちたか」まで出す（最大 20 件）
-                const head = `${label}: ${successCount} / ${statements.length} 件成功、${failures.length} 件失敗`;
+                const head = i18nT('{0}: {1} / {2} 件成功、{3} 件失敗', label, successCount, statements.length, failures.length);
                 const lines = [head].concat(
                     failures.slice(0, 20).map(f => `✕ ${f.sql.replace(/\s+/g, ' ').slice(0, 100)}\n   → ${f.error}`)
                 );
-                if (failures.length > 20) lines.push(`… 他 ${failures.length - 20} 件`);
+                if (failures.length > 20) lines.push(i18nT('… 他 {0} 件', failures.length - 20));
                 showImportLog(lines, true);
-                showToast(`${failures.length} 件の SQL 文が失敗しました（詳細はモーダル内）。`, true);
+                showToast(i18nT('{0} 件の SQL 文が失敗しました（詳細はモーダル内）。', failures.length), true);
             }
             if (successCount > 0) triggerAutoSave();
             return { successCount, failed: failures.length };
         } catch (err) {
-            showImportLog([`SQL インポート失敗: ${err.message}`], true);
-            showToast(`SQLインポート失敗: ${err.message}`, true);
+            showImportLog([i18nT('SQL インポート失敗: {0}', err.message)], true);
+            showToast(i18nT('SQLインポート失敗: {0}', err.message), true);
             return { successCount: 0, failed: 1 };
         }
     }
@@ -405,10 +410,10 @@
        try {
            const generatedCount = db.generateDummyData(tbl, count);
            renderTree();
-           showToast(`${generatedCount.toLocaleString()}行のデータを ${tbl} に追加しました。`);
+           showToast(i18nT('{0}行のデータを {1} に追加しました。', generatedCount.toLocaleString(), tbl));
            triggerAutoSave();
        } catch (err) {
-           showToast(`データ生成失敗: ${err.message}`, true);
+           showToast(i18nT('データ生成失敗: {0}', err.message), true);
        }
        closeModal('dataModal');
     });
@@ -440,36 +445,36 @@
             table = (nameEl ? nameEl.value : '').trim();
             create = true;
             if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table)) {
-                showImportLog(['新しい表の名前を英数字とアンダースコアで入力してください（先頭は英字か _）。'], true);
-                showToast('新しい表の名前が不正です。', true);
+                showImportLog([i18nT('新しい表の名前を英数字とアンダースコアで入力してください（先頭は英字か _）。')], true);
+                showToast(i18nT('新しい表の名前が不正です。'), true);
                 return { error: 'invalid table name' };
             }
             if (db.tables[table.toLowerCase()]) {
-                showImportLog([`表 '${table}' はすでにあります。取り込み先から選ぶか、別の名前にしてください。`], true);
-                showToast(`表 '${table}' はすでに存在します。`, true);
+                showImportLog([i18nT('表 \'{0}\' はすでにあります。取り込み先から選ぶか、別の名前にしてください。', table)], true);
+                showToast(i18nT('表 \'{0}\' はすでに存在します。', table), true);
                 return { error: 'table exists' };
             }
         }
         if (!table) {
-            showImportLog(['取り込み先の表が選ばれていません。'], true);
-            showToast('取り込み先の表が選ばれていません。', true);
+            showImportLog([i18nT('取り込み先の表が選ばれていません。')], true);
+            showToast(i18nT('取り込み先の表が選ばれていません。'), true);
             return { error: 'no table' };
         }
 
         const res = LuminaDB.importCSV(text, table, { create, replace });
         renderTree();
         if (res && res.error) {
-            showImportLog([`${label}: 取り込みに失敗しました。`, `→ ${res.error}`], true);
-            showToast(`インポート失敗: ${res.error}`, true);
+            showImportLog([i18nT('{0}: 取り込みに失敗しました。', label), `→ ${res.error}`], true);
+            showToast(i18nT('インポート失敗: {0}', res.error), true);
             return res;
         }
         const n = (res && res.rows) || 0;
         const cols = (res && res.columns) ? res.columns.join(', ') : '';
         showImportLog([
-            `${label}: ${n.toLocaleString()} 行を ${table} に取り込みました${create ? '（表を新規作成）' : ''}。`,
-            cols ? `列: ${cols}` : ''
+            i18nT('{0}: {1} 行を {2} に取り込みました{3}。', label, n.toLocaleString(), table, create ? '（表を新規作成）' : ''),
+            cols ? i18nT('列: {0}', cols) : ''
         ].filter(Boolean), false);
-        showToast(`${n.toLocaleString()} 行を ${table} にインポートしました。`);
+        showToast(i18nT('{0} 行を {1} にインポートしました。', n.toLocaleString(), table));
         if (n > 0) triggerAutoSave();
         return res;
     }
@@ -479,8 +484,8 @@
         const file = fileInput.files[0];
         clearImportLog();
         if (!file) {
-            showImportLog(['CSV ファイルが選ばれていません。'], true);
-            return showToast("CSVファイルが選択されていません。", true);
+            showImportLog([i18nT('CSV ファイルが選ばれていません。')], true);
+            return showToast(i18nT('CSVファイルが選択されていません。'), true);
         }
         const reader = new FileReader();
         reader.onload = (event) => {
@@ -586,12 +591,12 @@
 
     function copyToClipboard(text, label) {
         if (!navigator.clipboard || !navigator.clipboard.writeText) {
-            showToast('このブラウザではクリップボードを利用できません。', true);
+            showToast(i18nT('このブラウザではクリップボードを利用できません。'), true);
             return;
         }
         navigator.clipboard.writeText(text)
-            .then(() => showToast(`${label} をコピーしました（${text.length.toLocaleString()} 文字）。`))
-            .catch(() => showToast('クリップボードへのコピーに失敗しました。', true));
+            .then(() => showToast(i18nT('{0} をコピーしました（{1} 文字）。', label, text.length.toLocaleString())))
+            .catch(() => showToast(i18nT('クリップボードへのコピーに失敗しました。'), true));
     }
 
     // 表計算ソフトへそのまま貼れる TSV。値中のタブ・改行は空白へ畳む
@@ -607,14 +612,14 @@
     document.getElementById('copyMdBtn').addEventListener('click', () => {
         const rows = exportRows();
         if (!rows || rows.length === 0) return;
-        copyToClipboard(resultToMarkdown(rows), 'Markdown 表');
+        copyToClipboard(resultToMarkdown(rows), i18nT('Markdown 表'));
     });
 
     const copyTsvBtn = document.getElementById('copyTsvBtn');
     if (copyTsvBtn) copyTsvBtn.addEventListener('click', () => {
         const rows = exportRows();
         if (!rows || rows.length === 0) return;
-        copyToClipboard(resultToTsv(rows), `TSV ${rows.length} 行`);
+        copyToClipboard(resultToTsv(rows), i18nT('TSV {0} 行', rows.length));
     });
 
     document.getElementById('copyInsertBtn').addEventListener('click', () => {
@@ -622,7 +627,7 @@
         if (!rows || rows.length === 0) return;
         // 基底表が判っていればその名前を、判らなければ汎用の名前を使う
         const table = (typeof editContext !== 'undefined' && editContext.editable) ? editContext.table : 'target_table';
-        copyToClipboard(resultToInserts(rows, table), `INSERT 文 ${rows.length} 件`);
+        copyToClipboard(resultToInserts(rows, table), i18nT('INSERT 文 {0} 件', rows.length));
     });
 
     // 結果セットを JSON ファイルとしてダウンロードする（行オブジェクトの配列 / 整形出力）

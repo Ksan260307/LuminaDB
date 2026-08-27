@@ -1,0 +1,50 @@
+{
+  "name": "luminadb",
+  "version": "1.38.0",
+  "description": "Build-free in-memory SQL database engine that runs entirely in the browser, with a Node/Bun entry point",
+  "type": "module",
+  "private": true,
+  "main": "./index.mjs",
+  "module": "./index.mjs",
+  "types": "./types/luminadb.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/luminadb.d.ts",
+      "import": "./dist/luminadb.mjs"
+    },
+    "./LuminaDB.html": "./LuminaDB.html",
+    "./js/*": "./js/*"
+  },
+  "files": [
+    "index.mjs",
+    "dist/",
+    "types/",
+    "js/engine/",
+    "js/storage/",
+    "js/worker/",
+    "js/api/",
+    "js/ui/",
+    "js/main.js",
+    "LuminaDB.html",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "bun test/browser-test.mjs",
+    "test:sql": "bun test/run-suite.mjs all",
+    "build": "bun tools/build-esm.mjs"
+  },
+  "keywords": [
+    "sql",
+    "database",
+    "in-memory",
+    "browser",
+    "indexeddb",
+    "no-build",
+    "columnar"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

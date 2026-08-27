@@ -2660,6 +2660,19 @@
         // ============================================================
         ...getV63Tests(),
 
+        // ============================================================
+        // v1.35: 画面表示の日本語 / 英語切り替え（既定は日本語）。
+        //   既定・切り替え・訳し漏れの有無・原文への往復・訳さない領域を見る（DOM 依存）
+        // ============================================================
+        ...getV64Tests(),
+        ...getV65Tests(),
+        ...getV66Tests(),
+        ...getV67Tests(),
+        ...getV68Tests(),
+        ...getV69Tests(),
+        ...getV70Tests(),
+        ...getV71Tests(),
+
         // Cleanup (New Features)
         { name: "Drop View Stats", sql: "DROP VIEW v_stats", check: r => true },
         { name: "Drop View Seniors", sql: "DROP VIEW v_seniors", check: r => true },

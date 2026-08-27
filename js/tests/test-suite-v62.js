@@ -311,7 +311,10 @@
       });
       val('V62Tz NULL 入力', "SELECT CONVERT_TZ(NULL, 'UTC', 'JST') AS r", null);
       val('V62Tz NULL の時間帯', "SELECT CONVERT_TZ('2024-01-01 00:00:00', NULL, 'JST') AS r", null);
-      err('V62Tz 未知の時間帯', "SELECT CONVERT_TZ('2024-01-01 00:00:00', 'UTC', 'Asia/Tokyo') AS r", 'unknown time zone');
+      // IANA 名は v1.36 から Intl 経由で引けるようになったので、ここは実在しない地名で見る
+      // （'Asia/Tokyo' を未知として固定していたのは、対応前の制限をそのまま写していたもの）
+      err('V62Tz 未知の時間帯', "SELECT CONVERT_TZ('2024-01-01 00:00:00', 'UTC', 'Mars/Olympus') AS r", 'unknown time zone');
+      val('V62Tz IANA 名が引ける', "SELECT CONVERT_TZ('2024-01-01 00:00:00', 'UTC', 'Asia/Tokyo') AS r", '2024-01-01 09:00:00');
       err('V62Tz 引数 2 個', "SELECT CONVERT_TZ('2024-01-01 00:00:00', 'UTC') AS r", 'parameter count');
       t('V62Tz AT TIME ZONE と整合する', () => {
         const a = valsOf("SELECT CONVERT_TZ(ts, 'UTC', '+09:00') AS r FROM v62_t ORDER BY id");
