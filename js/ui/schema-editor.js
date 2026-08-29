@@ -52,7 +52,7 @@
         document.getElementById('schemaTableName').textContent = tName;
         document.getElementById('schemaErrorMsg').classList.add('hidden');
         renderSchemaEditor();
-        document.getElementById('schemaModal').classList.remove('hidden');
+        openModal('schemaModal');
     }
 
     function renderSchemaEditor() {
@@ -68,14 +68,14 @@
             const opt = (v) => `<option value="${v}" ${col.type === v ? 'selected' : ''}>${v}</option>`;
             row.innerHTML = `
                 <div class="flex items-center gap-2">
-                    <div class="text-gray-400 cursor-grab active:cursor-grabbing px-1">
+                    <div class="text-gray-500 cursor-grab active:cursor-grabbing px-1">
                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8h16M4 16h16"></path></svg>
                     </div>
-                    <input type="text" class="flex-1 border border-gray-300 rounded px-3 py-1.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none col-name-input shadow-sm transition-all" data-idx="${idx}" value="${escapeHtmlSchema(col.newName)}" placeholder="Column Name">
+                    <input type="text" class="flex-1 border border-gray-300 rounded px-3 py-1.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none col-name-input shadow-sm transition-all" data-idx="${idx}" value="${escapeHtmlSchema(col.newName)}" placeholder="${escapeHtmlSchema(i18nT('列名'))}" aria-label="${escapeHtmlSchema(i18nT('列名'))}" required pattern="[a-zA-Z_][a-zA-Z0-9_]*" maxlength="64" title="${escapeHtmlSchema(i18nT('英数字とアンダースコアで入力してください（先頭は英字か _）。'))}">
                     <select class="border border-gray-300 rounded px-2 py-1.5 text-sm outline-none col-type-select focus:border-blue-500 shadow-sm" data-idx="${idx}">
                         ${['ANY','INTEGER','FLOAT','TEXT','BOOLEAN','DATE'].map(opt).join('')}
                     </select>
-                    <button class="text-gray-400 hover:text-red-500 hover:bg-red-50 p-1.5 rounded transition-colors col-del-btn opacity-50 group-hover:opacity-100" data-idx="${idx}" title="Delete Column">
+                    <button class="text-gray-500 hover:text-red-500 hover:bg-red-50 p-1.5 rounded transition-colors col-del-btn opacity-50 group-hover:opacity-100" data-idx="${idx}" title="Delete Column">
                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
                     </button>
                 </div>
@@ -216,6 +216,50 @@
         if (tn) html = html.replace(new RegExp(`(\\(\\s*|\\s)(${tn})\\b`, 'g'), `$1<span class="text-blue-300 font-bold">$2</span>`);
 
         previewEl.innerHTML = html;
+        updateSchemaDanger();
+    }
+
+    // 「この保存で何が失われるか」を先に出す。
+    // 列の削除と型変換は元に戻せない（保存失敗時のロールバックは効くが、
+    // 成功したうえで値が落ちる分は取り返せない）
+    function updateSchemaDanger() {
+        const el = document.getElementById('schemaDangerMsg');
+        if (!el) return;
+        const t = db.tables[editingSchema.tableName];
+        const rows = t ? t.rowCount : 0;
+        const warn = [];
+
+        // 名前を空にした行も「削除」として数える。
+        // 以前は oldName !== newName を先に見ていたため、空欄は
+        // 「列名を変えます: id → 。」という**改名の予告**になっていた。
+        // 実際には列ごと消えるので、いちばん危ない操作にいちばん誤った説明が
+        // 付いていたことになる（保存は止めるようにしたが、予告も直しておく）
+        const dropped = editingSchema.cols.filter(c => !c.isNew && c.oldName
+            && (c.isDeleted || c.newName.trim() === ''));
+        if (dropped.length > 0) {
+            warn.push(i18nT('列 {0} を削除します（{1} 行分の値が失われます）。',
+                dropped.map(c => `「${c.oldName}」`).join('、'), rows.toLocaleString()));
+        }
+        const retyped = editingSchema.cols.filter(c =>
+            !c.isNew && !c.isDeleted && c.newName.trim() !== '' && t &&
+            (t.colTypes[c.newName.toLowerCase()] || 'ANY') !== c.type);
+        if (retyped.length > 0) {
+            warn.push(i18nT('列 {0} の型を変えます。変換できない値は失われます。',
+                retyped.map(c => `「${c.newName}」`).join('、')));
+        }
+        // 改名は「新しい名前がある」ものだけ（空欄は上の削除で数えている）
+        const renamed = editingSchema.cols.filter(c => !c.isNew && !c.isDeleted && c.oldName
+            && c.newName.trim() !== '' && c.oldName !== c.newName);
+        if (renamed.length > 0) {
+            warn.push(i18nT('列名を変えます: {0}。この名前を使っているビュー・トリガーは追随しません。',
+                renamed.map(c => `${c.oldName} → ${c.newName}`).join('、')));
+        }
+
+        if (warn.length === 0) { el.classList.add('hidden'); el.textContent = ''; return; }
+        el.classList.remove('hidden');
+        // XSS対策: 列名はユーザー入力由来なのでエスケープしてから組み立てる
+        el.innerHTML = `<div class="font-semibold mb-1">${escapeHtmlSchema(i18nT('保存すると元に戻せません'))}</div>`
+            + warn.map(w => `<div class="text-xs leading-relaxed">・${escapeHtmlSchema(w)}</div>`).join('');
     }
 
     document.getElementById('execSchemaSaveBtn').addEventListener('click', () => {
@@ -227,18 +271,44 @@
         errorEl.classList.add('hidden');
         errorEl.textContent = '';
 
+        const fail = (msg) => {
+            errorEl.textContent = msg;
+            errorEl.classList.remove('hidden');
+            // 直すべき欄へ連れて行く（エラーだけ出して放置しない）
+            const bad = document.querySelector('#schemaColumnList input.col-name-input');
+            if (bad) { try { bad.focus(); } catch (e) { /* 消えていれば何もしない */ } }
+        };
+
+        // 名前を空にしたまま保存しようとしたら止める。
+        //
+        // 以前は「空の名前 = その列を保存対象から外す」という扱いだったため、
+        // 名前欄を消しただけで**その列が黙って落ちていた**。実測では users の
+        // 主キー id が 10 行分の値ごと消え、モーダルは成功したかのように閉じた。
+        // 消したいなら削除の操作があるので、空欄は明確な入力ミスとして扱う
+        const blank = editingSchema.cols.filter(c => !c.isDeleted && c.newName.trim() === '');
+        if (blank.length > 0) {
+            return fail(i18nT('列名が空の行があります。消したい列は削除ボタンを使ってください。'));
+        }
+
+        // 識別子として使える名前かを確かめる。
+        // CSV 取り込みの表名は同じ判定で弾いているのに、ここだけ素通りで、
+        // `1abc スペース` のような名前が通って、あとから
+        // 「PRIMARY KEY constraint failed」という無関係なエラーになっていた
+        const badName = editingSchema.cols
+            .filter(c => !c.isDeleted)
+            .find(c => !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(c.newName.trim()));
+        if (badName) {
+            return fail(i18nT('列名「{0}」は使えません。英数字とアンダースコアで入力してください（先頭は英字か _）。', badName.newName));
+        }
+
         const activeCols = editingSchema.cols.filter(c => !c.isDeleted && c.newName !== '');
         if(activeCols.length === 0) {
-            errorEl.textContent = i18nT('テーブルには少なくとも1つのカラムが必要です。');
-            errorEl.classList.remove('hidden');
-            return;
+            return fail(i18nT('表には少なくとも 1 つの列が必要です。'));
         }
 
         const names = activeCols.map(c => c.newName.toLowerCase());
         if(new Set(names).size !== names.length) {
-            errorEl.textContent = i18nT('カラム名が重複しています。');
-            errorEl.classList.remove('hidden');
-            return;
+            return fail(i18nT('列名が重複しています。'));
         }
 
         // バックアップ（ロールバック用）。cloneFull は列データに加え型・制約
@@ -279,11 +349,11 @@
             // --- 制約の適用（engine-ddl の CREATE TABLE / ADD 制約と同じ正規化・検証） ---
             const lc = s => s.toLowerCase();
             const pks = activeCols.filter(c => c.pk);
-            if (pks.length > 1) throw new Error(i18nT('PRIMARY KEY は1カラムのみ指定できます。'));
+            if (pks.length > 1) throw new Error(i18nT('PRIMARY KEY に指定できる列は 1 つだけです。'));
             const pkCol = pks.length === 1 ? lc(pks[0].newName) : null;
 
             const ais = activeCols.filter(c => c.autoInc);
-            if (ais.length > 1) throw new Error(i18nT('AUTO_INCREMENT は1カラムのみ指定できます。'));
+            if (ais.length > 1) throw new Error(i18nT('AUTO_INCREMENT に指定できる列は 1 つだけです。'));
             const aiCol = ais.length === 1 ? lc(ais[0].newName) : null;
 
             // CREATE TABLE と同様に PK 列は uniqueCols から除外する
@@ -331,7 +401,7 @@
             [...(pkCol ? [pkCol] : []), ...uniqueSet].forEach(c => { if (!t.indices[c]) t.createIndex(c); });
 
             renderTree();
-            document.getElementById('schemaModal').classList.add('hidden');
+            closeModal('schemaModal');
             showToast(i18nT('Table \'{0}\' のスキーマを更新しました。', tName));
             triggerAutoSave();
         } catch (e) {

@@ -5,11 +5,11 @@
     const CHUNK_SIZE = 50;
 
     // --- Interactive Sorting ---
-    els.resArea.addEventListener('click', (e) => {
-        const th = e.target.closest('th[data-col]');
-        if (!th || !currentResultData || currentResultData.length === 0) return;
-
-        const col = th.dataset.col;
+    // 列見出しは tabindex="0" + role="button" の th。
+    // 以前は素の th に cursor-pointer を当てただけで、並べ替えは
+    // マウス専用だった（キーボードでは到達も実行もできない）
+    function sortByColumn(col) {
+        if (!col || !currentResultData || currentResultData.length === 0) return;
         if (currentSort.col === col) {
             currentSort.asc = !currentSort.asc;
         } else {
@@ -30,6 +30,49 @@
         // 解除しないと「− Row」が選んだのとは別の行を削除する（データ破壊）
         clearRowSelection();
         renderDisplay(true);
+        // 描き直しでフォーカスが飛ぶので、同じ列の見出しへ戻す。
+        // 列名は任意の文字を含みうるので、属性セレクタを組み立てずに走査して照合する
+        const again = [...els.resArea.querySelectorAll('th[data-col]')]
+            .find(th => th.dataset.col === col);
+        if (again) { try { again.focus(); } catch (e) { /* 消えていれば何もしない */ } }
+    }
+
+    els.resArea.addEventListener('click', (e) => {
+        const th = e.target.closest('th[data-col]');
+        if (th) sortByColumn(th.dataset.col);
+    });
+    // Enter / Space で並べ替える（見出しは role="button" として宣言している）
+    els.resArea.addEventListener('keydown', (e) => {
+        const el = e.target.closest && e.target.closest('th[data-col], td[data-r]');
+        if (!el) return;
+        // 列見出し: Enter / Space で並べ替え
+        if (el.tagName === 'TH') {
+            if (e.key !== 'Enter' && e.key !== ' ') return;
+            e.preventDefault();
+            sortByColumn(el.dataset.col);
+            return;
+        }
+        // データセル: 矢印で移動 / Enter で値の詳細 / F2 で編集。
+        // クリックとダブルクリックしか入口が無く、キーボードだけでは
+        // 値を読むことも直すこともできなかった
+        const moveTo = (r, c) => {
+            const next = els.resArea.querySelector(`td[data-r="${r}"][data-c="${c}"]`);
+            if (next) { e.preventDefault(); next.focus(); }
+        };
+        const r = Number(el.dataset.r), c = Number(el.dataset.c);
+        if (e.key === 'ArrowRight') return moveTo(r, c + 1);
+        if (e.key === 'ArrowLeft')  return moveTo(r, c - 1);
+        if (e.key === 'ArrowDown')  return moveTo(r + 1, c);
+        if (e.key === 'ArrowUp')    return moveTo(r - 1, c);
+        if (e.key === 'F2') { e.preventDefault(); beginCellEdit(el); return; }
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            const rows = filteredResultData();
+            const row = rows[r];
+            if (!row) return;
+            const col = Object.keys(row)[c];
+            openCellModal(col, row[col]);
+        }
     });
 
     // 行の選択を解除する。表示順が変わる操作（並べ替え・絞り込み・再実行）の直後に
@@ -59,7 +102,7 @@
        }
 
        if (!currentResultData || currentResultData.length === 0) {
-          if (reset) els.resArea.innerHTML = `<div class="m-auto text-gray-500 text-sm">No rows returned.</div>`;
+          if (reset) els.resArea.innerHTML = `<div class="m-auto text-gray-500 text-sm">${i18nT('該当する行はありません。')}</div>`;
           return;
        }
 
@@ -88,14 +131,34 @@
 
        const chunk = targetData.slice(currentDisplayOffset, currentDisplayOffset + CHUNK_SIZE);
        const chunkStart = currentDisplayOffset;
-       let ths = `<tr>${keys.map(k => {
-           let sortIcon = '<span class="text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity ml-1">⇅</span>';
+
+       // 行を識別する列は横スクロールしても残す。
+       // 40 列の表は内容 3,400px に対して表示が 1,000px ほどしかなく、
+       // 右へ送るとキー列が画面外へ出て「これはどの行か」が判らなくなっていた
+       // （列見出しは sticky top で縦には残るが、横には何も残らなかった）。
+       // 編集可のときは基底表のキー列、そうでなければ先頭列を固定する
+       const freezeCol = (editContext.editable && editContext.keyCols && editContext.keyCols.length === 1)
+           ? editContext.keyCols[0]
+           : keys[0];
+       const freezeIdx = keys.indexOf(freezeCol);
+       // 1 列しか無い結果で固定しても意味が無い（かつ影が邪魔になる）
+       const useFreeze = keys.length > 3 && freezeIdx === 0;
+
+       let ths = `<tr>${keys.map((k, ki) => {
+           let sortIcon = '<span class="text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity ml-1">⇅</span>';
            if (currentSort.col === k) {
                sortIcon = currentSort.asc
                    ? '<span class="text-blue-500 ml-1 inline-block transform">↑</span>'
                    : '<span class="text-blue-500 ml-1 inline-block transform">↓</span>';
            }
-           return `<th class="px-4 py-2 font-semibold border-r border-gray-200 last:border-0 sticky top-0 bg-gray-100 shadow-sm z-20 cursor-pointer hover:bg-gray-200 select-none group" data-col="${escapeHtml(k)}">${escapeHtml(k)}${sortIcon}</th>`;
+           // aria-sort は「いまこの列で並んでいるか、向きはどちらか」を支援技術へ伝える
+           const ariaSort = currentSort.col === k ? (currentSort.asc ? 'ascending' : 'descending') : 'none';
+           // 固定列の見出しは縦横どちらにも残る（z を上げて他の sticky より前に出す）
+           const frozen = useFreeze && ki === freezeIdx;
+           const pos = frozen ? ' sticky -top-4 -left-4 z-30' : ' sticky -top-4 z-20';
+           return `<th scope="col" role="button" tabindex="0" aria-sort="${ariaSort}"`
+               + ` title="${escapeHtml(i18nT('クリックまたは Enter で並べ替え'))}"`
+               + ` class="px-4 py-2 font-semibold border-r border-gray-200 last:border-0${pos} bg-gray-100 shadow-sm cursor-pointer hover:bg-gray-200 select-none group" data-col="${escapeHtml(k)}">${escapeHtml(k)}${sortIcon}</th>`;
        }).join('')}</tr>`;
 
        let trs = chunk.map((row, ri) => {
@@ -103,7 +166,26 @@
           // 属性なので td の子要素は増えない（セル値のエスケープ検証テストが要求する）
           const rowIdx = chunkStart + ri;
           let tds = Object.values(row).map((v, ci) => {
-             const pos = ` data-r="${rowIdx}" data-c="${ci}"`;
+             // data-r / data-c に加えて tabindex / role を持たせる。
+             // セルの詳細（クリック）と編集（ダブルクリック）はマウス専用で、
+             // キーボードだけでは触れなかった。Enter で詳細・F2 で編集を受ける
+             // 省略されたときに中身が判るよう、長い値だけ title を付ける
+             //（短い値にまで付けるとツールチップが鬱陶しい）
+             const raw = v === null || v === undefined ? '' : String(v);
+             const tip = raw.length > 40 ? ` title="${escapeHtml(raw.slice(0, 400))}"` : '';
+             const attr = ` data-r="${rowIdx}" data-c="${ci}" tabindex="0" role="gridcell"${tip}`;
+             // 固定列は横スクロールしても残す。透けないよう背景を敷く
+             const frozen = useFreeze && ci === freezeIdx;
+             // 列幅に上限を置いて、超えたぶんは省略する。
+             //
+             // 上限が無かったので、400 文字のセル 1 つで列が 4,833px に広がり、
+             // 表全体が 4,976px（横スクロール約 4,950px）になって 3 列目が
+             // 画面外へ出ていた。説明欄・JSON・ログ行なら普通にある長さで、
+             // テキスト列を含む実データではグリッドが用を成さなくなる。
+             // 全文はセルの詳細（クリック / Enter）で読めるので、
+             // ここは「一覧できること」を優先する
+             const cell = (extra) => 'px-4 py-1.5 border-r border-gray-200 last:border-0 max-w-md truncate'
+                 + (frozen ? ' sticky -left-4 z-10 bg-white' : '') + ' ' + extra;
              // XSS対策: セル値は必ずエスケープしてから innerHTML へ挿入する
              const esc = escapeHtml(v);
              // 緑/赤の「状態色」は **結果の形** で決める（statusShape）。
@@ -113,26 +195,35 @@
              // エラー扱いの赤地になっていた
              if (statusShape) {
                  if(v==="Success"||v==="PASS"||(typeof v==='string' && (v.includes("inserted")||v.includes("updated")||v.includes("deleted")))){
-                     return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-green-600 font-medium">${esc}</td>`;
+                     return `<td${attr} class="${cell('text-green-600 font-medium')}">${esc}</td>`;
                  }
                  if(v==="FAIL"||(typeof v==='string' && v.includes("Assertion") && !v.includes("not found"))){
-                     return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-red-600 font-medium">${esc}</td>`;
+                     return `<td${attr} class="${cell('text-red-600 font-medium')}">${esc}</td>`;
                  }
-                 if(typeof v==='string' && (v.includes("not found") || v.includes("Type mismatch") || v.includes("Foreign key constraint failed"))) return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-red-600 font-bold bg-red-50">${esc}</td>`;
+                 if(typeof v==='string' && (v.includes("not found") || v.includes("Type mismatch") || v.includes("Foreign key constraint failed"))) return `<td${attr} class="${cell('text-red-600 font-bold bg-red-50')}">${esc}</td>`;
              }
-             if(typeof v==='number') return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-blue-600">${v}</td>`;
-             if(typeof v==='boolean') return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-purple-600 font-semibold">${v}</td>`;
+             if(typeof v==='number') return `<td${attr} class="${cell('text-blue-600')}">${v}</td>`;
+             if(typeof v==='boolean') return `<td${attr} class="${cell('text-purple-600 font-semibold')}">${v}</td>`;
              // NULL と文字列 'null' と空文字が同じ見た目だったので区別できる印にする
-             if(v===null||v===undefined) return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-gray-400 italic">[NULL]</td>`;
-             if(v==='') return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-gray-300 italic">[empty]</td>`;
-             return `<td${pos} class="px-4 py-1.5 border-r border-gray-200 last:border-0 text-gray-700">${esc}</td>`;
+             // 白地で gray-400 は約 2.6:1、gray-300 は約 1.5:1 しかなく、
+             // NULL と空文字を区別する印そのものが読めなかった
+             if(v===null||v===undefined) return `<td${attr} class="${cell('text-gray-500 italic')}">[NULL]</td>`;
+             if(v==='') return `<td${attr} class="${cell('text-gray-500 italic')}">[empty]</td>`;
+             return `<td${attr} class="${cell('text-gray-700')}">${esc}</td>`;
           }).join('');
           return `<tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0">${tds}</tr>`;
        }).join('');
 
        if (reset) {
            els.resArea.innerHTML = `
-              <div class="rounded-lg border border-gray-200 overflow-hidden bg-white w-fit min-w-full shadow-sm relative z-10 flex flex-col h-full">
+              <!-- overflow-hidden を置かないこと。
+                   overflow が visible 以外の要素は「スクロールの入れ物」になるので、
+                   中の position:sticky はスクロールしない**この div** に貼り付き、
+                   実際にスクロールしている #resultsContainer に対しては効かない。
+                   そのため列見出しの sticky top-0 は当たっているのに一度も機能しておらず、
+                   300 行の結果を少し下げるだけで列名が消えていた（角の丸めのために
+                   付いていたクラスが、そのまま固定表示を殺していた） -->
+              <div class="rounded-lg border border-gray-200 bg-white w-fit min-w-full shadow-sm relative z-10 flex flex-col h-full">
                 <table class="w-full text-left text-sm whitespace-nowrap">
                   <thead class="bg-gray-100 text-gray-600 text-xs border-b border-gray-200">${ths}</thead>
                   <tbody id="resultsTbody" class="font-mono text-xs">${trs}</tbody>
@@ -147,18 +238,25 @@
 
        currentDisplayOffset += chunk.length;
 
+       // 脚注。以前は「全部描き切ったとき」だけ出していたため、描画途中は
+       // **続きがあることを示す表示が画面上に一つも無かった**。
+       // 5 万行の結果でも最初は 50 行しか出ず、件数メトリクスだけが 50,000 を指すので、
+       // 「50 件しか返っていない」と読み違えるほかなかった。
+       // 途中なら「いくつまで出していて、あと何件あるのか」を出す
        const noteEl = els.resArea.querySelector('#resultsNote');
        if (noteEl) {
+           const shown = Math.min(currentDisplayOffset, targetData.length);
+           const filteredNote = resultFilter.trim() === ''
+               ? ''
+               : i18nT('（全 {0} 件から絞り込み）', currentResultData.length.toLocaleString());
            if (currentDisplayOffset >= targetData.length) {
-               const base = `Showing top ${targetData.length.toLocaleString()} rows out of ${filtered.length.toLocaleString()}`;
-               // 絞り込み中は「絞り込み後の件数 / 全件数」の両方を出す
-               noteEl.textContent = resultFilter.trim() === ''
-                   ? `${base}.`
-                   : `${base} (filtered from ${currentResultData.length.toLocaleString()}).`;
-               noteEl.classList.remove('hidden');
+               noteEl.textContent = i18nT('{0} / {1} 件を表示{2}',
+                   shown.toLocaleString(), filtered.length.toLocaleString(), filteredNote);
            } else {
-               noteEl.classList.add('hidden');
+               noteEl.textContent = i18nT('{0} / {1} 件を表示{2} — 下へスクロールすると続きを読み込みます',
+                   shown.toLocaleString(), targetData.length.toLocaleString(), filteredNote);
            }
+           noteEl.classList.remove('hidden');
        }
     }
 
@@ -219,8 +317,41 @@
     // ときだけ有効。セルをダブルクリックすると入力欄になり、Enter で基底表へ
     // UPDATE を発行する。値は必ずプレースホルダでバインドする（SQL 組み立てを避ける）
     // ============================================================================
+    // 「なぜ編集できないのか」を短い日本語にする。
+    //
+    // 理由の文言はエンジン（analyzeEditableSelect）が英語で返す。エンジンの
+    // エラーは英語のままにする方針なので、UI 側でだけ言い換える。
+    // 既定値も 'run a SELECT first' だったが、これは **SELECT を実行した直後にも出る**
+    // ので明確な誤案内だった（JOIN の結果は単一の基底表へ対応付けられない、が真の理由）。
+    // 対応表に無い理由は英語のまま出す（黙って消すより読めるほうがよい）
+    const EDIT_REASON_JA = [
+        [/not a simple SELECT/i,                  '複数表の結合や集約は、行を元の表に対応付けられません'],
+        [/reads multiple base tables/i,           '複数の表を読んでいるため、更新先を決められません'],
+        // `it uses JOIN` / `it uses GROUP BY` 等。構文名をそのまま見せたほうが、
+        // なぜ編集できないのかが一目で判る
+        [/it uses (.+)/i,                         '{0} を含む結果は、行を元の表に対応付けられません'],
+        [/has no PRIMARY KEY or UNIQUE/i,         'この表に行を識別する主キー / UNIQUE がありません'],
+        [/include (.+) in the result/i,           '{0} を結果に含めると編集できます'],
+        [/is not a plain base-table column/i,     '計算列・別名列は直接更新できません'],
+        [/there are no plain columns/i,           '素の列が無いため更新先を決められません'],
+        [/not updatable|nested views/i,           'このビューは更新できません'],
+        [/base table .* not found/i,              '元の表が見つかりません'],
+        [/is not from a SELECT/i,                 'SELECT の結果ではありません'],
+    ];
+    function editReasonText(reason) {
+        const raw = String(reason || '');
+        for (const [re, ja] of EDIT_REASON_JA) {
+            const m = re.exec(raw);
+            // 捕獲がある対応表は、拾った構文名を {0} に差し込む
+            if (m) return m[1] !== undefined ? i18nT(ja, m[1]) : i18nT(ja);
+        }
+        return raw;
+    }
+
     function setEditContext(sql) {
-        editContext = sql ? db.analyzeEditableSelect(sql) : { editable: false, reason: 'run a SELECT first' };
+        editContext = sql
+            ? db.analyzeEditableSelect(sql)
+            : { editable: false, reason: 'the result is not from a SELECT' };
         renderEditBadge();
         // 新しい結果セットでは行選択を解除する（行番号が別の行を指してしまうため）
         selectedRowIdx = null;
@@ -232,13 +363,19 @@
         const text = document.getElementById('editBadgeText');
         if (!badge || !text) return;
         if (editContext.editable) {
-            badge.className = 'inline-flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded border text-[11px] font-medium border-blue-200 bg-blue-50 text-blue-700';
-            text.textContent = `Editable: ${editContext.table}`;
+            // 青は「主要操作の地色」と「数値セルの文字色」で既に 2 つの意味を
+            // 持っている。状態を示すバッジまで青にすると、グリッドを眺めたときに
+            // 型の表現と状態の表現が混ざるので、こちらは緑系に分ける
+            badge.className = 'inline-flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded border text-xs font-medium border-green-300 bg-green-50 text-green-800';
+            text.textContent = i18nT('編集可: {0}', editContext.table);
             badge.title = i18nT('結果セルをダブルクリックすると {0} を直接更新します（キー: {1}）', editContext.table, editContext.keyCols.join(', '));
         } else {
-            badge.className = 'inline-flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded border text-[11px] font-medium border-gray-200 bg-gray-50 text-gray-400';
-            text.textContent = 'Read-only';
-            badge.title = i18nT('直接編集できません: {0}', editContext.reason);
+            // 理由をバッジ本体に出す。以前は 'Read-only' の 3 語だけで、
+            // なぜ編集できないのかは hover しないと読めなかった（タッチ環境では読めない）
+            badge.className = 'inline-flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded border text-xs font-medium border-gray-200 bg-gray-50 text-gray-600';
+            const why = editReasonText(editContext.reason);
+            text.textContent = why ? i18nT('読み取り専用 — {0}', why) : i18nT('読み取り専用');
+            badge.title = i18nT('直接編集できません: {0}', why);
         }
     }
 
@@ -394,15 +531,29 @@
 
     els.dispLimit.addEventListener('change', () => renderDisplay(true));
 
+    // 「件数」の表示を、いま画面が対象にしている行数へ合わせる。
+    // 絞り込みで 15 件になっているのに件数は 5,000 のままで、
+    // 脚注（15 / 15 件を表示）と画面の中で食い違っていた
+    function refreshRowMetric() {
+        if (!els.mRows || !currentResultData) return;
+        const total = currentResultData.length;
+        const shown = (typeof filteredResultData === 'function' ? filteredResultData() : currentResultData).length;
+        els.mRows.textContent = shown === total
+            ? total.toLocaleString()
+            : i18nT('{0}（全 {1}）', shown.toLocaleString(), total.toLocaleString());
+    }
+
     // 絞り込み入力: 入力のたびに再描画する（元データは保持したまま表示だけ絞る）
     if (els.resFilter) {
         els.resFilter.addEventListener('input', () => {
             resultFilter = els.resFilter.value;
             clearRowSelection();   // 絞り込みで添字の指す行が変わるため
             renderDisplay(true);
+            refreshRowMetric();
         });
         document.getElementById('resultFilterClear').addEventListener('click', () => {
-            els.resFilter.value = ''; resultFilter = ''; clearRowSelection(); renderDisplay(true); els.resFilter.focus();
+            els.resFilter.value = ''; resultFilter = ''; clearRowSelection(); renderDisplay(true);
+            refreshRowMetric(); els.resFilter.focus();
         });
     }
 

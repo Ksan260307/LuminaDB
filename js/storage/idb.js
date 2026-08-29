@@ -251,7 +251,7 @@
             tx.onerror = () => {
                 const err = tx.error;
                 if (err && (err.name === 'QuotaExceededError' || /quota/i.test(err.message || ''))) {
-                    reject(new Error("ブラウザのストレージ上限に達したため保存できません。不要なテーブルを削除するか、SQL としてエクスポートしてください。"));
+                    reject(new Error("ブラウザのストレージ上限に達したため保存できません。不要な表を削除するか、SQL として書き出してください。"));
                 } else {
                     reject(err);
                 }
@@ -337,9 +337,23 @@
         return migrateLegacyDB();
     }
 
-    // 旧 'JSLiteDB' に保存されたスナップショットがあれば新DBへ移行する
+    // 旧 'JSLiteDB' に保存されたスナップショットがあれば新DBへ移行する。
+    //
+    // 注意: indexedDB.open() は **無ければ作る**。以前はここで無条件に open していたため、
+    // 旧 DB を一度も使ったことのない利用者の環境にも空の 'JSLiteDB' が作られ、
+    // 移行するものが無い（legacyData === undefined）ときは消さずに残していた。
+    // その結果、改名後に入った人の環境にも旧名の DB が永久に居座っていた。
+    //   1. databases() が使えるなら、存在しない場合は open せずに帰る
+    //   2. 開いた場合は、移行の成否にかかわらず必ず消す
     async function migrateLegacyDB() {
         try {
+            // 1. 事前確認。Safari の一部など databases() が無い環境では従来どおり開いて確かめる
+            if (typeof indexedDB.databases === 'function') {
+                try {
+                    const names = (await indexedDB.databases()).map(d => d && d.name);
+                    if (!names.includes(IDB_LEGACY_NAME)) return undefined;
+                } catch (e) { /* 問い合わせに失敗したら開いて確かめる */ }
+            }
             const legacy = await new Promise((resolve, reject) => {
                 const req = indexedDB.open(IDB_LEGACY_NAME, 1);
                 req.onupgradeneeded = e => {
@@ -357,9 +371,11 @@
             legacy.close();
             if (legacyData !== undefined) {
                 await saveDB(legacyData);
-                indexedDB.deleteDatabase(IDB_LEGACY_NAME);
                 console.log('Migrated legacy JSLiteDB snapshot to LuminaDB.');
             }
+            // 2. 中身の有無にかかわらず後片付けする。
+            //    移行済みなら不要、空ならこの関数が作ってしまったもの
+            indexedDB.deleteDatabase(IDB_LEGACY_NAME);
             return legacyData;
         } catch (e) {
             console.warn('Legacy DB migration skipped:', e);

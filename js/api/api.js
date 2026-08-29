@@ -233,6 +233,11 @@
             return this._writeRows('REPLACE INTO', table, rows);
         },
 
+        // 1 文へ詰め込む値の最大文字数。
+        // エンジンの受け付ける文は 1,000,000 文字までなので、表名・列名の分と
+        // 余白を見て 80% を目安にする。ここを超える行数は複数文へ分ける
+        _MAX_VALUES_CHARS: 800000,
+
         _writeRows(verb, table, rows) {
             if (!_validIdent(table)) return { error: 'Invalid table name.' };
             const list = Array.isArray(rows) ? rows : [rows];
@@ -250,13 +255,95 @@
             }
             if (cols.length === 0) return { error: 'Row object has no columns.' };
             if (!cols.every(_validIdent)) return { error: 'Invalid column name.' };
-            const params = [];
-            const groups = list.map(r => {
-                cols.forEach(c => params.push(r[c] === undefined ? null : r[c]));
-                return `(${cols.map(() => '?').join(', ')})`;
+
+            // ------------------------------------------------------------------
+            // 行数に応じて複数の文へ分ける。
+            //
+            // 以前は全行を 1 本の INSERT に畳んでいたため、プレースホルダの
+            // 並び `(?, ?, ?), (?, ?, ?), ...` が 100 万文字の上限に達し、
+            //   3 列で約 90,900 行 / 10 列で約 31,200 行 / 40 列で約 8,200 行
+            // を超えると `Query too long` で丸ごと失敗していた。
+            // CSV 取り込み（importCSV → insert）も同じ天井を持っていて、
+            // 1MB 程度の CSV が「クエリが長すぎる」という、取り込みとは
+            // 関係の無い文言で拒否されていた。
+            // ------------------------------------------------------------------
+            // 長さは **バインド後** で見ること。query() は '?' を実際の値の
+            // リテラルへ置き換えてから文を組み立てるので、プレースホルダの数で
+            // 区切ると、値の長い表で結局 100 万文字を超える
+            const litLen = (v) => {
+                if (v === null || v === undefined) return 4;             // NULL
+                if (typeof v === 'number') return String(v).length;
+                if (typeof v === 'boolean') return v ? 4 : 5;
+                if (v instanceof Date) return 30;                        // DATE('....')
+                const t = String(v);
+                // ' と \ は 2 文字へ膨らむ。前後の引用符で +2
+                let extra = 0;
+                for (let i = 0; i < t.length; i++) {
+                    const c = t.charCodeAt(i);
+                    if (c === 39 || c === 92) extra++;
+                }
+                return t.length + extra + 2;
+            };
+            const group = `(${cols.map(() => '?').join(', ')})`;
+            const head = `${verb} ${table} (${cols.join(', ')}) VALUES `;
+            const sep = group.length - cols.length + 2;   // 括弧・カンマ・", " の固定分
+            const runChunk = (slice) => {
+                const params = [];
+                for (const r of slice) {
+                    for (const c of cols) params.push(r[c] === undefined ? null : r[c]);
+                }
+                return this.query(head + Array(slice.length).fill(group).join(', '), params);
+            };
+
+            // 各行のバインド後の長さを積み上げて、上限に届く手前で切る
+            const budget = this._MAX_VALUES_CHARS;
+            const chunks = [];
+            let start = 0, acc = 0;
+            for (let i = 0; i < list.length; i++) {
+                let rowLen = sep;
+                for (const c of cols) rowLen += litLen(list[i][c]);
+                // 1 行だけで上限を超える場合はその 1 行で 1 文にする（分けようがない）
+                if (acc > 0 && acc + rowLen > budget) { chunks.push([start, i]); start = i; acc = 0; }
+                acc += rowLen;
+            }
+            chunks.push([start, list.length]);
+
+            if (chunks.length === 1) return runChunk(list);
+
+            // 複数文になるときは、途中で転んで半端に入るのを避けるため 1 つの
+            // トランザクションで包む（1 文だったころの「全部入るか、何も入らないか」を保つ）。
+            // 呼び出し側が既にトランザクション中なら、そちらに任せて何も足さない
+            const ownTx = !db.inTransaction;
+            if (ownTx) {
+                const b = db.executeQuery('BEGIN');
+                if (b.error) return b;
+                this._ownsTx = true;
+            }
+            let written = 0, last = null;
+            try {
+                for (const [from, to] of chunks) {
+                    last = runChunk(list.slice(from, to));
+                    if (last.error) {
+                        if (ownTx) { db.executeQuery('ROLLBACK'); this._ownsTx = false; }
+                        return last;
+                    }
+                    written += to - from;
+                }
+            } catch (e) {
+                if (ownTx) { db.executeQuery('ROLLBACK'); this._ownsTx = false; }
+                return { error: e.message };
+            }
+            if (ownTx) {
+                const c = db.executeQuery('COMMIT');
+                this._ownsTx = false;
+                if (c.error) return { error: c.error };
+            }
+            // 戻り値の形は 1 文のときと揃える（最後の結果に合計件数を載せる）
+            return Object.assign({}, last, {
+                data: [{ Result: 'Success', Message: db._rowsMsg(written, verb === 'INSERT INTO' ? 'inserted' : 'replaced') }],
+                scannedRows: written,
+                rows: written
             });
-            const sql = `${verb} ${table} (${cols.join(', ')}) VALUES ${groups.join(', ')}`;
-            return this.query(sql, params);
         },
 
         // SHOW STATUS をオブジェクト形式で返す（result.status.version 等でアクセス）

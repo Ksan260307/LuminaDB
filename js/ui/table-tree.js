@@ -35,7 +35,7 @@
         const btn = document.createElement('button');
         btn.className = 'w-full text-left px-2 py-0.5 rounded hover:bg-gray-100 transition-colors flex items-center gap-1.5 group/col column-insert-btn';
         btn.dataset.column = col;
-        btn.title = i18nT('クリックでカラム名をエディタへ挿入');
+        btn.title = i18nT('クリックで列名をエディタへ挿入');
 
         const nameEl = document.createElement('span');
         nameEl.className = 'text-xs text-gray-700 font-mono truncate';
@@ -43,7 +43,7 @@
         btn.appendChild(nameEl);
 
         const typeEl = document.createElement('span');
-        typeEl.className = 'text-[10px] text-gray-400 uppercase shrink-0';
+        typeEl.className = 'text-[10px] text-gray-500 uppercase shrink-0';
         typeEl.textContent = (t.colTypes && t.colTypes[col]) ? t.colTypes[col] : 'ANY';
         btn.appendChild(typeEl);
 
@@ -95,18 +95,21 @@
         const li = document.createElement('li');
         li.innerHTML = `
         <div class="flex justify-between items-center group">
-          <button class="text-gray-400 hover:text-gray-700 px-1 shrink-0 tree-toggle-btn" data-table="${tbl}" title="${i18nT('カラムを表示')}">
+          <button class="text-gray-500 hover:text-gray-800 px-1 shrink-0 tree-toggle-btn" data-table="${tbl}" aria-label="${i18nT('列を表示')}" title="${i18nT('列を表示')}">
             <svg class="w-3 h-3 transition-transform ${isOpen ? 'rotate-90' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M9 5l7 7-7 7"></path></svg>
           </button>
           <button class="text-gray-600 hover:text-blue-600 text-sm flex justify-between flex-1 text-left px-1.5 py-1.5 rounded hover:bg-gray-100 font-medium transition-colors table-select-btn" data-table="${tbl}">
             <span>${tbl}</span>
-            <span class="text-[10px] text-gray-400 bg-gray-50 border border-gray-200 px-1.5 rounded-full">${db.tables[tbl].rowCount}</span>
+            <span class="text-xs text-gray-600 bg-gray-50 border border-gray-200 px-1.5 rounded-full">${db.tables[tbl].rowCount}</span>
           </button>
-          <button class="text-gray-400 hover:text-blue-600 p-1.5 opacity-0 group-hover:opacity-100 transition-opacity profile-btn" data-table="${tbl}" title="${i18nT('列プロファイル（中身の要約）')}">
-             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
-          </button>
-          <button class="text-gray-400 hover:text-blue-600 p-1.5 opacity-0 group-hover:opacity-100 transition-opacity edit-schema-btn" data-table="${tbl}" title="${i18nT('スキーマを編集')}">
-             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+          <!-- 行ごとの操作は 1 つの「⋯」へ寄せる。
+               以前は列プロファイルとスキーマ編集を icon 2 個で常時出していたが、
+               表 1 つにつき 4 個の操作になり、表が増えるほど密度が上がっていた
+               （20 表で 80 個超）。同じ内容は右クリックメニューに 8 項目あるのに、
+               そちらは見つけようが無かった。⋯ にまとめると、操作は 1 つ減って
+               届く機能は 2 → 8 に増え、隠れていたメニューが表から見えるようになる -->
+          <button class="text-gray-500 hover:text-blue-600 p-1.5 tree-row-action row-menu-btn" data-table="${tbl}" aria-haspopup="menu" aria-label="${i18nT('{0} の操作', tbl)}" title="${i18nT('{0} の操作', tbl)}">
+             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01"></path></svg>
           </button>
         </div>`;
         if (isOpen) li.appendChild(buildColumnList(tbl));
@@ -136,12 +139,30 @@
         }
       }
 
+      // 表が 1 つも無いとき。
+      // 上の案内は検索中（q !== ''）にしか出ないので、**DB が本当に空のとき**は
+      // 検索欄だけが浮いた無言の空欄になっていた。初期化直後や全 DROP の後に
+      // 必ず通る道なので、次に何をすればよいかをここで示す
+      if (totalTables === 0 && q === '') {
+        const li = document.createElement('li');
+        li.className = 'px-3 py-2 text-xs text-gray-600 leading-relaxed';
+        li.innerHTML = `<p class="mb-2">${escapeHtml(i18nT('表がまだありません。'))}</p>`
+            + `<p class="mb-4 text-gray-500">${escapeHtml(i18nT('CREATE TABLE で作るか、CSV / SQL を取り込むと、ここに一覧が出ます。'))}</p>`
+            + `<button type="button" id="emptyTreeDataBtn" class="w-full bg-white hover:bg-gray-100 border border-gray-300 py-1.5 rounded text-blue-600 font-medium transition-colors shadow-sm">`
+            + `${escapeHtml(i18nT('データを取り込む'))}</button>`;
+        tree.appendChild(li);
+        const btn = li.querySelector('#emptyTreeDataBtn');
+        if (btn) btn.addEventListener('click', () => {
+            if (typeof openDataModal === 'function') openDataModal('dataPaneImport');
+        });
+      }
+
       // ビュー / トリガー等のセクション（存在する場合のみ表示）。
       // makeQuery が null の項目はクリックしても何もしない（純粋な一覧表示）
       const addSection = (title, names, makeQuery, subtitle) => {
           if (names.length === 0) return;
           const header = document.createElement('li');
-          header.innerHTML = `<div class="text-xs font-semibold text-gray-400 uppercase tracking-widest mt-4 mb-1 px-3">${title}</div>`;
+          header.innerHTML = `<div class="text-xs font-semibold text-gray-500 uppercase tracking-widest mt-4 mb-1 px-3">${title}</div>`;
           tree.appendChild(header);
           names.forEach(n => {
               const li = document.createElement('li');
@@ -153,12 +174,12 @@
               btn.appendChild(label);
               if (subtitle) {
                   const sub = document.createElement('span');
-                  sub.className = 'text-[10px] text-gray-400 ml-auto shrink-0';
+                  sub.className = 'text-[10px] text-gray-500 ml-auto shrink-0';
                   sub.textContent = subtitle(n);
                   btn.appendChild(sub);
               }
               btn.addEventListener('click', () => {
-                  setQueryValue(makeQuery(n));
+                  loadIntoEditor(makeQuery(n));
                   els.query.focus();
               });
               li.appendChild(btn);
@@ -176,10 +197,16 @@
       addSection('Procedures', Object.keys(db.procedures || {}), (n) => `CALL ${n}()`);
       addSection('Functions', Object.keys(db.functions || {}), () => 'SHOW FUNCTIONS');
 
+      // 表をクリックしたら中身まで出す。
+      // 以前は SQL を入れるだけで実行せず、いちばん見つけやすい操作が
+      // 「途中まで」で止まっていた（一方で見つけにくい右クリックの
+      // 「データを見る」は実行まで済ませていて、順序が逆だった）。
+      // 生成する SQL も右クリック側と同じ LIMIT 100 に揃える
       tree.querySelectorAll('.table-select-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
-          setQueryValue(`SELECT * FROM ${e.currentTarget.dataset.table}`);
-          els.query.focus();
+          loadIntoEditor(`SELECT * FROM ${e.currentTarget.dataset.table} LIMIT 100`);
+          if (typeof runQueryFromUi === 'function') runQueryFromUi();
+          else runQuery();
         });
       });
 
@@ -200,16 +227,12 @@
         });
       });
 
-      tree.querySelectorAll('.edit-schema-btn').forEach(btn => {
+      // 行の「⋯」は右クリックと同じメニューを、ボタンの真下に開く
+      tree.querySelectorAll('.row-menu-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
-          openSchemaEditor(e.currentTarget.dataset.table);
-        });
-      });
-
-      // 列プロファイル（schema-insight.js。読み込み順の都合で存在確認してから呼ぶ）
-      tree.querySelectorAll('.profile-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          if (typeof openProfile === 'function') openProfile(e.currentTarget.dataset.table);
+          e.stopPropagation();
+          const r = e.currentTarget.getBoundingClientRect();
+          openTreeMenu(e.currentTarget.dataset.table, r.left, r.bottom + 2);
         });
       });
 
@@ -221,15 +244,27 @@
     // DDL の確認・データの閲覧・件数・削除は、これまで SQL を手で書くしか
     // 到達手段が無かった。実 DB クライアントと同じくツリーから辿れるようにする
     // ============================================================================
+    // 右クリックメニューを開いた元の要素（閉じたらここへフォーカスを返す）
+    let treeMenuReturnTo = null;
+
     function closeTreeMenu() {
         const m = document.getElementById('treeMenu');
-        if (m) { m.classList.add('hidden'); m.innerHTML = ''; }
+        if (!m || m.classList.contains('hidden')) return;
+        // 中にフォーカスが残ったまま隠すと現在地が body へ落ちるので、
+        // 開いた場所（表のボタン）へ返す
+        const hadFocus = m.contains(document.activeElement);
+        m.classList.add('hidden');
+        m.innerHTML = '';
+        if (hadFocus && treeMenuReturnTo && document.contains(treeMenuReturnTo)) {
+            try { treeMenuReturnTo.focus(); } catch (e) { /* 消えていれば何もしない */ }
+        }
+        treeMenuReturnTo = null;
     }
 
     function openTreeMenu(table, x, y) {
         const menu = document.getElementById('treeMenu');
         if (!menu) return;
-        const run = (sql) => { setQueryValue(sql); runQuery(); };
+        const run = (sql) => { loadIntoEditor(sql); runQuery(); };
         const items = [
             { label: i18nT('データを見る（先頭 100 行）'), act: () => run(`SELECT * FROM ${table} LIMIT 100`) },
             { label: i18nT('件数を数える'), act: () => run(`SELECT COUNT(*) AS rows FROM ${table}`) },
@@ -245,20 +280,26 @@
             { sep: true },
             { label: i18nT('表を削除'), danger: true, act: () => {
                 // 破壊的操作なのでエディタへ置くだけにし、実行はユーザーに委ねる
-                setQueryValue(`DROP TABLE ${table}`);
+                loadIntoEditor(`DROP TABLE ${table}`);
                 showToast(i18nT('DROP 文をエディタへ入れました。実行すると {0} は消えます。', table), true);
             } }
         ];
         menu.innerHTML = '';
+        // メニューとして宣言する。以前は div にボタンを並べただけで、
+        // 開いてもフォーカスが移らず矢印キーでも辿れなかった
+        menu.setAttribute('role', 'menu');
+        menu.setAttribute('aria-label', i18nT('{0} の操作', table));
         items.forEach(it => {
             if (it.sep) {
                 const hr = document.createElement('div');
                 hr.className = 'my-1 border-t border-gray-100';
+                hr.setAttribute('role', 'separator');
                 menu.appendChild(hr);
                 return;
             }
             const b = document.createElement('button');
             b.className = `w-full text-left px-3 py-1.5 hover:bg-gray-100 transition-colors ${it.danger ? 'text-red-600' : 'text-gray-700'}`;
+            b.setAttribute('role', 'menuitem');
             b.textContent = it.label;   // textContent なのでエスケープ不要
             b.addEventListener('click', () => { closeTreeMenu(); it.act(); });
             menu.appendChild(b);
@@ -268,7 +309,22 @@
         const r = menu.getBoundingClientRect();
         menu.style.left = Math.min(x, window.innerWidth - r.width - 8) + 'px';
         menu.style.top = Math.min(y, window.innerHeight - r.height - 8) + 'px';
+        // 開いた元の要素を控えて先頭項目へフォーカスを移す（閉じたら戻す）
+        treeMenuReturnTo = document.activeElement;
+        const first = menu.querySelector('button');
+        if (first) setTimeout(() => { try { first.focus(); } catch (e) {} }, 0);
     }
+
+    // 上下で項目を辿る
+    document.getElementById('treeMenu').addEventListener('keydown', (e) => {
+        const items = [...document.querySelectorAll('#treeMenu button')];
+        if (items.length === 0) return;
+        const i = items.indexOf(document.activeElement);
+        if (e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length].focus(); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
+        else if (e.key === 'Home') { e.preventDefault(); items[0].focus(); }
+        else if (e.key === 'End') { e.preventDefault(); items[items.length - 1].focus(); }
+    });
 
     document.addEventListener('click', (e) => {
         if (!e.target.closest || !e.target.closest('#treeMenu')) closeTreeMenu();

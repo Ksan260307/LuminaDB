@@ -3,6 +3,14 @@
     // ============================================================================
     Object.assign(DatabaseEngine.prototype, {
 
+      // 件数付きの状態メッセージ。
+      // `1 rows updated.` と出ていたのを直すため 1 か所へ寄せた。
+      // DML を実行するたびに出る、このアプリでいちばん目にする文字列なので
+      // 単複の崩れが目立つ。呼び出し側で `${n} rows ...` と書かないこと
+      _rowsMsg(n, verb, suffix = '') {
+          return `${n} ${n === 1 ? 'row' : 'rows'} ${verb}.${suffix}`;
+      },
+
       // ============ 更新可能ビュー (INSERT / UPDATE / DELETE ON VIEW) ============
       // 商用DBはいずれも「単一表に対する射影＋選択だけのビュー」を更新可能として扱う。
       // ここも同じ方針で、ビューへの DML を基底表への DML へ書き換えて実行する。
@@ -307,9 +315,9 @@
                   });
               }
           }
-          if (rows.length === 0) return { data: [{ Result: 'Success', Message: '0 rows affected (INSTEAD OF trigger).' }], affectedRows: 0 };
+          if (rows.length === 0) return { data: [{ Result: 'Success', Message: this._rowsMsg(0, 'affected', ' (INSTEAD OF trigger)') }], affectedRows: 0 };
           this._fireInsteadOfTriggers(kind, view, rows);
-          return { data: [{ Result: 'Success', Message: `${rows.length} rows affected (INSTEAD OF trigger).` }], affectedRows: rows.length };
+          return { data: [{ Result: 'Success', Message: this._rowsMsg(rows.length, 'affected', ' (INSTEAD OF trigger)') }], affectedRows: rows.length };
       },
 
       // INSTEAD OF UPDATE の SET 式を、対象行の値を差し込んだうえで評価する
@@ -1059,10 +1067,18 @@
       _parseValueToken(raw, strMap) {
           const masked = raw.trim();
           if (/^default$/i.test(masked)) return this._DEFAULT_MARKER;
-          let val = masked;
-          // 置換文字列はコールバックで返す。値の '$'（$&, $', $1 等）が String.replace の
-          // 特殊置換パターンとして誤解釈され INSERT 値が壊れるのを防ぐ（例: '100$' → '100'）
-          strMap.forEach((str, i) => { val = val.replace(new RegExp(`__STR_${i}__`, 'g'), () => str); });
+          // 退避した文字列を戻す。
+          //
+          // 以前はここで strMap を**全件走査**し、要素ごとに RegExp を作って
+          // 値トークン 1 個ずつに replace を掛けていた。値トークンの数 ×
+          // strMap の長さで効いてくるので、多行 INSERT が完全に二乗だった
+          // （10 列 400 行 = リテラル 4,000 個で 3.2 秒。800 行にすると 13.6 秒）。
+          // 数値だけの同じ形は 5ms なので、遅さはすべてここに由来していた。
+          // トークンは `__STR_12__` の形と決まっているのだから、
+          // 出てきた番号で引けばよい（_restoreStrings が一巡でそれをやる）。
+          // 置換文字列はコールバックで返すので、値の '$'（$&, $', $1 等）が
+          // String.replace の特殊置換パターンとして誤解釈されることもない
+          let val = this._restoreStrings(masked, strMap);
           // 文字列リテラル: 引用符を外し、バインド時に付与されたエスケープ(\' \" \\)を復元する
           if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith('"') && val.endsWith('"'))) return val.slice(1, -1).replace(/\\(['"\\])/g, '$1');
           if (val.toLowerCase() === 'null') return null;
@@ -1379,7 +1395,7 @@
           });
           flush();
 
-          const parts = [`${inserted} rows inserted`];
+          const parts = [`${inserted} ${inserted === 1 ? 'row' : 'rows'} inserted`];
           if (replaced) parts.push(`${replaced} replaced`);
           if (updated) parts.push(`${updated} updated`);
           if (ignored) parts.push(`${ignored} ignored`);
@@ -1857,7 +1873,7 @@
               if (ret.returning) {
                   return { data: this._returningForAppended(table, affected, ret.returning, strMap), affectedRows: affected };
               }
-              return { data: [{ Result: "Success", Message: `${affected} rows inserted.` }], affectedRows: affected };
+              return { data: [{ Result: "Success", Message: this._rowsMsg(affected, 'inserted') }], affectedRows: affected };
           }
 
           // カラムリストは省略可（省略時はテーブル定義順の全カラムを対象とする）
@@ -1896,11 +1912,11 @@
                   }
                   affectedRows = this.insertRows(table, cols, valuesList);
               } else if (isReplaceStmt || isIgnore || odkuStr) {
-                  return { data: ret.returning ? [] : [{Result:"Success", Message:"0 rows inserted."}], affectedRows: 0 };
+                  return { data: ret.returning ? [] : [{Result:"Success", Message: this._rowsMsg(0, 'inserted')}], affectedRows: 0 };
               }
               resultSet = ret.returning
                   ? this._returningForAppended(table, affectedRows, ret.returning, strMap)
-                  : [{Result:"Success", Message:`${affectedRows} rows inserted.`}];
+                  : [{Result:"Success", Message: this._rowsMsg(affectedRows, 'inserted')}];
           } else if (insertValuesMatch) {
               const table = insertValuesMatch[1].toLowerCase();
               if (!this.tables[table]) throw this._tableNotFound(table);
@@ -1937,7 +1953,7 @@
                   affectedRows = this.insertRows(table, cols, parsedValsList);
                   resultSet = ret.returning
                       ? this._returningForAppended(table, affectedRows, ret.returning, strMap)
-                      : [{Result:"Success", Message:`${affectedRows} rows inserted.`}];
+                      : [{Result:"Success", Message: this._rowsMsg(affectedRows, 'inserted')}];
               }
           } else if (insertSetMatch) {
               const table = insertSetMatch[1].toLowerCase();
@@ -1959,7 +1975,7 @@
                   affectedRows = this.insertRows(table, cols, [vals]);
                   resultSet = ret.returning
                       ? this._returningForAppended(table, affectedRows, ret.returning, strMap)
-                      : [{Result:"Success", Message:`${affectedRows} rows inserted.`}];
+                      : [{Result:"Success", Message: this._rowsMsg(affectedRows, 'inserted')}];
               }
           } else throw new Error("Syntax Error in INSERT.");
 
@@ -2398,7 +2414,7 @@
              }
              resultSet = ret.returning
                  ? this._evalReturning(table, targetIndices, ret.returning, strMap)
-                 : [{Result:"Success", Message:`${affectedRows} rows updated.`}];
+                 : [{Result:"Success", Message: this._rowsMsg(affectedRows, 'updated')}];
           } else throw new Error("Syntax Error in UPDATE.");
 
           return { data: resultSet, affectedRows };
@@ -2474,7 +2490,7 @@
              if (!m[3] && affectedRows > 0) {
                  this._warn('NO_WHERE', `DELETE on '${table}' had no WHERE clause: all ${affectedRows} rows were deleted.`);
              }
-             resultSet = returningRows || [{Result:"Success", Message:`${affectedRows} rows deleted.`}];
+             resultSet = returningRows || [{Result:"Success", Message: this._rowsMsg(affectedRows, 'deleted')}];
           } else throw new Error("Syntax Error in DELETE.");
 
           return { data: resultSet, affectedRows };

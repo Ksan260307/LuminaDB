@@ -179,12 +179,12 @@
       // ビューに無い列は既定値のまま（dept は NULL になるのでこの行はビューから外れる）
       push('V23Vw insert reached base table', "SELECT nm, dept FROM v23_emp WHERE id = 10", r => r.data[0].nm === 'v' && r.data[0].dept === null);
       push('V23Vw insert row outside view', "SELECT COUNT(*) AS c FROM v23_vx WHERE id = 10", r => r.data[0].c === 0);
-      push('V23Vw update through view', "UPDATE v23_vx SET sal = 111 WHERE id = 1", r => !r.error && r.data[0].Message.startsWith('1 rows'));
+      push('V23Vw update through view', "UPDATE v23_vx SET sal = 111 WHERE id = 1", r => !r.error && r.data[0].Message.startsWith('1 row '));
       push('V23Vw update reached base table', "SELECT sal FROM v23_emp WHERE id = 1", r => r.data[0].sal === 111);
       // ビューの WHERE の外にある行は更新対象にならない
       push('V23Vw update skips rows outside view', "UPDATE v23_vx SET sal = 999 WHERE id = 3", r => r.data[0].Message.startsWith('0 rows'));
       push('V23Vw row outside view unchanged', "SELECT sal FROM v23_emp WHERE id = 3", r => r.data[0].sal === 300);
-      push('V23Vw delete through view', "DELETE FROM v23_vx WHERE id = 2", r => !r.error && r.data[0].Message.startsWith('1 rows'));
+      push('V23Vw delete through view', "DELETE FROM v23_vx WHERE id = 2", r => !r.error && r.data[0].Message.startsWith('1 row '));
       push('V23Vw delete reached base table', "SELECT COUNT(*) AS c FROM v23_emp WHERE id = 2", r => r.data[0].c === 0);
       push('V23Vw delete skips rows outside view', "DELETE FROM v23_vx WHERE id = 3", r => r.data[0].Message.startsWith('0 rows'));
 
@@ -220,7 +220,7 @@
         db.executeQuery("CREATE VIEW v23_vn AS SELECT id, sal FROM v23_emp");
         const u = db.executeQuery("UPDATE v23_vn SET sal = sal WHERE id = 3");
         db.executeQuery("DROP VIEW v23_vn");
-        return !u.error && u.data[0].Message.startsWith('1 rows');
+        return !u.error && u.data[0].Message.startsWith('1 row ');
       });
       fn('V23Vw order by does not block updatability', () => {
         db.executeQuery("CREATE VIEW v23_vo AS SELECT id, sal FROM v23_emp ORDER BY sal DESC");
@@ -294,7 +294,7 @@
       });
       fn('V23Chk delete never violates check option', () => {
         const r = db.executeQuery("DELETE FROM v23_vck WHERE id = 20");
-        return !r.error && r.data[0].Message.startsWith('1 rows');
+        return !r.error && r.data[0].Message.startsWith('1 row ');
       });
       fn('V23Chk local keyword accepted', () => {
         db.executeQuery("CREATE VIEW v23_vckl AS SELECT id FROM v23_emp WHERE id > 0 WITH LOCAL CHECK OPTION");
@@ -450,10 +450,10 @@
         db.executeQuery("INSERT INTO v23_al VALUES (1,1,'x',100),(2,1,'y',200),(3,2,'z',300)");
         return true;
       });
-      push('V23Al delete with alias', "DELETE FROM v23_al e WHERE e.id = 3", r => !r.error && r.data[0].Message.startsWith('1 rows'));
+      push('V23Al delete with alias', "DELETE FROM v23_al e WHERE e.id = 3", r => !r.error && r.data[0].Message.startsWith('1 row '));
       push('V23Al delete with AS alias', "DELETE FROM v23_al AS e WHERE e.sal > 5000", r => !r.error && r.data[0].Message.startsWith('0 rows'));
       push('V23Al delete without alias unaffected', "DELETE FROM v23_al WHERE id = 999", r => !r.error);
-      push('V23Al update with alias', "UPDATE v23_al e SET e.sal = e.sal + 1 WHERE e.id = 1", r => !r.error && r.data[0].Message.startsWith('1 rows'));
+      push('V23Al update with alias', "UPDATE v23_al e SET e.sal = e.sal + 1 WHERE e.id = 1", r => !r.error && r.data[0].Message.startsWith('1 row '));
       push('V23Al update alias applied', "SELECT sal FROM v23_al WHERE id = 1", r => r.data[0].sal === 101);
       push('V23Al update AS alias unqualified set', "UPDATE v23_al AS e SET sal = 999 WHERE e.nm = 'y'", r => !r.error);
       push('V23Al update AS alias applied', "SELECT sal FROM v23_al WHERE id = 2", r => r.data[0].sal === 999);
@@ -576,7 +576,8 @@
         const txt = note ? note.textContent : '';
         els.resFilter.value = ''; els.resFilter.dispatchEvent(new Event('input'));
         currentResultData = bku; resultFilter = bkf; els.resFilter.value = bkf; renderDisplay(true);
-        return txt.includes('filtered from 2');
+        // 脚注は日本語が原文（英語表示のときだけ辞書で差し替わる）
+        return txt.includes('全 2 件から絞り込み');
       });
       fn('V23Ui filter clear button resets', () => {
         const bku = currentResultData, bkf = resultFilter;

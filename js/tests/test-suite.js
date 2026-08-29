@@ -37,7 +37,7 @@
         { name: "Insert Select", sql: "INSERT INTO test_trunc (id, val) SELECT id, val FROM test_a WHERE id IN (1, 2)", check: r => r.data[0].Message.includes('2 rows inserted') },
 
         // Type: Boolean, Date
-        { name: "Date & Bool Insert", sql: "INSERT INTO test_trunc (id, val) VALUES (99, 99)", check: r => r.data[0].Message.includes('1 rows inserted') },
+        { name: "Date & Bool Insert", sql: "INSERT INTO test_trunc (id, val) VALUES (99, 99)", check: r => r.data[0].Message.includes('1 row inserted') },
         { name: "Date & Bool Insert 2", sql: "INSERT INTO test_trunc (id, val, dt, flag) VALUES (99, 99, DATE('2024-01-01'), TRUE), (98, 98, DATE('2024-12-31'), FALSE)", check: r => r.data[0].Message.includes('2 rows inserted') },
         { name: "Date & Bool Select", sql: "SELECT dt, flag FROM test_trunc WHERE flag = true", check: r => r.data.length === 1 && r.data[0].dt.includes('2024-01-01') && r.data[0].flag === true },
         { name: "Mega Cplx: Date and Boolean Aggregation", sql: "SELECT flag, COUNT(*) as c, MAX(YEAR(dt)) as max_y FROM test_trunc WHERE flag IS NOT NULL GROUP BY flag ORDER BY flag DESC", check: r => r.data.length === 2 && r.data[0].flag === true && r.data[0].c === 1 && r.data[0].max_y === 2024 },
@@ -1559,10 +1559,10 @@
             const c = db.executeQuery("SELECT COUNT(*) AS c FROM cmd_rep");
             return r.data[0].v === 'new' && c.data[0].c === 2;
         }},
-        { name: "Cmd: REPLACE Inserts When New", sql: "REPLACE INTO cmd_rep (id, v) VALUES (3, 'three')", check: r => r.data[0].Message.includes('1 rows inserted') && !r.data[0].Message.includes('replaced') },
+        { name: "Cmd: REPLACE Inserts When New", sql: "REPLACE INTO cmd_rep (id, v) VALUES (3, 'three')", check: r => r.data[0].Message.includes('1 row inserted') && !r.data[0].Message.includes('replaced') },
 
         // INSERT IGNORE / INSERT OR IGNORE
-        { name: "Cmd: INSERT IGNORE Skips Conflict", sql: "INSERT IGNORE INTO cmd_rep (id, v) VALUES (1, 'dup'), (4, 'four')", check: r => r.data[0].Message.includes('1 rows inserted') && r.data[0].Message.includes('1 ignored') },
+        { name: "Cmd: INSERT IGNORE Skips Conflict", sql: "INSERT IGNORE INTO cmd_rep (id, v) VALUES (1, 'dup'), (4, 'four')", check: r => r.data[0].Message.includes('1 row inserted') && r.data[0].Message.includes('1 ignored') },
         { name: "Cmd: INSERT IGNORE Keeps Original", sql: "SELECT v FROM cmd_rep WHERE id = 1", check: r => r.data[0].v === 'new' },
         { name: "Cmd: INSERT OR IGNORE Syntax", sql: "INSERT OR IGNORE INTO cmd_rep (id, v) VALUES (1, 'dup2')", check: r => r.data[0].Message.includes('1 ignored') },
 
@@ -1571,7 +1571,7 @@
         { name: "Cmd: ODKU Seed", sql: "INSERT INTO cmd_odku (id, cnt) VALUES (1, 1)", check: r => r.data[0].Message.includes('1') },
         { name: "Cmd: ODKU Updates on Conflict", sql: "INSERT INTO cmd_odku (id, cnt) VALUES (1, 100) ON DUPLICATE KEY UPDATE cnt = cnt + 1", check: r => r.data[0].Message.includes('1 updated') },
         { name: "Cmd: ODKU Verify Update", sql: "SELECT cnt FROM cmd_odku WHERE id = 1", check: r => r.data[0].cnt === 2 },
-        { name: "Cmd: ODKU Inserts When No Conflict", sql: "INSERT INTO cmd_odku (id, cnt) VALUES (2, 10) ON DUPLICATE KEY UPDATE cnt = cnt + 1", check: r => r.data[0].Message.includes('1 rows inserted') },
+        { name: "Cmd: ODKU Inserts When No Conflict", sql: "INSERT INTO cmd_odku (id, cnt) VALUES (2, 10) ON DUPLICATE KEY UPDATE cnt = cnt + 1", check: r => r.data[0].Message.includes('1 row inserted') },
 
         // ALTER TABLE ADD/DROP PRIMARY KEY
         successCase("Cmd: ADD PK Setup", "CREATE TABLE cmd_pk (id INTEGER, v TEXT)"),

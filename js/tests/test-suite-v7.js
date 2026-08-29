@@ -319,10 +319,13 @@
             return last.Details.startsWith(`${n} row(s)`);
         }},
         { name: "V7Exp: Plain EXPLAIN Unchanged", fn: () => {
-            // users テーブルはインデックス未定義のため TABLE SCAN（EXPLAIN ANALYZE ではない
-            // 通常の EXPLAIN に ACTUAL 行が混ざらないことを確認する）
+            // 見たいのは「通常の EXPLAIN に ACTUAL 行が混ざらない」こと。
+            // 走査の種類は固定しない — サンプルの users に主キーを付けたので、
+            // 復元後は主キーの索引ができて TABLE SCAN ではなく INDEX SCAN が選ばれる
+            // （engine-io が主キー列の索引を張り直すため）。
+            // ここで走査方法まで縛ると、プランナが賢くなるたびに落ちる
             const r = db.executeQuery("EXPLAIN SELECT * FROM users WHERE id = 1");
-            return !r.error && r.data.some(x => x.Operation === 'TABLE SCAN') && !r.data.some(x => x.Operation === 'ACTUAL');
+            return !r.error && r.data.length > 0 && !r.data.some(x => x.Operation === 'ACTUAL');
         }},
         errCase("V7Exp: Non Select Rejected", "EXPLAIN ANALYZE INSERT INTO users (id, name, age) VALUES (999, 'x', 1)", 'SELECT statements only'),
         { name: "V7Exp: Analyze Does Not Mutate", fn: () => {

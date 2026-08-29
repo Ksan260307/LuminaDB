@@ -275,13 +275,21 @@
         renderTree();
         return db.tables.v27_pf.rowCount === 4;
       });
+      // 行の「⋯」から列プロファイルを開く（v1.41 で icon 2 個をメニューへ集約した）
+      const openProfileFromTree = (tbl) => {
+        document.querySelector(`.row-menu-btn[data-table="${tbl}"]`).click();
+        const item = [...document.querySelectorAll('#treeMenu button')]
+            .find(b => b.textContent.includes('列プロファイル'));
+        item.click();
+      };
       fn('V27Pf opens from the tree', () => {
-        document.querySelector('.profile-btn[data-table="v27_pf"]').click();
+        openProfileFromTree('v27_pf');
         return !document.getElementById('profileModal').classList.contains('hidden')
             && document.getElementById('profileTable').textContent === 'v27_pf';
       });
       fn('V27Pf header counts rows and columns', () => {
-        return document.getElementById('profileRows').textContent === '(4 rows × 4 columns)';
+        // 見出しは日本語が原文（英語表示のときだけ辞書で差し替わる）
+        return document.getElementById('profileRows').textContent === '（4 行 × 4 列）';
       });
       fn('V27Pf one row per column', () => {
         return document.querySelectorAll('#profileBody tbody tr').length === 4;
@@ -324,7 +332,7 @@
       fn('V27Pf empty table is handled', () => {
         db.executeQuery("CREATE TABLE v27_empty (a INTEGER, b TEXT)");
         renderTree();
-        document.querySelector('.profile-btn[data-table="v27_empty"]').click();
+        openProfileFromTree('v27_empty');
         const rows = document.querySelectorAll('#profileBody tbody tr').length;
         const note = document.getElementById('profileNote').textContent;
         const dash = document.querySelectorAll('#profileBody tbody tr')[0].children[4].textContent;
@@ -354,7 +362,7 @@
         const fkCount = Object.keys(db.tables).filter(n => !n.startsWith('__tmp_'))
             .reduce((a, n) => a + (db.tables[n].foreignKeys || []).length, 0);
         return document.querySelectorAll('#erBody path[marker-end]').length === fkCount
-            && document.getElementById('erCount').textContent.includes(`${fkCount} foreign keys`);
+            && document.getElementById('erCount').textContent.includes(`外部キー ${fkCount} 本`);
       });
       fn('V27Er child sits below its parent', () => {
         const boxOf = (n) => document.querySelector(`#erBody .er-table[data-table="${n}"] rect`);

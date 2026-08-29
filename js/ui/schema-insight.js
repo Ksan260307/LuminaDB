@@ -60,14 +60,14 @@
         const stats = profileTable(tbl);
         document.getElementById('profileTable').textContent = tbl;
         const t = db.tables[tbl];
-        document.getElementById('profileRows').textContent = `(${t.rowCount.toLocaleString()} rows × ${stats.length} columns)`;
-        document.getElementById('profileNote').textContent = t.rowCount === 0 ? i18nT('空のテーブルです') : '';
+        document.getElementById('profileRows').textContent = i18nT('（{0} 行 × {1} 列）', t.rowCount.toLocaleString(), stats.length);
+        document.getElementById('profileNote').textContent = t.rowCount === 0 ? i18nT('空の表です') : '';
 
         const table = document.createElement('table');
         table.className = 'w-full text-xs border-collapse';
         const head = document.createElement('thead');
         head.innerHTML = `<tr class="bg-gray-50 sticky top-0">
-            ${['Column', 'Type', 'Nulls', 'Distinct', 'Min', 'Max', 'Avg', 'Len', 'Top values']
+            ${[i18nT('列'), i18nT('型'), i18nT('NULL'), i18nT('相異なり'), i18nT('最小'), i18nT('最大'), i18nT('平均'), i18nT('長さ'), i18nT('多い値')]
               .map(h => `<th class="text-left font-semibold text-gray-500 px-2 py-1.5 border-b border-gray-200 whitespace-nowrap">${h}</th>`).join('')}
         </tr>`;
         table.appendChild(head);
@@ -126,7 +126,7 @@
         body.querySelectorAll('.profile-col-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
                 const c = e.currentTarget.dataset.column;
-                setQueryValue(`SELECT ${c}, COUNT(*) AS n FROM ${tbl} GROUP BY ${c} ORDER BY n DESC`);
+                loadIntoEditor(`SELECT ${c}, COUNT(*) AS n FROM ${tbl} GROUP BY ${c} ORDER BY n DESC`);
                 closeModal('profileModal');
                 els.query.focus();
             });
@@ -134,7 +134,7 @@
     }
 
     function openProfile(tbl) {
-        if (!db.tables[tbl]) { showToast(i18nT('テーブル \'{0}\' がありません。', tbl), true); return; }
+        if (!db.tables[tbl]) { showToast(i18nT('表 \'{0}\' がありません。', tbl), true); return; }
         renderProfile(tbl);
         openModal('profileModal');
     }
@@ -171,10 +171,10 @@
     function renderEr() {
         const body = document.getElementById('erBody');
         const { names, edges, depth } = buildErModel();
-        document.getElementById('erCount').textContent = `(${names.length} tables, ${edges.length} foreign keys)`;
+        document.getElementById('erCount').textContent = i18nT('（{0} 表 / 外部キー {1} 本）', names.length, edges.length);
         document.getElementById('erNote').textContent = edges.length === 0 ? i18nT('外部キーはまだありません') : '';
         if (names.length === 0) {
-            body.innerHTML = `<div class="p-8 text-center text-gray-400 text-sm">${i18nT('テーブルがありません。')}</div>`;
+            body.innerHTML = `<div class="p-8 text-center text-gray-500 text-sm">${i18nT('表がありません。')}</div>`;
             return;
         }
 
@@ -267,7 +267,7 @@
                 fill: '#eff6ff', stroke: '#cbd5e1', 'stroke-width': 1 }));
             g.appendChild(mk('text', { x: b.x + PAD, y: b.y + 17, 'font-size': 12, 'font-weight': 600, fill: '#1d4ed8' }, n));
             g.appendChild(mk('text', { x: b.x + b.w - PAD, y: b.y + 17, 'font-size': 9, fill: '#94a3b8', 'text-anchor': 'end' },
-                `${t.rowCount} rows`));
+                i18nT('{0} 行', t.rowCount)));
 
             const cols = Object.keys(t.cols);
             cols.slice(0, MAX_COLS).forEach((c, i) => {
@@ -292,7 +292,7 @@
         body.appendChild(svg);
         svg.querySelectorAll('.er-table').forEach(g => {
             g.addEventListener('click', (e) => {
-                setQueryValue(`SELECT * FROM ${e.currentTarget.dataset.table}`);
+                loadIntoEditor(`SELECT * FROM ${e.currentTarget.dataset.table}`);
                 closeModal('erModal');
                 els.query.focus();
             });

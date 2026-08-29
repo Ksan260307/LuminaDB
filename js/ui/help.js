@@ -684,7 +684,7 @@
       { cat: "v1.33 Commands", cmds: [
         { name: "Database & Use", sql: "-- 単一スキーマなので名前を記録するだけ\nCREATE DATABASE shop; USE shop; USE main; DROP DATABASE shop" },
         { name: "Alter View", sql: "CREATE VIEW v_tmp AS SELECT id FROM {table}; ALTER VIEW v_tmp AS SELECT id, name FROM {table}" },
-        { name: "Temporary View", sql: "-- 保存・エクスポート対象外（セッション限り）\nCREATE TEMPORARY VIEW v_session AS SELECT id FROM {table}" },
+        { name: "Temporary View", sql: "-- 保存・書き出しの対象外（セッション限り）\nCREATE TEMPORARY VIEW v_session AS SELECT id FROM {table}" },
         { name: "Order By Using", sql: "-- USING > は DESC、USING < は ASC\nSELECT id, age FROM {table} ORDER BY age USING >, id" },
         { name: "Do (evaluate & discard)", sql: "DO 1 + 1" },
         { name: "Execute Immediate", sql: "EXECUTE IMMEDIATE 'SELECT ? AS answer' USING 42" },
@@ -718,8 +718,8 @@
     document.getElementById('helpContent').addEventListener('click', (e) => {
       const btn = e.target.closest('.copy-cmd-btn');
       if (btn) {
-        setQueryValue(btn.dataset.query);
-        document.getElementById('helpModal').classList.add('hidden');
+        loadIntoEditor(btn.dataset.query);
+        closeModal('helpModal');
         els.query.focus();
       }
     });
@@ -735,11 +735,152 @@
       return esc.replace(re, '<mark class="bg-yellow-200 text-inherit rounded-sm px-0.5">$1</mark>');
     }
 
+    // ------------------------------------------------------------------
+    // カテゴリ名の日本語と、日本語で探すための言い換え。
+    //
+    // helpData のカテゴリ名・コマンド名は英語で書かれている。日本語表示でも
+    // 60 個の見出しが全部英語のままだったうえ、検索も英語前提で、
+    // 「結合」「並べ替え」では 0 件（「日付」だけは説明コメントに
+    // たまたま含まれていて当たる）という状態だった。
+    // 見出しは訳し、検索語は下の表で英語へ言い換えてから照合する
+    // ------------------------------------------------------------------
+    const HELP_CAT_JA = {
+        "Basic DQL": "基本の SELECT",
+        "String Functions": "文字列関数",
+        "Hash & Encoding": "ハッシュ・符号化",
+        "Sequences & Prepared Statements": "シーケンス・プリペアド文",
+        "Math & Date Functions": "数値・日付の関数",
+        "JSON Functions": "JSON 関数",
+        "Advanced DQL": "応用の SELECT（結合・集計・ウィンドウ）",
+        "Data Manipulation (DML)": "データの追加・更新・削除（DML）",
+        "Data Definition (DDL)": "表の作成・変更（DDL）",
+        "Metadata / Introspection": "メタ情報・内部の確認",
+        "Tools & Transactions": "道具・トランザクション",
+        "Commercial SQL (Oracle / SQL Server / PostgreSQL)": "商用 DB 互換（Oracle / SQL Server / PostgreSQL）",
+        "Operators & Predicates": "演算子・述語",
+        "Query Shorthands": "問い合わせの短縮記法",
+        "Multi-table DML": "複数表の更新・削除",
+        "Catalog & Functions": "カタログ・ユーザー定義関数",
+        "Browser DB Operations": "ブラウザ DB の操作",
+        "Operators & Search": "演算子・全文検索",
+        "Tables from JSON & Sampling": "JSON から表・標本抽出",
+        "Stored Procedure Logic": "ストアドプロシージャの制御",
+        "Introspection & Schema Ops": "内部の確認・スキーマ操作",
+        "Browser DB Essentials": "ブラウザ DB の要点",
+        "Cursors & Error Handling": "カーソル・エラー処理",
+        "Ranges, JSON & Time Buckets": "範囲・JSON・時間バケット",
+        "Schema & Planner Compatibility": "スキーマ・実行計画の互換",
+        "Persistence & Streaming": "永続化・逐次読み出し",
+        "Arrays & Fuzzy Matching": "配列・あいまい一致",
+        "Statistics & Time Series": "統計・時系列",
+        "Window Extras": "ウィンドウ関数の応用",
+        "CSV, Cache & Coordination": "CSV・キャッシュ・タブ間連携",
+        "Type Conversion with Precision": "精度を指定した型変換",
+        "Updatable Views": "更新できるビュー",
+        "Constraints & Keys": "制約とキー",
+        "JSON Operators": "JSON 演算子",
+        "Predicates, Aliases & Indexes": "述語・別名・索引",
+        "Composite Keys & Sequences": "複合キー・シーケンス",
+        "MERGE & Upsert": "MERGE・UPSERT",
+        "Views, Indexes & Catalog": "ビュー・索引・カタログ",
+        "Date Arithmetic": "日付の計算",
+        "Hierarchical Queries (Oracle)": "階層問い合わせ（Oracle）",
+        "Analytic Functions": "分析関数",
+        "Match Operators (PostgreSQL)": "一致演算子（PostgreSQL）",
+        "DDL & Upsert Extras": "DDL・UPSERT の補足",
+        "Windows over Groups": "グループに対するウィンドウ",
+        "Collation, ORDER BY ALL & GROUPING_ID": "照合順序・ORDER BY ALL・GROUPING_ID",
+        "DDL, Identity & LATERAL": "DDL・IDENTITY・LATERAL",
+        "Subscripts & Warnings": "添字・警告",
+        "Ordered Aggregates & Windows": "順序付き集約・ウィンドウ",
+        "Derived Sources & SRFs": "派生表・表関数",
+        "Domains, Types & Roles": "ドメイン・型・ロール",
+        "Recursive SEARCH & CYCLE": "再帰の SEARCH・CYCLE",
+        "Quoted Identifiers & Grouping Sets": "引用識別子・GROUPING SETS",
+        "NULL in Arithmetic & Date Types": "NULL の演算・日付型",
+        "NULL & Three-Valued Logic": "NULL と三値論理",
+        "Aliases, Stars & Set Operations": "別名・アスタリスク・集合演算",
+        "SHA-2 & Regexp Options": "SHA-2・正規表現オプション",
+        "Schema Changes": "スキーマの変更",
+        "v1.33 Functions": "v1.33 で足した関数",
+        "v1.33 Commands": "v1.33 で足した命令",
+        "External API": "外部 API（JS から使う）",
+    };
+    const HELP_SYNONYMS = {
+        "結合": "join",
+        "内部結合": "inner join",
+        "外部結合": "outer join",
+        "並べ替え": "order by",
+        "並び替え": "order by",
+        "整列": "order by",
+        "絞り込み": "where",
+        "条件": "where",
+        "抽出": "select",
+        "重複": "distinct",
+        "件数": "count",
+        "合計": "sum",
+        "平均": "avg",
+        "最大": "max",
+        "最小": "min",
+        "集計": "group by",
+        "グループ": "group by",
+        "追加": "insert",
+        "挿入": "insert",
+        "更新": "update",
+        "削除": "delete",
+        "作成": "create",
+        "変更": "alter",
+        "索引": "index",
+        "インデックス": "index",
+        "ビュー": "view",
+        "表": "table",
+        "テーブル": "table",
+        "列": "column",
+        "制約": "constraint",
+        "主キー": "primary key",
+        "外部キー": "foreign key",
+        "日付": "date",
+        "時刻": "time",
+        "文字列": "string",
+        "数値": "number",
+        "型変換": "cast",
+        "変換": "cast",
+        "連結": "concat",
+        "置換": "replace",
+        "部分文字列": "substring",
+        "切り出し": "substring",
+        "ウィンドウ": "over",
+        "順位": "rank",
+        "採番": "sequence",
+        "再帰": "recursive",
+        "共通表式": "with",
+        "副問い合わせ": "select",
+        "取り込み": "import",
+        "書き出し": "export",
+        "スナップショット": "snapshot",
+        "トランザクション": "transaction",
+        "権限": "role",
+        "全文検索": "match",
+        "正規表現": "regexp",
+        "配列": "array",
+        "乱数": "rand",
+        "丸め": "round",
+    };
+    // カテゴリ名は、日本語表示なら訳、英語表示なら原文
+    function helpCatLabel(cat) {
+        return (typeof getLang === 'function' && getLang() === 'en') ? cat : (HELP_CAT_JA[cat] || cat);
+    }
     function renderHelpCommands() {
       const tbl = document.getElementById('helpTableSelect').value || 'users';
       const searchEl = document.getElementById('helpSearchInput');
       const term = searchEl ? searchEl.value.trim() : '';
       const termLower = term.toLowerCase();
+      // 日本語で打たれた語は英語へ言い換えて照合する（「結合」→ join）。
+      // 言い換えが無ければ元の語のまま（説明コメントの日本語には直接当たる）
+      const termAlt = (HELP_SYNONYMS[term] || '').toLowerCase();
+      const hit = (hay) => !termLower
+          || hay.includes(termLower)
+          || (termAlt !== '' && hay.includes(termAlt));
 
       // コマンド名（UI非表示）と展開後SQLの双方を対象に検索する
       const createCommandHTML = (cmd, q) => `
@@ -754,12 +895,16 @@
         // 辞書にあれば英語へ差し替える。辞書に無いものはそのまま出る
         const items = group.cmds
           .map(cmd => ({ cmd: { name: i18nT(cmd.name), sql: cmd.sql }, q: i18nT(cmd.sql).replace(/\{table\}/g, tbl) }))
-          .filter(({ cmd, q }) => !termLower || cmd.name.toLowerCase().includes(termLower) || q.toLowerCase().includes(termLower));
+          .filter(({ cmd, q }) => hit(cmd.name.toLowerCase()) || hit(q.toLowerCase())
+              || hit(helpCatLabel(group.cat).toLowerCase()));
         if (items.length === 0) return '';
         matchCount += items.length;
+        // 見出しは日本語（英語表示のときは原文）。uppercase / tracking は
+        // 日本語では効かないうえ字面を乱すので外す
+        const catId = 'helpcat-' + group.cat.replace(/[^a-zA-Z0-9]+/g, '-').toLowerCase();
         return `
-          <div class="mb-4">
-            <h3 class="text-xs font-bold text-gray-400 uppercase border-b border-gray-100 pb-1 mb-2 tracking-wider">${group.cat} <span class="text-gray-300 font-medium normal-case">(${items.length})</span></h3>
+          <div class="mb-4" id="${catId}">
+            <h3 class="text-xs font-bold text-gray-600 border-b border-gray-100 pb-1 mb-2">${escapeHtmlHelp(helpCatLabel(group.cat))} <span class="text-gray-500 font-medium">(${items.length})</span></h3>
             <div class="space-y-3">
               ${items.map(({ cmd, q }) => createCommandHTML(cmd, q)).join('')}
             </div>
@@ -772,6 +917,7 @@
       if (noRes) noRes.classList.toggle('hidden', matchCount > 0);
       const countEl = document.getElementById('helpSearchCount');
       if (countEl) countEl.textContent = term ? i18nT('{0} 件ヒット', matchCount) : '';
+      renderHelpCatJump();
     }
 
     // 検索ボックスのワイヤリング（入力で絞り込み・Esc/✕でクリア・モーダル表示時に自動フォーカス）
@@ -803,5 +949,35 @@
         setTimeout(() => { if (helpSearchInput) helpSearchInput.focus(); }, 30);
       });
     }
+
+    // 目次: いま出ているカテゴリを並べ、選ぶとその見出しへスクロールする。
+    // 検索で絞り込んだときは残ったカテゴリだけを並べ直す
+    function renderHelpCatJump() {
+        const sel = document.getElementById('helpCatJump');
+        const content = document.getElementById('helpContent');
+        if (!sel || !content) return;
+        const groups = [...content.querySelectorAll('[id^="helpcat-"]')];
+        sel.innerHTML = '';
+        const head = document.createElement('option');
+        head.value = '';
+        head.textContent = i18nT('{0} カテゴリ', groups.length);
+        sel.appendChild(head);
+        groups.forEach(g => {
+            const h3 = g.querySelector('h3');
+            const o = document.createElement('option');
+            o.value = g.id;
+            o.textContent = h3 ? h3.textContent.trim() : g.id;
+            sel.appendChild(o);
+        });
+    }
+    (function bindHelpCatJump() {
+        const sel = document.getElementById('helpCatJump');
+        if (!sel) return;
+        sel.addEventListener('change', () => {
+            const target = sel.value && document.getElementById(sel.value);
+            if (target) target.scrollIntoView({ block: 'start' });
+            sel.value = '';
+        });
+    })();
 
     document.getElementById('helpTableSelect').addEventListener('change', renderHelpCommands);

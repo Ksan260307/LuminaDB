@@ -660,7 +660,7 @@
         { name: "XBnd: Leap Day Accepted", sql: "INSERT INTO bx_date (id, d) VALUES (1, '2024-02-29')", check: r => r.data[0].Message.includes('1') },
         { name: "XBnd: Leap Day Stored Value", sql: "SELECT COUNT(*) AS c FROM bx_date WHERE d = '2024-02-29 00:00:00'", check: r => r.data[0].c === 1 },
         // JS の Date は非閏年の 2/29 を 3/1 へ繰り上げる（不正日付ではなく有効値として受理される）
-        { name: "XBnd: Non-Leap Feb 29 Rolls To Mar 1", sql: "INSERT INTO bx_date (id, d) VALUES (2, '2023-02-29')", check: r => r.data[0].Message.includes('1 rows inserted') },
+        { name: "XBnd: Non-Leap Feb 29 Rolls To Mar 1", sql: "INSERT INTO bx_date (id, d) VALUES (2, '2023-02-29')", check: r => r.data[0].Message.includes('1 row inserted') },
         { name: "XBnd: Non-Leap Feb 29 Stored As Mar 1", sql: "SELECT COUNT(*) AS c FROM bx_date WHERE d = '2023-03-01 00:00:00'", check: r => r.data[0].c === 1 },
         errCase("XBnd: Month 13 Rejected", "INSERT INTO bx_date (id, d) VALUES (3, '2026-13-01')", 'Type mismatch'),
         { name: "XBnd: Min Max Year Accepted", sql: "INSERT INTO bx_date (id, d) VALUES (4, '0001-01-01'), (5, '9999-12-31')", check: r => r.data[0].Message.includes('2') },

@@ -19,7 +19,7 @@
             const r = db.executeQuery("INSERT INTO ra_c (id, p_id) VALUES (10, 1), (11, 1), (12, 2), (13, 3)");
             return !r.error && r.data[0].Message.includes('4');
         }},
-        { name: "XRef: Cascade Delete Removes Children", sql: "DELETE FROM ra_p WHERE id = 1", check: r => r.data[0].Message.includes('1 rows') },
+        { name: "XRef: Cascade Delete Removes Children", sql: "DELETE FROM ra_p WHERE id = 1", check: r => r.data[0].Message.includes('1 row ') },
         { name: "XRef: Cascade Child Count After", sql: "SELECT COUNT(*) AS c FROM ra_c", check: r => r.data[0].c === 2 },
         { name: "XRef: Cascade Child Survivors", sql: "SELECT id FROM ra_c ORDER BY id ASC", check: r => r.data.length === 2 && r.data[0].id === 12 && r.data[1].id === 13 },
         { name: "XRef: Cascade Parent Count After", sql: "SELECT COUNT(*) AS c FROM ra_p", check: r => r.data[0].c === 2 },

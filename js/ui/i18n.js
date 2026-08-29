@@ -55,6 +55,16 @@
         return out;
     }
 
+    // 数えられる名詞の単複。
+    //   i18nPlural(1, 'エラー', 'error', 'errors')  -> ja: 'エラー 1 件' / en: '1 error'
+    // 日本語には単複が無いので助数詞を付けるだけ、英語だけ 1 とそれ以外で語を替える。
+    // 「(1 errors)」のような崩れを一箇所で防ぐ
+    function i18nPlural(n, jaNoun, enOne, enMany, jaCounter = '件') {
+        const c = Number(n);
+        if (luminaLang === 'en') return `${c.toLocaleString()} ${c === 1 ? enOne : enMany}`;
+        return `${jaNoun} ${c.toLocaleString()} ${jaCounter}`;
+    }
+
     // ------------------------------------------------------------------
     // DOM 走査
     // ------------------------------------------------------------------
@@ -80,6 +90,17 @@
     function i18nIsUnit(el) {
         if (I18N_STATEFUL.has(el.tagName)) return false;
         if (el.querySelector && el.querySelector('input, select, textarea, canvas, iframe')) return false;
+        // 中に「訳さない領域」を含む要素は単位にしない。
+        //
+        // 単位は innerHTML ごと差し替えるので、実行時に中身が変わる span
+        // （件数・表名・セル値など）を巻き込むと
+        //   ・辞書のキーにその span のマークアップまで入り、書き換えのたびにずれる
+        //   ・見出しの文言が「訳せない単位」の一部になって永久に日本語のまま残る
+        // ということが起きる。実際、モーダル見出しを日本語化したときに
+        // 「クエリ履歴」「列プロファイル:」「スキーマ図」「セルの値:」と
+        // メトリクスの「実行時間」「件数」が、辞書にキーがあるのに訳されなかった。
+        // ここで壁にすると走査が中へ入り、見出しの文字だけがテキストノードとして訳される
+        if (el.querySelector && el.querySelector('[data-i18n-skip]')) return false;
         for (const c of el.children) if (!I18N_INLINE.has(c.tagName)) return false;
         return i18nOriginalHtml.has(el) || I18N_JP.test(el.textContent || '');
     }

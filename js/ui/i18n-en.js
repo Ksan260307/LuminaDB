@@ -58,7 +58,7 @@
         'コマンドを検索 (例: JOIN, DATE, INSERT, JSON)': 'Search commands (e.g. JOIN, DATE, INSERT, JSON)',
         '一致するコマンドがありません。': 'No matching commands.',
         '履歴を検索': 'Search history',
-        '履歴を消去': 'Clear history',
+        '履歴を削除': 'Clear history',
         'クリックでエディタへ読み込み · Run で即実行': 'Click to load into the editor · Run executes it right away',
         '<span>列名クリックでその列の分布クエリをエディタへ</span> <span id="profileNote"></span>':
             '<span>Click a column name to put its distribution query in the editor</span> <span id="profileNote"></span>',
@@ -139,10 +139,10 @@
 
         // ---- データ画面: 書き出し ----
         'SQL ダンプ (.sql)': 'SQL dump (.sql)',
-        '全テーブルの <code class="bg-gray-100 px-1 rounded">CREATE TABLE</code> と <code class="bg-gray-100 px-1 rounded">INSERT</code> を 1 つのテキストにします。 別のブラウザや別の DB へ移すとき、または変更をファイルとして残すときに使います。':
+        '全ての表の <code class="bg-gray-100 px-1 rounded">CREATE TABLE</code> と <code class="bg-gray-100 px-1 rounded">INSERT</code> を 1 つのテキストにします。 別のブラウザや別の DB へ移すとき、または変更をファイルとして残すときに使います。':
             'Puts the <code class="bg-gray-100 px-1 rounded">CREATE TABLE</code> and <code class="bg-gray-100 px-1 rounded">INSERT</code> statements for every table into a single text file. Use it to move to another browser or another database, or to keep a change as a file.',
         '書き出す': 'Export',
-        '全テーブルを <code class="bg-gray-100 px-1 rounded">{ 表名: [行, ...] }</code> の形で書き出します。 他のツールやスクリプトへ渡すとき向けです。結果セットだけが要るなら、結果ツールバーの <span class="font-medium">Export JSON</span> を使ってください。':
+        '全ての表を <code class="bg-gray-100 px-1 rounded">{ 表名: [行, ...] }</code> の形で書き出します。 他のツールやスクリプトへ渡すとき向けです。結果セットだけが要るなら、結果ツールバーの <span class="font-medium">書き出し ▾</span> を使ってください。':
             'Exports every table as <code class="bg-gray-100 px-1 rounded">{ table: [row, ...] }</code>. Meant for handing data to another tool or script. If you only need the current result set, use <span class="font-medium">Export JSON</span> in the results toolbar.',
 
         // ---- データ画面: 読み込み ----
@@ -195,7 +195,7 @@
         'IndexedDB からデータを読み込みました。': 'Loaded from IndexedDB.',
         '保存されたデータがありません。': 'There is no saved data.',
         '読み込みエラー: {0}': 'Load failed: {0}',
-        'IndexedDB のデータを削除し、初期状態にリセットしました。': 'Deleted the IndexedDB data and reset to the initial state.',
+        'このブラウザの保存データを削除し、初期状態へ戻しました。': 'Deleted the saved data in this browser and returned to the initial state.',
         '保存しました。': 'Saved.',
 
         // ---- ファイル ----
@@ -219,15 +219,14 @@
         '{0} 表 / {1} 文字を luminadb_export.sql として保存しました。':
             'Saved {0} tables / {1} characters as luminadb_export.sql.',
         'SQL ダンプを書き出しました（{0} 表）。': 'Exported the SQL dump ({0} tables).',
-        '書き出せるテーブルがありません。': 'There are no tables to export.',
+        '書き出せる表がありません。': 'There are no tables to export.',
         '{0} 表を JSON として書き出しました。': 'Exported {0} tables as JSON.',
         '{0}: {1} 件の SQL 文をすべて実行しました。': '{0}: ran all {1} SQL statements.',
         '{0} 件の SQL 文を実行しました。': 'Ran {0} SQL statements.',
         '{0}: {1} / {2} 件成功、{3} 件失敗': '{0}: {1} of {2} succeeded, {3} failed',
         '… 他 {0} 件': '… and {0} more',
         '{0} 件の SQL 文が失敗しました（詳細はモーダル内）。': '{0} SQL statements failed (details are in the panel).',
-        'SQL インポート失敗: {0}': 'SQL import failed: {0}',
-        'SQLインポート失敗: {0}': 'SQL import failed: {0}',
+        'SQL の取り込みに失敗しました: {0}': 'SQL import failed: {0}',
         '{0}行のデータを {1} に追加しました。': 'Added {0} rows to {1}.',
         'データ生成失敗: {0}': 'Could not generate data: {0}',
         '新しい表の名前を英数字とアンダースコアで入力してください（先頭は英字か _）。':
@@ -238,11 +237,11 @@
         '表 \'{0}\' はすでに存在します。': 'Table \'{0}\' already exists.',
         '取り込み先の表が選ばれていません。': 'No destination table is selected.',
         '{0}: 取り込みに失敗しました。': '{0}: the import failed.',
-        'インポート失敗: {0}': 'Import failed: {0}',
+        '取り込みに失敗しました: {0}': 'Import failed: {0}',
         '{0}: {1} 行を {2} に取り込みました{3}。': '{0}: imported {1} rows into {2}{3}.',
         '（表を新規作成）': ' (new table created)',
         '列: {0}': 'Columns: {0}',
-        '{0} 行を {1} にインポートしました。': 'Imported {0} rows into {1}.',
+        '{0} 行を {1} に取り込みました。': 'Imported {0} rows into {1}.',
         'CSV ファイルが選ばれていません。': 'No CSV file is selected.',
         'CSVファイルが選択されていません。': 'No CSV file is selected.',
 
@@ -276,7 +275,6 @@
             'Run on a worker (Ctrl+Alt+Enter) — keeps the page responsive and can be cancelled',
         '実行中のクエリを止める': 'Stop the running query',
         'テストの読み込みに失敗しました: {0}': 'Could not load the test suites: {0}',
-        '{0} / {1} 文が成功（エラー {2} 件）': '{0} of {1} statements succeeded ({2} errors)',
         'Script: {0}/{1} 文成功': 'Script: {0}/{1} statements succeeded',
         '{0} 件のエラー: {1}': '{0} errors: {1}',
         '最終結果 0 件': 'final result: 0 rows',
@@ -290,6 +288,187 @@
         'IN TRANSACTION ({0} 変更)': 'IN TRANSACTION ({0} changes)',
         '実行時間の上限を外しました。': 'Removed the execution time limit.',
         '実行時間の上限を {0} 秒にしました。': 'Set the execution time limit to {0} seconds.',
+
+
+        // ---- v1.39: 見出し・主要ボタンの日本語化にともなう訳 ----
+        // HTML に英語を直書きしていたため、**日本語表示のときだけ訳されず英語のまま**
+        // 残っていた（見出しと CTA だけ英語という状態）。原文を日本語へ寄せ、
+        // 英語はここで与える
+        'クエリ入力欄': 'Query workspace',
+        'スキーマとデータ': 'Schema and data',
+        'SQL 補完候補': 'SQL suggestions',
+        '表の一覧を開く': 'Open the table list',
+        '表の編集:': 'Table editor:',
+        '＋ 列を追加': '+ Add column',
+        '生成される DDL': 'Generated DDL',
+        'スキーマを保存': 'Save schema',
+        '対象の表:': 'Target table:',
+        'SVG をコピー': 'Copy SVG',
+        '初期化の確認': 'Confirm reset',
+        '初期化する': 'Reset data',
+        'キャンセル': 'Cancel',
+        'クエリ履歴': 'Query history',
+        '列プロファイル:': 'Column profile:',
+        'スキーマ図': 'Schema diagram',
+        'キーボードショートカット': 'Keyboard shortcuts',
+        'セルの値:': 'Cell value:',
+        '実行時間': 'Time',
+        '件数': 'Rows',
+        '表示件数': 'Limit',
+
+        // ---- v1.39: 結果エリアの案内 ----
+        'クエリを実行すると、ここに結果が出ます。': 'Run a query to see results here.',
+        '該当する行はありません。': 'No rows returned.',
+        '（全 {0} 件から絞り込み）': ' (filtered from {0})',
+        '{0} / {1} 件を表示{2}': 'Showing {0} of {1} rows{2}',
+        '{0} / {1} 件を表示{2} — 下へスクロールすると続きを読み込みます':
+            'Showing {0} of {1} rows{2} — scroll down to load more',
+        '{0} / {1} 文を実行しました（返す行はありません）。': 'Ran {0} of {1} statements (no rows returned).',
+        // {2} には i18nPlural が組んだ「エラー 1 件」/「1 error」がそのまま入る。
+        // 助数詞をテンプレート側に書くと英語で "(1 errors)" になる
+        '{0} / {1} 文が成功（{2}）。タブで結果とエラーを切り替えられます。':
+            '{0} of {1} statements succeeded ({2}). Use the tabs to switch between results and errors.',
+
+        // ---- v1.39: 表が 1 つも無いとき ----
+        '表がまだありません。': 'No tables yet.',
+        'CREATE TABLE で作るか、CSV / SQL を取り込むと、ここに一覧が出ます。':
+            'Create one with CREATE TABLE, or import CSV / SQL, and it will be listed here.',
+        'データを取り込む': 'Import data',
+
+        // ---- v1.39: 編集可否バッジ（理由を画面に出す） ----
+        '編集可: {0}': 'Editable: {0}',
+        '読み取り専用': 'Read-only',
+        '読み取り専用 — {0}': 'Read-only — {0}',
+        '複数表の結合や集約は、行を元の表に対応付けられません':
+            'joins and aggregates cannot be mapped back to a single base table',
+        '複数の表を読んでいるため、更新先を決められません':
+            'it reads more than one table, so there is no single update target',
+        '{0} を含む結果は、行を元の表に対応付けられません':
+            'results using {0} cannot be mapped back to rows in a base table',
+        'この表に行を識別する主キー / UNIQUE がありません':
+            'this table has no PRIMARY KEY or UNIQUE column to identify rows',
+        '{0} を結果に含めると編集できます': 'include {0} in the result to edit rows',
+        '計算列・別名列は直接更新できません': 'computed and aliased columns cannot be updated in place',
+        '素の列が無いため更新先を決められません': 'there are no plain columns to update',
+        'このビューは更新できません': 'this view is not updatable',
+        '元の表が見つかりません': 'the underlying table was not found',
+        'SELECT の結果ではありません': 'the result is not from a SELECT',
+
+        // ---- v1.39: 実行中の表示 ----
+        '実行中…': 'Running…',
+        '{0} ms かかりました': 'took {0} ms',
+        'Run ⧉（Ctrl+Alt+Enter）で実行すると画面が固まらず、途中で止められます。':
+            'Run ⧉ (Ctrl+Alt+Enter) keeps the page responsive and lets you cancel.',
+
+
+        // ---- v1.39: スキーマ編集の破壊的変更の予告 ----
+        '保存すると元に戻せません': 'Saving cannot be undone',
+        '列 {0} を削除します（{1} 行分の値が失われます）。':
+            'Column {0} will be dropped ({1} rows of values will be lost).',
+        '列 {0} の型を変えます。変換できない値は失われます。':
+            'Column {0} will change type. Values that cannot be converted will be lost.',
+        '列名を変えます: {0}。この名前を使っているビュー・トリガーは追随しません。':
+            'Columns will be renamed: {0}. Views and triggers that use these names will not follow.',
+        'クリックまたは Enter で並べ替え': 'Click or press Enter to sort',
+
+        'ワーカーで実行（画面が固まらない・途中で止められる）':
+            'Run on a worker (keeps the page responsive, can be cancelled)',
+
+        'エラー': 'Error',
+
+
+        // ---- v1.40: ツールバーの動詞も原文を日本語に揃えた ----
+        '整形': 'Format',
+        '実行計画': 'Explain',
+        '⧉ ワーカー': 'Run ⧉',
+        '中止': 'Cancel',
+        '実行': 'Run',
+        'CSV 書き出し': 'Export CSV',
+        'JSON 書き出し': 'Export JSON',
+        'Markdown コピー': 'Copy MD',
+        'TSV コピー': 'Copy TSV',
+        'INSERT コピー': 'Copy INSERT',
+        '＋ 行': '+ Row',
+        '－ 行': '− Row',
+        '履歴': 'History',
+
+        // ---- v1.40: セル詳細 / 列プロファイル / ER 図 ----
+        '型:': 'Type:',
+        '長さ:': 'Length:',
+        'コピー': 'Copy',
+        '閉じる': 'Close',
+        '（{0} 行 × {1} 列）': '({0} rows × {1} columns)',
+        '列': 'Column',
+        '型': 'Type',
+        'NULL': 'Nulls',
+        '相異なり': 'Distinct',
+        '最小': 'Min',
+        '最大': 'Max',
+        '平均': 'Avg',
+        '長さ': 'Len',
+        '多い値': 'Top values',
+        '（{0} 表 / 外部キー {1} 本）': '({0} tables, {1} foreign keys)',
+        '{0} 行': '{0} rows',
+
+        // ---- v1.40: 処理中の表示と、編集内容の保護 ----
+        '生成中…': 'Generating…',
+        '取り込み中…': 'Importing…',
+        '書き出し中…': 'Exporting…',
+        '保存中…': 'Saving…',
+        '読み込み中…': 'Loading…',
+        'エディタの内容を置き換えました（Ctrl+Z で戻せます）。':
+            'Replaced the editor contents (Ctrl+Z undoes it).',
+        '新しいタブで開きました。': 'Opened in a new tab.',
+        '{0}（全 {1}）': '{0} of {1}',
+
+        '絞り込み後の全行を書き出します（表示件数の設定は影響しません）':
+            'Exports every filtered row (the display limit does not apply)',
+        '画面に描く件数の上限です。書き出し・コピーは常に絞り込み後の全行が対象になります':
+            'How many rows to draw. Export and copy always cover every filtered row.',
+
+        'エディタタブ': 'Editor tabs',
+        '{0}{1} — ダブルクリック（または F2）で名前を変更': '{0}{1} — double-click (or F2) to rename',
+
+        '{0} の操作': 'Actions for {0}',
+
+        '表': 'Tables',
+
+        '書き出し ▾': 'Export ▾',
+        '絞り込み後の全行が対象です（表示件数の設定は影響しません）':
+            'Covers every filtered row (the display limit does not apply)',
+
+        'SQL を入力してから実行してください。表をクリックすると例が入ります。':
+            'Type some SQL first. Clicking a table fills in an example.',
+        '-- 実行（Ctrl + Enter）で結果が出ます。表をクリックしても中身を見られます。':
+            '-- Run it (Ctrl + Enter) to see results. Clicking a table also shows its rows.',
+
+        'エラー {0} 件（クリックで開く）': '{0} errors (click to open)',
+        '警告 {0} 件（クリックで開く）': '{0} warnings (click to open)',
+
+        'WHERE を指定していません。{0} 行すべてが対象になりました。':
+            'No WHERE clause: all {0} rows were affected.',
+        '元に戻す': 'Undo',
+        '{0} 退避が大きすぎるため取っていません。': '{0} The database is too large to snapshot, so this cannot be undone.',
+        '元に戻せませんでした: {0}': 'Could not undo: {0}',
+        '実行前の状態へ戻しました。': 'Restored the state from before the statement.',
+
+        'カテゴリへ移動': 'Jump to category',
+        '{0} カテゴリ': '{0} categories',
+
+        '列名が空の行があります。消したい列は削除ボタンを使ってください。':
+            'A column name is empty. Use the delete button to remove a column.',
+        '列名「{0}」は使えません。英数字とアンダースコアで入力してください（先頭は英字か _）。':
+            'Column name "{0}" is not valid. Use letters, digits and underscores (starting with a letter or _).',
+        '表には少なくとも 1 つの列が必要です。': 'A table needs at least one column.',
+        '列名が重複しています。': 'Duplicate column names.',
+        '列名': 'Column name',
+        '英数字とアンダースコアで入力してください（先頭は英字か _）。':
+            'Use letters, digits and underscores (starting with a letter or _).',
+
+        'クエリ入力欄へ移動': 'Skip to the query editor',
+
+        'このブラウザに保存したデータを完全に削除し、初期状態へ戻します。この操作は取り消せません。':
+            'Permanently deletes the data saved in this browser and returns to the initial state. This cannot be undone.',
 
         // ---- 結果グリッド ----
         '「{0}」に一致する行がありません（全 {1} 件）。': 'No rows match "{0}" (out of {1}).',
@@ -307,8 +486,8 @@
         '1 行処理 · 行削除': '1 row affected · row deleted',
 
         // ---- 表一覧 / メニュー ----
-        'クリックでカラム名をエディタへ挿入': 'Click to insert the column name into the editor',
-        'カラムを表示': 'Show columns',
+        'クリックで列名をエディタへ挿入': 'Click to insert the column name into the editor',
+        '列を表示': 'Show columns',
         '列プロファイル（中身の要約）': 'Column profile (a summary of the contents)',
         '＋ 新しい表を作る': '+ Create a new table',
         '「{0}」に一致する表・列はありません（全 {1} 表）。': 'No tables or columns match "{0}" (out of {1} tables).',
@@ -325,25 +504,22 @@
             'Put a DROP statement in the editor. Running it deletes {0}.',
 
         // ---- スキーマ / プロファイル / ER ----
-        'テーブルには少なくとも1つのカラムが必要です。': 'A table needs at least one column.',
-        'カラム名が重複しています。': 'Two columns have the same name.',
-        'PRIMARY KEY は1カラムのみ指定できます。': 'Only one column can be the PRIMARY KEY.',
-        'AUTO_INCREMENT は1カラムのみ指定できます。': 'Only one column can be AUTO_INCREMENT.',
+        'PRIMARY KEY に指定できる列は 1 つだけです。': 'Only one column can be the PRIMARY KEY.',
+        'AUTO_INCREMENT に指定できる列は 1 つだけです。': 'Only one column can be AUTO_INCREMENT.',
         'Table \'{0}\' のスキーマを更新しました。': 'Updated the schema of \'{0}\'.',
         'エラー: {0}': 'Error: {0}',
-        '空のテーブルです': 'This table is empty',
+        '空の表です': 'This table is empty',
         'この列の分布を出すクエリをエディタへ': 'Put a query for this column\'s distribution in the editor',
         'この列の非NULL値はすべて異なる': 'Every non-NULL value in this column is distinct',
-        'テーブル \'{0}\' がありません。': 'There is no table \'{0}\'.',
+        '表 \'{0}\' がありません。': 'There is no table \'{0}\'.',
         '外部キーはまだありません': 'There are no foreign keys yet',
-        'テーブルがありません。': 'There are no tables.',
+        '表がありません。': 'There are no tables.',
         '図がありません。': 'There is no diagram.',
 
         // ---- エディタタブ / 履歴 ----
         'このタブを閉じる': 'Close this tab',
         'タブは最大 {0} 枚までです。': 'You can have at most {0} tabs.',
         'タブ名': 'Tab name',
-        '{0}{1} — ダブルクリックで名前を変更': '{0}{1} — double-click to rename',
         '履歴はまだありません。': 'No history yet.',
         '一致する履歴がありません。': 'No matching history.',
         '{0} 件ヒット': '{0} matches',

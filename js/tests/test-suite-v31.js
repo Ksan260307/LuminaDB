@@ -162,7 +162,9 @@
         ].forEach(s => src.executeQuery(s));
         const dump = src.exportSQL();
         const fresh = new DatabaseEngine();
-        ['users', 'products', 'orders'].forEach(t => fresh.executeQuery(`DROP TABLE IF EXISTS ${t}`));
+        // 依存の子から先に落とす。orders が users / products を参照しているので、
+        // 親から落とすと外部キーに阻まれて残り、ダンプの CREATE TABLE が衝突する
+        ['orders', 'users', 'products'].forEach(t => fresh.executeQuery(`DROP TABLE IF EXISTS ${t}`));
         const res = fresh.executeScript(dump);
         return res.succeeded === res.total
             && !!fresh.views.rx_view && !!fresh.sequences.rx_seq && !!fresh.triggers.rx_trig

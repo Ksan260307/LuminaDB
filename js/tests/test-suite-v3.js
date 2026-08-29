@@ -42,7 +42,7 @@
             const r = db.executeQuery("DELETE FROM v3c_p WHERE NOT EXISTS (SELECT 1 FROM v3c_c WHERE v3c_c.pid = v3c_p.id)");
             const c = db.executeQuery("SELECT COUNT(*) AS c FROM v3c_p");
             db.executeQuery("DROP TABLE v3c_c, v3c_p");
-            return !r.error && r.data[0].Message.includes('1 rows deleted') && c.data[0].c === 2;
+            return !r.error && r.data[0].Message.includes('1 row deleted') && c.data[0].c === 2;
         }},
         { name: "V3Corr: Scalar Update Set Value", fn: () => {
             db.executeQuery("CREATE TABLE v3c_agg (uid INTEGER, total INTEGER)");
@@ -223,7 +223,7 @@
         errCase("V3Cmp: NULL In Composite PK Rejected", "INSERT INTO v3cmp (a, b, v) VALUES (3, NULL, 'n')", 'NOT NULL'),
         errCase("V3Cmp: Batch Internal Duplicate Rejected", "INSERT INTO v3cmp (a, b, v) VALUES (5, 5, 'p'), (5, 5, 'q')", 'constraint failed'),
         errCase("V3Cmp: Update Into Conflict Rejected", "UPDATE v3cmp SET b = 2 WHERE a = 1 AND b = 1", 'PRIMARY KEY constraint failed'),
-        { name: "V3Cmp: Update To Free Slot OK", sql: "UPDATE v3cmp SET b = 9 WHERE a = 2 AND b = 1", check: r => r.data[0].Message.includes('1 rows updated') },
+        { name: "V3Cmp: Update To Free Slot OK", sql: "UPDATE v3cmp SET b = 9 WHERE a = 2 AND b = 1", check: r => r.data[0].Message.includes('1 row updated') },
         { name: "V3Cmp: REPLACE On Composite Conflict", fn: () => {
             const r = db.executeQuery("REPLACE INTO v3cmp (a, b, v) VALUES (1, 2, 'replaced')");
             const q = db.executeQuery("SELECT v FROM v3cmp WHERE a = 1 AND b = 2");

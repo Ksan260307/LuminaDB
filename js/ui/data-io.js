@@ -2,6 +2,43 @@
     // [Data IO] - DB保存/読込/クリア、SQL・CSVのインポート/エクスポート、テストデータ生成
     // ============================================================================
 
+    // ------------------------------------------------------------------
+    // 時間のかかる処理を「押した合図」付きで走らせる。
+    //
+    // ここの操作は同期で、その間ブラウザは何も描けない。ダミー行を 10 万件
+    // 生成すると 4 秒強かかるのに、ボタンは押せたまま・表示も変わらないため、
+    // 反応が無いと思ってもう一度押せてしまった（二重に生成される）。
+    // クエリ実行には実行中の表示を入れてあるので、こちらも同じ扱いに揃える。
+    //
+    // 「busy を描く → 1 タスク譲る → 処理する」の順にする。
+    // テスト中は遅らせない。click() の直後に結果を読む検査があり、
+    // 遅らせるとそれが空振りするため（busy 表示は人向けの演出）
+    // ------------------------------------------------------------------
+    function runWithBusy(btn, busyLabel, work) {
+        if (!btn || (typeof isTesting !== 'undefined' && isTesting)) { return work(); }
+        const label = btn.textContent;
+        const done = () => {
+            btn.disabled = false;
+            btn.removeAttribute('aria-busy');
+            btn.textContent = label;
+        };
+        btn.disabled = true;
+        btn.setAttribute('aria-busy', 'true');
+        btn.textContent = busyLabel;
+        setTimeout(() => {
+            let r;
+            try {
+                r = work();
+            } catch (e) {
+                done();
+                throw e;
+            }
+            // 非同期の処理（保存・読み込み）は終わるまで待ってから戻す
+            if (r && typeof r.then === 'function') r.then(done, done);
+            else done();
+        }, 0);
+    }
+
     // SQLテキストを ';' 区切りで文へ分割する。
     // 文字列リテラル内の ';' は保護し、エスケープは SQL標準の引用符二重化 ('')
     // と exportSQL が出力するバックスラッシュ形式 (\') の両方を認識する。
@@ -103,17 +140,20 @@
     }
     window.refreshStorageInfo = refreshStorageInfo;
 
-    document.getElementById('saveIdbBtn').addEventListener('click', async () => {
+    document.getElementById('saveIdbBtn').addEventListener('click', (e) => {
+      runWithBusy(e.currentTarget, i18nT('保存中…'), async () => {
       try {
         await saveDB(db.exportForIDB());
         refreshStorageInfo();
         showToast(i18nT('IndexedDB にデータを保存しました。'));
-      } catch (e) {
-        showToast(i18nT('保存エラー: {0}', e.message), true);
+      } catch (err) {
+        showToast(i18nT('保存エラー: {0}', err.message), true);
       }
+      });
     });
 
-    document.getElementById('loadIdbBtn').addEventListener('click', async () => {
+    document.getElementById('loadIdbBtn').addEventListener('click', (e) => {
+      runWithBusy(e.currentTarget, i18nT('読み込み中…'), async () => {
       try {
         const dump = await loadDB();
         if (dump) {
@@ -124,11 +164,12 @@
         } else {
             showToast(i18nT('保存されたデータがありません。'), true);
         }
-      } catch(e) { showToast(i18nT('読み込みエラー: {0}', e.message), true); }
+      } catch(err) { showToast(i18nT('読み込みエラー: {0}', err.message), true); }
+      });
     });
 
     document.getElementById('clearIdbBtn').addEventListener('click', () => {
-      document.getElementById('clearConfirmModal').classList.remove('hidden');
+      openModal('clearConfirmModal');
     });
 
     document.getElementById('execClearIdbBtn').addEventListener('click', async () => {
@@ -138,9 +179,9 @@
       if (typeof reapplyStatementTimeout === 'function') reapplyStatementTimeout();
       currentResultData = null;
       renderTree();
-      els.resArea.innerHTML = `<div class="m-auto text-gray-400 text-sm">Run a query to see results.</div>`;
-      showToast(i18nT('IndexedDB のデータを削除し、初期状態にリセットしました。'));
-      document.getElementById('clearConfirmModal').classList.add('hidden');
+      els.resArea.innerHTML = `<div class="m-auto text-gray-500 text-sm">${i18nT('クエリを実行すると、ここに結果が出ます。')}</div>`;
+      showToast(i18nT('このブラウザの保存データを削除し、初期状態へ戻しました。'));
+      closeModal('clearConfirmModal');
     });
 
     // ファイルを 1 本のヘルパーで落とす（従来は書き出しごとに同じ 5 行を書いていた）
@@ -327,7 +368,8 @@
         if (box) { box.classList.add('hidden'); box.innerHTML = ''; }
     }
 
-    document.getElementById('exportSqlBtn').addEventListener('click', () => {
+    document.getElementById('exportSqlBtn').addEventListener('click', (e) => {
+      runWithBusy(e.currentTarget, i18nT('書き出し中…'), () => {
         // 断片のまま Blob へ渡す（20 万行のダンプで 5.5MB の文字列を作らない）
         const parts = db.exportSQLParts();
         downloadText(parts, 'luminadb_export.sql', 'text/sql');
@@ -337,11 +379,13 @@
         const tables = Object.keys(db.tables).filter(t => !t.startsWith('__tmp_') && !db.tables[t].isTemp).length;
         if (info) info.textContent = i18nT('{0} 表 / {1} 文字を luminadb_export.sql として保存しました。', tables, sqlLen.toLocaleString());
         showToast(i18nT('SQL ダンプを書き出しました（{0} 表）。', tables));
+      });
     });
 
     // 全テーブルを JSON で書き出す（結果セットではなくデータベース全体）
     const exportJsonAllBtn = document.getElementById('exportJsonAllBtn');
-    if (exportJsonAllBtn) exportJsonAllBtn.addEventListener('click', () => {
+    if (exportJsonAllBtn) exportJsonAllBtn.addEventListener('click', (e) => {
+      runWithBusy(e.currentTarget, i18nT('書き出し中…'), () => {
         const out = {};
         Object.keys(db.tables).forEach(t => {
             if (t.startsWith('__tmp_') || db.tables[t].isTemp) return;
@@ -349,9 +393,10 @@
             out[t] = r.error ? { __error: r.error } : r.data;
         });
         const names = Object.keys(out);
-        if (names.length === 0) { showToast(i18nT('書き出せるテーブルがありません。'), true); return; }
+        if (names.length === 0) { showToast(i18nT('書き出せる表がありません。'), true); return; }
         downloadText(JSON.stringify(out, null, 2), 'luminadb_export.json', 'application/json');
         showToast(i18nT('{0} 表を JSON として書き出しました。', names.length));
+      });
     });
 
     document.getElementById('importSqlBtn').addEventListener('click', () => {
@@ -387,8 +432,8 @@
             if (successCount > 0) triggerAutoSave();
             return { successCount, failed: failures.length };
         } catch (err) {
-            showImportLog([i18nT('SQL インポート失敗: {0}', err.message)], true);
-            showToast(i18nT('SQLインポート失敗: {0}', err.message), true);
+            showImportLog([i18nT('SQL の取り込みに失敗しました: {0}', err.message)], true);
+            showToast(i18nT('SQL の取り込みに失敗しました: {0}', err.message), true);
             return { successCount: 0, failed: 1 };
         }
     }
@@ -402,7 +447,8 @@
         e.target.value = '';
     });
 
-    document.getElementById('generateBtn').addEventListener('click', () => {
+    document.getElementById('generateBtn').addEventListener('click', (e) => {
+       runWithBusy(e.currentTarget, i18nT('生成中…'), () => {
        const tbl = document.getElementById('genTableSelect').value;
        const inputVal = parseInt(document.getElementById('genRowCount').value, 10);
        const count = isNaN(inputVal) || inputVal < 1 ? 10000 : inputVal;
@@ -416,6 +462,7 @@
            showToast(i18nT('データ生成失敗: {0}', err.message), true);
        }
        closeModal('dataModal');
+       });
     });
 
     // CSV の取り込み先セレクトで「新しい表を作る」を選んだときだけ表名の入力欄を出す
@@ -465,7 +512,7 @@
         renderTree();
         if (res && res.error) {
             showImportLog([i18nT('{0}: 取り込みに失敗しました。', label), `→ ${res.error}`], true);
-            showToast(i18nT('インポート失敗: {0}', res.error), true);
+            showToast(i18nT('取り込みに失敗しました: {0}', res.error), true);
             return res;
         }
         const n = (res && res.rows) || 0;
@@ -474,12 +521,12 @@
             i18nT('{0}: {1} 行を {2} に取り込みました{3}。', label, n.toLocaleString(), table, create ? '（表を新規作成）' : ''),
             cols ? i18nT('列: {0}', cols) : ''
         ].filter(Boolean), false);
-        showToast(i18nT('{0} 行を {1} にインポートしました。', n.toLocaleString(), table));
+        showToast(i18nT('{0} 行を {1} に取り込みました。', n.toLocaleString(), table));
         if (n > 0) triggerAutoSave();
         return res;
     }
 
-    document.getElementById('execCsvImportBtn').addEventListener('click', () => {
+    document.getElementById('execCsvImportBtn').addEventListener('click', (e) => {
         const fileInput = document.getElementById('csvFileInput');
         const file = fileInput.files[0];
         clearImportLog();
@@ -487,10 +534,13 @@
             showImportLog([i18nT('CSV ファイルが選ばれていません。')], true);
             return showToast(i18nT('CSVファイルが選択されていません。'), true);
         }
+        const btn = e.currentTarget;
         const reader = new FileReader();
         reader.onload = (event) => {
-            runCsvImport(event.target.result, file.name);
-            fileInput.value = '';
+            runWithBusy(btn, i18nT('取り込み中…'), () => {
+                runCsvImport(event.target.result, file.name);
+                fileInput.value = '';
+            });
         };
         reader.readAsText(file);
     });

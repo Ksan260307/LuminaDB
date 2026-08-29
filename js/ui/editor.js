@@ -194,14 +194,30 @@
         return map;
     }
 
-    function hideSuggestions() {
-        els.suggestBox.classList.add('hidden');
+    // 補完中の語が「表名しか置けない位置」か。
+    // 直前が FROM / JOIN / INTO / UPDATE / TABLE のときだけ真。
+    // 修飾子（`u.`）付きの語や、既に別名を書き始めた位置（`FROM users u`）は
+    // 対象外になるよう、直前の 1 語だけを見る
+    const TABLE_SLOT = /\b(from|join|into|update|table)\s+$/i;
+    function expectsTableName(wordStart) {
+        return TABLE_SLOT.test(els.query.value.slice(0, wordStart));
     }
 
+    function hideSuggestions() {
+        els.suggestBox.classList.add('hidden');
+        // 支援技術へ「候補は閉じた」と伝える。付けっぱなしだと開いていると読まれ続ける
+        els.query.setAttribute('aria-expanded', 'false');
+        els.query.removeAttribute('aria-activedescendant');
+    }
+
+    // 候補一覧は listbox / option として組む。role が無いと支援技術には
+    // ただの div の山にしか見えず、「何件出ていて、いま何番目を選んでいるか」が届かない
     function renderSuggestBox() {
         els.suggestBox.innerHTML = currentSuggestions.map((s, i) => `
-            <div class="px-3 py-1.5 cursor-pointer ${i === suggestIndex ? 'bg-blue-100 text-blue-800 font-semibold' : 'hover:bg-gray-50 text-gray-600'}" data-index="${i}">${s}</div>
+            <div id="suggestOpt${i}" role="option" aria-selected="${i === suggestIndex}" class="px-3 py-1.5 cursor-pointer ${i === suggestIndex ? 'bg-blue-100 text-blue-800 font-semibold' : 'hover:bg-gray-50 text-gray-600'}" data-index="${i}">${escapeHtml(s)}</div>
         `).join('');
+        if (suggestIndex >= 0) els.query.setAttribute('aria-activedescendant', `suggestOpt${suggestIndex}`);
+        else els.query.removeAttribute('aria-activedescendant');
     }
 
     function showSuggestions() {
@@ -228,7 +244,13 @@
                 if (db.tables[t]) db.tables[t].getColumnNames().forEach(c => ctxCols.push(c));
             });
             const tableNames = Object.keys(db.tables).filter(t => !t.startsWith('__'));
-            pool = [...ctxCols, ...tableNames, ...keywords];
+            // 直前の節を見て候補の種類を絞る。
+            // FROM / JOIN / INTO / UPDATE の直後に来られるのは表名だけなので、
+            // そこへキーワードを混ぜない。`FROM us` に USING / USER / USER_VERSION が
+            // 並んで、本命の users が埋もれていた
+            pool = expectsTableName(wordInfo.start)
+                ? tableNames
+                : [...ctxCols, ...tableNames, ...keywords];
         }
         currentSuggestions = [...new Set(pool)]
             .filter(s => s.toLowerCase().startsWith(lowerWord) && s.toLowerCase() !== lowerWord)
@@ -239,7 +261,10 @@
             return;
         }
 
-        suggestIndex = 0;
+        // 既定は「未選択」。0 にしておくと素の Enter が改行ではなく確定になり、
+        // 語の途中で改行が打てなくなる。↑↓ で選んだときだけ Enter が効く
+        suggestIndex = -1;
+        els.query.setAttribute('aria-expanded', 'true');
 
         // Calculate coordinate using dummy span
         const textBefore = els.query.value.slice(0, wordInfo.start);
@@ -317,7 +342,7 @@
             : `(${items.length} / ${all.length})`;
         list.innerHTML = '';
         if (items.length === 0) {
-            list.innerHTML = `<div class="text-sm text-gray-400 text-center py-10">${all.length === 0 ? i18nT('履歴はまだありません。') : i18nT('一致する履歴がありません。')}</div>`;
+            list.innerHTML = `<div class="text-sm text-gray-500 text-center py-10">${all.length === 0 ? i18nT('履歴はまだありません。') : i18nT('一致する履歴がありません。')}</div>`;
             return;
         }
         items.forEach(sql => {
@@ -396,6 +421,22 @@
     //   ・localStorage へ保存し、リロードしても書きかけが残る
     //   ・ラベルは SQL から自動生成（ダブルクリックで手動命名も可）
     // ============================================================================
+    // 初回だけエディタへ置くお手本。サンプルの 3 表が全部登場し、
+    // 結合・別名・並べ替え・件数制限がひと目で判る短さにしてある。
+    // 別名は英語のままにする（英語表示の利用者にも同じ例が読めるように）。
+    // 言語に合わせるのは先頭の案内だけ
+    function firstRunSql() {
+        return [
+            i18nT('-- 実行（Ctrl + Enter）で結果が出ます。表をクリックしても中身を見られます。'),
+            'SELECT u.name AS customer, p.name AS product, o.amount AS qty',
+            'FROM orders o',
+            '  JOIN users u    ON u.id = o.user_id',
+            '  JOIN products p ON p.id = o.product_id',
+            'ORDER BY o.order_id',
+            'LIMIT 10;'
+        ].join('\n');
+    }
+
     const TABS_KEY = 'luminadb_editor_tabs';
     const TABS_MAX = 12;
     let tabs = [];
@@ -404,7 +445,13 @@
 
     // SQL から短いタブ名を作る（'SELECT users' 等）。空なら 'Untitled'
     function deriveTabName(sql) {
-        const t = String(sql || '').trim().replace(/\s+/g, ' ');
+        // 先頭のコメント行は名前にしない（初回のお手本が
+        // 「-- 実行（Ctrl + Enter」というタブ名になっていた）
+        const body = String(sql || '')
+            .split('\n')
+            .filter(l => !/^\s*--/.test(l))
+            .join('\n');
+        const t = body.trim().replace(/\s+/g, ' ');
         if (t === '') return 'Untitled';
         const vm = t.match(/^([a-zA-Z_]+)/);
         if (!vm) return t.slice(0, 18);
@@ -450,6 +497,8 @@
     function renderTabs() {
         const wrap = document.getElementById('editorTabs');
         if (!wrap) return;
+        wrap.setAttribute('role', 'tablist');
+        wrap.setAttribute('aria-label', i18nT('エディタタブ'));
         wrap.innerHTML = '';
         // 仮引数は tab（i18nT と紛れないよう t を避ける）
         tabs.forEach((tab, i) => {
@@ -459,14 +508,21 @@
                 + (on ? 'bg-white border-blue-500 text-gray-800 font-medium shadow-sm'
                       : 'bg-gray-50 border-transparent text-gray-500 hover:bg-gray-100 hover:text-gray-700');
             el.dataset.tabId = tab.id;
-            el.title = i18nT('{0}{1} — ダブルクリックで名前を変更', tab.name, i < 9 ? ` (Alt+${i + 1})` : '');
+            // タブは div のままだが、tablist / tab として宣言してキーボードから
+            // 選べるようにする。以前は閉じる × だけが button で focusable という
+            // 非対称で、「閉じられるのに選べない」状態だった（Alt+1..9 のみ）。
+            // 選択中のタブだけを Tab 順に入れる（一般的な tablist の作法）
+            el.setAttribute('role', 'tab');
+            el.setAttribute('aria-selected', on ? 'true' : 'false');
+            el.tabIndex = on ? 0 : -1;
+            el.title = i18nT('{0}{1} — ダブルクリック（または F2）で名前を変更', tab.name, i < 9 ? ` (Alt+${i + 1})` : '');
             const label = document.createElement('span');
             label.className = 'truncate max-w-[10rem]';
             label.textContent = tab.name;
             el.appendChild(label);
             if (tabs.length > 1) {
                 const x = document.createElement('button');
-                x.className = 'text-gray-400 hover:text-red-600 leading-none px-0.5';
+                x.className = 'text-gray-500 hover:text-red-600 leading-none px-0.5';
                 x.textContent = '×';
                 x.title = i18nT('このタブを閉じる');
                 x.dataset.closeId = tab.id;
@@ -555,8 +611,17 @@
             const idx = Math.max(0, (saved.tabs || []).findIndex(t => t.id === saved.activeTabId));
             activeTabId = tabs[Math.min(idx, tabs.length - 1)].id;
         } else {
-            // 初回起動: 現在エディタに入っている内容をそのまま 1 枚目のタブにする
-            const cur = els.query.value;
+            // 初回起動。
+            //
+            // 何も無い状態で開くと、空のエディタと 40 個ほどのボタンだけが出て、
+            // いちばん大きい「実行」を押しても（空文なので）無反応だった。
+            // 500 以上の構文・ER 図・列プロファイル・ワーカー実行があるのに、
+            // 入口がどこにも示されない。
+            //
+            // サンプル 3 表を結合する 1 文を置いておく。押すだけで結果グリッド・
+            // 編集可バッジ・件数・実行時間の意味が同時に伝わる。
+            // 保存済みのタブがあるときは触らない（2 回目以降は出ない）
+            const cur = els.query.value || firstRunSql();
             tabs = [{ id: ++tabSeq, name: deriveTabName(cur), custom: false, sql: cur, undoStack: [cur], redoStack: [] }];
             activeTabId = tabs[0].id;
         }
@@ -578,6 +643,27 @@
         const tab = e.target.closest('[data-tab-id]');
         if (tab) renameTab(Number(tab.dataset.tabId));
     });
+    // キーボードでのタブ操作: ← → で移動、Enter/Space で選択、
+    // F2 で名前の変更、Delete で閉じる。
+    // 名前の変更はダブルクリック専用だったので F2 を足した
+    document.getElementById('editorTabs').addEventListener('keydown', (e) => {
+        const tab = e.target.closest && e.target.closest('[data-tab-id]');
+        if (!tab) return;
+        const id = Number(tab.dataset.tabId);
+        const idx = tabs.findIndex(t => t.id === id);
+        const focusTab = (i) => {
+            const t = tabs[(i + tabs.length) % tabs.length];
+            if (!t) return;
+            selectTab(t.id);
+            const el = document.querySelector(`#editorTabs [data-tab-id="${t.id}"]`);
+            if (el) el.focus();
+        };
+        if (e.key === 'ArrowRight') { e.preventDefault(); focusTab(idx + 1); return; }
+        if (e.key === 'ArrowLeft')  { e.preventDefault(); focusTab(idx - 1); return; }
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectTab(id); els.query.focus(); return; }
+        if (e.key === 'F2') { e.preventDefault(); renameTab(id); return; }
+        if (e.key === 'Delete') { e.preventDefault(); closeTab(id); }
+    });
     document.getElementById('tabAddBtn').addEventListener('click', () => addTab(''));
 
     function setQueryValue(val) {
@@ -586,6 +672,35 @@
         saveQueryState();
         touchActiveTab();
     }
+
+    // ------------------------------------------------------------------
+    // 画面の別の場所（Help の Use / サイドバーの表 / ER 図 / 列プロファイル）から
+    // SQL をエディタへ流し込む共通の入口。
+    //
+    // 以前はどれも setQueryValue で**書きかけを黙って上書き**していた。
+    // Ctrl+Z で戻せはするが、そう案内する場所がどこにも無く、
+    // 「消えた」としか見えなかった。
+    //
+    // 人が打った内容が残っているときは、潰さずに新しいタブで開く。
+    // 表を続けて選ぶような操作でタブが増え続けないよう、
+    // 「この仕組みが入れた内容のまま触られていない」場合は同じタブを使い回す
+    // ------------------------------------------------------------------
+    let editorContentIsGenerated = true;   // 起動直後の空/復元内容は守る対象ではない
+    function loadIntoEditor(sql) {
+        const cur = els.query.value.trim();
+        const mine = editorContentIsGenerated || cur === '';
+        if (mine || tabs.length >= TABS_MAX) {
+            setQueryValue(sql);
+            editorContentIsGenerated = true;
+            if (!mine) showToast(i18nT('エディタの内容を置き換えました（Ctrl+Z で戻せます）。'));
+            return;
+        }
+        addTab(sql);
+        editorContentIsGenerated = true;
+        showToast(i18nT('新しいタブで開きました。'));
+    }
+    // 人が打った瞬間から「守る対象」に変わる
+    els.query.addEventListener('input', () => { editorContentIsGenerated = false; });
 
     // カーソル位置へテキストを挿入する（サイドバーのカラム名クリック等から使う）。
     // 直前が識別子文字なら区切りの空白を足し、挿入後はカーソルを末尾へ送る
@@ -666,28 +781,41 @@
     });
 
     els.query.addEventListener('keydown', (e) => {
+        // 補完ポップアップが開いている間のキー処理。
+        //
+        // **修飾キー付きは補完へ渡さない**こと。以前は Enter を無条件に奪っていたため、
+        // 語の途中で Ctrl+Enter を押すと実行されず、代わりに候補が挿入されて
+        // SQL が黙って書き換わっていた（最頻出のショートカットが最頻出の状況で効かない）。
+        // Escape だけは修飾キーの有無にかかわらず閉じる意味しか無いので通す
+        const plainKey = !e.ctrlKey && !e.metaKey && !e.altKey;
         if (!els.suggestBox.classList.contains('hidden') && currentSuggestions.length > 0) {
-            if (e.key === 'ArrowDown') {
+            if (e.key === 'Escape') {
+                hideSuggestions();
+                return;
+            }
+            if (plainKey && e.key === 'ArrowDown') {
                 e.preventDefault();
+                // 未選択（-1）からは先頭へ。以降は巡回する
                 suggestIndex = (suggestIndex + 1) % currentSuggestions.length;
                 renderSuggestBox();
                 return;
             }
-            if (e.key === 'ArrowUp') {
+            if (plainKey && e.key === 'ArrowUp') {
                 e.preventDefault();
                 suggestIndex = (suggestIndex - 1 + currentSuggestions.length) % currentSuggestions.length;
                 renderSuggestBox();
                 return;
             }
-            if (e.key === 'Enter' || e.key === 'Tab') {
+            // Tab は候補が出ていれば常に確定（未選択なら先頭）。
+            // Enter は **↑↓ で明示的に選んだときだけ** 確定する。
+            // 既定で先頭を選択済みにしていたため、素の改行が打てなくなっていた
+            if (plainKey && (e.key === 'Tab' || (e.key === 'Enter' && suggestIndex >= 0))) {
                 e.preventDefault();
-                insertSuggestion(currentSuggestions[suggestIndex]);
+                insertSuggestion(currentSuggestions[suggestIndex < 0 ? 0 : suggestIndex]);
                 return;
             }
-            if (e.key === 'Escape') {
-                hideSuggestions();
-                return;
-            }
+            // ここへ来た Enter は候補未選択の素の改行。補完を畳んでから通す
+            if (e.key === 'Enter') hideSuggestions();
         }
 
         const cmdKey = e.metaKey || e.ctrlKey;
@@ -712,8 +840,8 @@
             if (e.altKey) { if (typeof runQueryInWorker === 'function') runQueryInWorker(); return; }
             // Ctrl+Enter はカーソル位置の 1 文だけ、Ctrl+Shift+Enter は全文を実行する。
             // 複数文を書き溜めたスクラッチパッドから 1 文ずつ試せるようにするため
-            if (e.shiftKey) runQuery();
-            else runQueryAtCursor();
+            if (e.shiftKey) runQueryFromUi();
+            else runQueryFromUi(undefined, true);
             return;
         }
         // Ctrl+↑ / Ctrl+↓: クエリ履歴の巡回

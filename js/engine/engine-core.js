@@ -202,35 +202,78 @@
         });
       }
 
+      // 起動時のサンプル 3 表。
+      //
+      // 以前はここで列を足すだけだったので、型も PRIMARY KEY も FOREIGN KEY も
+      // 無い表ができていた。その結果、初回に触れる範囲で
+      //   ・結果セルの直接編集（行を特定する鍵が無いので全表で不可）
+      //   ・+ Row / − Row（同上で常に無効）
+      //   ・ER 図（「3 表 / 外部キー 0」で線が 1 本も出ない。全列 ANY）
+      //   ・SHOW CREATE TABLE（`CREATE TABLE users (id, name, age)` としか出ない）
+      // が揃って「機能が壊れている」ように見えていた。画面のヒントは
+      // 「セルをダブルクリックで編集」と案内しているのに、案内された操作が
+      // どの表でも効かない状態だった。
+      //
+      // 型・主キー・外部キーを宣言して、最初の 1 分でその 4 つが動くようにする。
+      // DDL 文を流さず Table を直接組むのは、ここがコンストラクタの中で
+      // executeQuery の前提（トランザクション状態・警告・採番）がまだ整わないため
       _initDefaultData() {
-        const createTableFromData = (name, dataObj) => {
+        // spec: { cols: {名前: 型}, pk: 主キー列, fks: [{col, refTable, refCol}] }
+        const createTableFromData = (name, spec, dataObj) => {
             const t = new Table();
             const cols = Object.keys(dataObj);
             if(cols.length === 0) return t;
-            cols.forEach(c => t.addColumn(c));
+            cols.forEach(c => t.addColumn(c, (spec.cols && spec.cols[c]) || 'ANY'));
             const rows = dataObj[cols[0]].length;
             while(t.capacity < rows) t.grow();
             for(let i=0; i<rows; i++) {
                 cols.forEach(c => t.setValue(c, i, dataObj[c][i]));
             }
             t.rowCount = rows;
+            // 主キーは行の同一性の根拠なので NOT NULL も併せて立てる（宣言と実態を揃える）
+            if (spec.pk) {
+                t.primaryKey = spec.pk;
+                if (!t.notNullCols.includes(spec.pk)) t.notNullCols.push(spec.pk);
+            }
+            // 参照動作は ON DELETE CASCADE にする。
+            // 既定の RESTRICT だと、サンプルの users から 1 行消すだけで
+            // 「orders から参照されている」と拒否され、初めて触る人がいきなり
+            // 制約エラーに当たる。注文は利用者に属するので、親を消したら
+            // 一緒に消えるのが素直な模型でもある（SHOW CREATE TABLE にも出る）
+            if (spec.fks) t.foreignKeys = spec.fks.map(fk => ({
+                col: fk.col, refTable: fk.refTable, refCol: fk.refCol,
+                onDelete: 'CASCADE', onUpdate: 'CASCADE', name: null
+            }));
             this.tables[name.toLowerCase()] = t;
         };
 
-        createTableFromData('users', {
+        createTableFromData('users',
+          { cols: { id: 'INTEGER', name: 'TEXT', age: 'INTEGER' }, pk: 'id' },
+          {
             id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             name: ["Alice", "Bob", "Charlie", "Dave", "Eve", "Frank", "Grace", "Heidi", "Ivan", "Judy"],
             age: [25, 30, 22, 35, 28, 40, 29, 31, 24, 27]
         });
 
-        createTableFromData('products', {
+        createTableFromData('products',
+          { cols: { id: 'INTEGER', name: 'TEXT', price: 'INTEGER', stock: 'INTEGER' }, pk: 'id' },
+          {
             id: [101, 102, 103, 104, 105],
             name: ["Laptop", "Monitor", "Mouse", "Keyboard", "Router"],
             price: [1500, 800, 120, 250, 400],
             stock: [45, 12, 100, 80, 0]
         });
 
-        createTableFromData('orders', {
+        createTableFromData('orders',
+          {
+            cols: { order_id: 'INTEGER', user_id: 'INTEGER', product_id: 'INTEGER', amount: 'INTEGER' },
+            pk: 'order_id',
+            fks: [
+              { col: 'user_id', refTable: 'users', refCol: 'id' },
+              { col: 'product_id', refTable: 'products', refCol: 'id' }
+            ]
+          },
+          {
             order_id: [1001, 1002, 1003, 1004, 1005],
             user_id: [1, 2, 1, 3, 4],
             product_id: [101, 103, 105, 102, 104],

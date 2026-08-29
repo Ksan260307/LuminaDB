@@ -33,7 +33,9 @@
   "scripts": {
     "test": "bun test/browser-test.mjs",
     "test:sql": "bun test/run-suite.mjs all",
-    "build": "bun tools/build-esm.mjs"
+    "build": "bun tools/build-esm.mjs",
+    "build:css": "bun tools/build-tailwind.mjs",
+    "check:css": "bun tools/build-tailwind.mjs --check"
   },
   "keywords": [
     "sql",

@@ -1053,9 +1053,11 @@
                   .map(t => ({ Table: t, Rows: this.tables[t].rowCount, Columns: this.tables[t].getColumnNames().length, Temp: !!this.tables[t].isTemp }));
               return { data, affectedRows: data.length };
           }
-          // SHOW SNAPSHOTS: メモリ内スナップショットの一覧
+          // SHOW SNAPSHOTS: メモリ内スナップショットの一覧。
+          // '__' で始まる名前は画面が内部で使う退避（WHERE なしの UPDATE / DELETE の
+          // 直前に取る取り消し用）なので、利用者の一覧には混ぜない
           if (/^show\s+snapshots$/i.test(sql.trim())) {
-              const data = Object.keys(this.snapshots).map(n => ({
+              const data = Object.keys(this.snapshots).filter(n => !n.startsWith('__')).map(n => ({
                   Snapshot: n, TakenAt: this.snapshots[n].at,
                   Tables: Object.keys(this.snapshots[n].tables).length, Rows: this.snapshots[n].rows
               }));

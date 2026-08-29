@@ -479,7 +479,9 @@
         const editable = document.getElementById('editBadgeText').textContent;
         runGrid("SELECT dept, COUNT(*) AS n FROM v24_ui GROUP BY dept");
         const ro = document.getElementById('editBadgeText').textContent;
-        return editable === 'Editable: v24_ui' && ro === 'Read-only';
+        // 読み取り専用のときは「読み取り専用 — <理由>」の形になる
+        // （理由がツールチップの中だけだと、触れない環境では読めないため）
+        return editable === '編集可: v24_ui' && ro.startsWith('読み取り専用');
       });
       fn('V24Ce commit writes to the base table', () => {
         runGrid("SELECT id, name, salary FROM v24_ui ORDER BY id");
