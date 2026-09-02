@@ -31,7 +31,9 @@
         { name: "Trim Extended", sql: "SELECT TRIM(LEADING 'x' FROM 'xxhi'), TRIM(BOTH ' ' FROM '  hi  ')" },
         { name: "Substring (SQL Standard)", sql: "SELECT SUBSTRING(name FROM 2 FOR 3) FROM {table}" },
         { name: "Translate & Insert", sql: "SELECT TRANSLATE('abc-def', '-', '_'), INSERT('Quadratic', 3, 4, 'What')" },
-        { name: "Soundex", sql: "SELECT SOUNDEX('Robert'), SOUNDEX('Rupert') -- 発音が近い名前は同じコードになる" }
+        { name: "Soundex", sql: "SELECT SOUNDEX('Robert'), SOUNDEX('Rupert') -- 発音が近い名前は同じコードになる" },
+        { name: "Btrim / Encode", sql: "SELECT BTRIM('xxhixx', 'x') AS trimmed, ENCODE('abc', 'base64') AS b64, ENCODE('abc', 'hex') AS hx" },
+        { name: "Ord / Unistr / Contains", sql: "SELECT ORD('あ') AS code, UNISTR(CONCAT(CHAR(92), '0041')) AS ch, CONTAINS(name, 'a') AS has_a FROM {table}" }
       ]},
       { cat: "Hash & Encoding", cmds: [
         { name: "MD5 & SHA1 & CRC32", sql: "SELECT MD5(name), SHA1(name), CRC32(name) FROM {table} LIMIT 3" },
@@ -47,7 +49,8 @@
         { name: "Prepare & Execute", sql: "PREPARE find_user FROM 'SELECT * FROM users WHERE age > ?'" },
         { name: "Execute With Values", sql: "EXECUTE find_user USING 25" },
         { name: "Execute With Variables", sql: "SET @min = 30; EXECUTE find_user USING @min" },
-        { name: "Show / Deallocate", sql: "SHOW PREPARED -- 解放: DEALLOCATE PREPARE find_user" }
+        { name: "Show / Deallocate", sql: "SHOW PREPARED -- 解放: DEALLOCATE PREPARE find_user" },
+        { name: "Execute Immediate", sql: "EXECUTE IMMEDIATE 'SELECT ? AS answer' USING 42" }
       ]},
       { cat: "Math & Date Functions", cmds: [
         { name: "Math Basic", sql: "SELECT ABS(age), CEIL(age), FLOOR(age), ROUND(age) FROM {table}" },
@@ -72,7 +75,10 @@
         { name: "Days Conversion", sql: "SELECT TO_DAYS('2026-07-17'), FROM_DAYS(TO_DAYS('2026-07-17'))" },
         { name: "Time Builders", sql: "SELECT MAKETIME(9, 30, 0), CURTIME(), UTC_DATE" },
         { name: "Hyperbolic & Aliases", sql: "SELECT COSH(0), TANH(0), TRUNC(3.987, 2), RANDOM(), NVL(NULL, 'fallback')" },
-        { name: "Format Bytes", sql: "SELECT FORMAT_BYTES(1536), FORMAT_BYTES(1073741824)" }
+        { name: "Format Bytes", sql: "SELECT FORMAT_BYTES(1536), FORMAT_BYTES(1073741824)" },
+        { name: "Timediff", sql: "SELECT TIMEDIFF('2026-01-02 03:04:05', '2026-01-01 01:00:00') AS gap" },
+        { name: "Yearweek / Julian Day", sql: "SELECT YEARWEEK(NOW()) AS yw, JULIAN_DAY(NOW()) AS jd" },
+        { name: "Localtime", sql: "-- MySQL と同じく NOW() と同義\nSELECT LOCALTIME AS a, LOCALTIMESTAMP AS b" }
       ]},
       { cat: "JSON Functions", cmds: [
         { name: "Extract Path", sql: `SELECT JSON_EXTRACT('{"a": 1, "b": {"c": [10, 20]}}', '$.b.c[1]')` },
@@ -84,7 +90,9 @@
         { name: "Quote & Unquote", sql: `SELECT JSON_QUOTE('ab"c'), JSON_UNQUOTE('"hello"')` },
         { name: "Pretty & Depth", sql: `SELECT JSON_PRETTY('{"a": [1, 2]}'), JSON_DEPTH('{"a": [1, 2]}')` },
         { name: "Array Append", sql: `SELECT JSON_ARRAY_APPEND('{"tags": [1, 2]}', '$.tags', 3)` },
-        { name: "Merge Patch (RFC 7396)", sql: `SELECT JSON_MERGE_PATCH('{"a": 1, "b": 2}', '{"b": null, "c": 3}')` }
+        { name: "Merge Patch (RFC 7396)", sql: `SELECT JSON_MERGE_PATCH('{"a": 1, "b": 2}', '{"b": null, "c": 3}')` },
+        { name: "JSON Search", sql: `SELECT JSON_SEARCH('{"a": "x", "b": "xy"}', 'all', 'x%') AS paths` },
+        { name: "JSON Merge Preserve", sql: `-- 同キーは配列へまとめる（MERGE_PATCH は上書き）\nSELECT JSON_MERGE_PRESERVE('{"a": 1}', '{"a": 2, "b": 3}')` }
       ]},
       { cat: "Advanced DQL", cmds: [
         { name: "Aggregates", sql: "SELECT COUNT(*), SUM(age), AVG(age), MAX(age), MIN(age) FROM {table}" },
@@ -92,6 +100,7 @@
         { name: "Stats Aggregates", sql: "SELECT STDDEV(age), VARIANCE(age), MEDIAN(age) FROM {table}" },
         { name: "Sample Stats", sql: "SELECT STDDEV_SAMP(age), VAR_SAMP(age), STDDEV_POP(age), VAR_POP(age) FROM {table}" },
         { name: "Bit Aggregates", sql: "SELECT BIT_AND(id), BIT_OR(id), BIT_XOR(id), ANY_VALUE(name) FROM {table}" },
+        { name: "Every / Product / Approx Count", sql: "SELECT EVERY(age > 18) AS all_adult, PRODUCT(id) AS prod, APPROX_COUNT_DISTINCT(name) AS names FROM {table}" },
         { name: "Group By Having", sql: "SELECT age, COUNT(*) as c FROM {table} GROUP BY age HAVING c > 0" },
         { name: "Having Aggregate", sql: "SELECT age FROM {table} GROUP BY age HAVING COUNT(*) >= 1 ORDER BY COUNT(*) DESC" },
         { name: "Joins", sql: "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id" },
@@ -219,7 +228,8 @@
         { name: "Drop Index If Exists", sql: "DROP INDEX IF EXISTS ON {table} (id)" },
         { name: "Add Column Positioned", sql: "ALTER TABLE {table} ADD COLUMN new_col INTEGER AFTER id" },
         { name: "Drop Multiple Tables", sql: "DROP TABLE IF EXISTS tmp_a, tmp_b, tmp_c" },
-        { name: "Truncate/Drop", sql: "TRUNCATE TABLE {table}" }
+        { name: "Truncate/Drop", sql: "TRUNCATE TABLE {table}" },
+        { name: "Database & Use", sql: "-- 単一スキーマなので名前を記録するだけ\nCREATE DATABASE shop; USE shop; USE main; DROP DATABASE shop" }
       ]},
       { cat: "Metadata / Introspection", cmds: [
         { name: "Show Tables", sql: "SHOW TABLES" },
@@ -230,18 +240,23 @@
         { name: "Show Create Table", sql: "SHOW CREATE TABLE {table}" },
         { name: "Show Create View", sql: "SHOW CREATE VIEW my_view" },
         { name: "Show Columns", sql: "SHOW COLUMNS FROM {table}" },
+        { name: "Show Columns Like", sql: "SHOW COLUMNS FROM {table} LIKE '%name%'" },
         { name: "Show Create Procedure", sql: "SHOW CREATE PROCEDURE my_proc" },
         { name: "Show Status", sql: "SHOW STATUS" },
         { name: "Show Checks", sql: "SHOW CHECKS FROM {table}" },
         { name: "Show Triggers / Variables", sql: "SHOW TRIGGERS" },
         { name: "Show Triggers From Table", sql: "SHOW TRIGGERS FROM {table}" },
         { name: "Show Functions", sql: "SHOW FUNCTIONS LIKE 'JSON%'" },
+        { name: "Show Engines", sql: "SHOW ENGINES" },
         { name: "Check Table (Integrity)", sql: "CHECK TABLE {table}" },
         { name: "Analyze Table (Statistics)", sql: "ANALYZE TABLE {table}" },
-        { name: "Describe Table", sql: "DESCRIBE {table}" }
+        { name: "Checksum / Repair Table", sql: "CHECKSUM TABLE {table}" },
+        { name: "Describe Table", sql: "DESCRIBE {table}" },
+        { name: "Describe one column", sql: "DESCRIBE {table} name" }
       ]},
       { cat: "Tools & Transactions", cmds: [
         { name: "Explain Query", sql: "EXPLAIN SELECT * FROM {table} WHERE id = 1" },
+        { name: "Do (evaluate & discard)", sql: "DO 1 + 1" },
         { name: "Create Procedure", sql: "CREATE PROCEDURE my_proc AS BEGIN SELECT * FROM {table} LIMIT 3 END" },
         { name: "Replace Procedure", sql: "CREATE OR REPLACE PROCEDURE my_proc AS SELECT COUNT(*) FROM {table}" },
         { name: "Vacuum / Optimize", sql: "VACUUM" },
@@ -296,7 +311,8 @@
         { name: "Derived Table Columns", sql: "SELECT a, b FROM (SELECT id, name FROM {table}) AS d(a, b)" },
         { name: "FROM (VALUES ...)", sql: "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, label)" },
         { name: "STRING_SPLIT (table fn)", sql: "SELECT value FROM STRING_SPLIT('a,b,c', ',')" },
-        { name: "UNNEST (table fn)", sql: "SELECT n FROM UNNEST(10, 20, 30) AS u(n)" }
+        { name: "UNNEST (table fn)", sql: "SELECT n FROM UNNEST(10, 20, 30) AS u(n)" },
+        { name: "Order By Using", sql: "-- USING > は DESC、USING < は ASC\nSELECT id, age FROM {table} ORDER BY age USING >, id" }
       ]},
       { cat: "Multi-table DML", cmds: [
         { name: "UPDATE ... FROM (PostgreSQL)", sql: "UPDATE orders SET amount = amount + 1 FROM users WHERE orders.user_id = users.id AND users.age > 30" },
@@ -318,6 +334,8 @@
       { cat: "Browser DB Operations", cmds: [
         { name: "Statement Timeout", sql: "SET statement_timeout = 500" },
         { name: "Read-only Mode", sql: "SET read_only = ON" },
+        { name: "Reset session vars", sql: "SET statement_timeout = 500; RESET statement_timeout; RESET ALL" },
+        { name: "Set @@var", sql: "SET @@session.sql_mode = 'strict'" },
         { name: "Deterministic RAND", sql: "SET seed = 0.42; SELECT ROUND(RAND() * 100) AS r" },
         { name: "Create Snapshot", sql: "CREATE SNAPSHOT before_import" },
         { name: "Restore Snapshot", sql: "RESTORE SNAPSHOT before_import" },
@@ -360,11 +378,13 @@
         { name: "PRAGMA table_info", sql: "PRAGMA table_info({table})" },
         { name: "PRAGMA table_list", sql: "PRAGMA table_list" },
         { name: "PRAGMA foreign_key_list", sql: "PRAGMA foreign_key_list({table})" },
+        { name: "PRAGMA foreign_keys", sql: "PRAGMA foreign_keys" },
         { name: "PRAGMA user_version", sql: "PRAGMA user_version" },
         { name: "sqlite_master", sql: "SELECT type, name, sql FROM sqlite_master ORDER BY type, name" },
         { name: "ON UPDATE CURRENT_TIMESTAMP", sql: "CREATE TABLE audit_demo (id INTEGER PRIMARY KEY, v INTEGER, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)" },
         { name: "DECLARE @var (T-SQL)", sql: "DECLARE @min INT = 25; SELECT * FROM {table} WHERE age > @min" },
         { name: "EXPLAIN (FORMAT JSON)", sql: "EXPLAIN (FORMAT JSON) SELECT * FROM {table}" },
+        { name: "EXPLAIN VERBOSE", sql: "EXPLAIN VERBOSE SELECT * FROM {table}" },
         { name: "DROP TABLE ... CASCADE", sql: "DROP TABLE IF EXISTS parent_demo CASCADE" }
       ]},
       { cat: "Browser DB Essentials", cmds: [
@@ -416,7 +436,8 @@
         { name: "Rank by SIMILARITY", sql: "SELECT name, SIMILARITY(name, 'Alise') AS score FROM {table} ORDER BY score DESC LIMIT 5" },
         { name: "Sounds-like (DIFFERENCE)", sql: "SELECT DIFFERENCE('Robert', 'Rupert') AS closeness" },
         { name: "REGEXP_MATCHES / SPLIT", sql: "SELECT ARRAY_TO_STRING(REGEXP_MATCHES('a1b2', '[0-9]', 'g'), ',') AS digits" },
-        { name: "DIV / SAFE_DIVIDE", sql: "SELECT DIV(7, 2) AS whole, SAFE_DIVIDE(1, 0) AS no_error" }
+        { name: "DIV / SAFE_DIVIDE", sql: "SELECT DIV(7, 2) AS whole, SAFE_DIVIDE(1, 0) AS no_error" },
+        { name: "Array Distinct / Cat / Reverse", sql: "SELECT ARRAY_DISTINCT(ARRAY[1, 2, 2]) AS d, ARRAY_CAT(ARRAY[1], ARRAY[2]) AS c, ARRAY_REVERSE(ARRAY[1, 2, 3]) AS r" }
       ]},
       { cat: "Statistics & Time Series", cmds: [
         { name: "Linear regression", sql: "SELECT REGR_SLOPE(price, stock) AS slope, REGR_INTERCEPT(price, stock) AS intercept, REGR_R2(price, stock) AS r2 FROM products" },
@@ -456,8 +477,8 @@
         { name: "Check updatability", sql: "SELECT table_name, is_updatable, check_option FROM information_schema.views" }
       ]},
       { cat: "Constraints & Keys", cmds: [
-        { name: "Column-level REFERENCES", sql: "CREATE TABLE v18_child (id INTEGER, pid INTEGER REFERENCES {table}(id) ON DELETE CASCADE)" },
-        { name: "REFERENCES without a column (uses PK)", sql: "CREATE TABLE v18_child2 (id INTEGER, pid INTEGER REFERENCES {table})" },
+        { name: "Column-level REFERENCES", sql: "CREATE TABLE fk_child (id INTEGER, pid INTEGER REFERENCES {table}(id) ON DELETE CASCADE)" },
+        { name: "REFERENCES without a column (uses PK)", sql: "CREATE TABLE fk_child2 (id INTEGER, pid INTEGER REFERENCES {table})" },
         { name: "ADD CONSTRAINT name FOREIGN KEY", sql: "ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id)" },
         { name: "ADD CONSTRAINT name UNIQUE", sql: "ALTER TABLE {table} ADD CONSTRAINT uq_name UNIQUE (name)" },
         { name: "DROP CONSTRAINT by name", sql: "ALTER TABLE orders DROP CONSTRAINT fk_user" },
@@ -489,14 +510,14 @@
         { name: "UNNEST WITH ORDINALITY", sql: "SELECT v, n FROM UNNEST(ARRAY['a','b']) WITH ORDINALITY AS t(v, n)" }
       ]},
       { cat: "Composite Keys & Sequences", cmds: [
-        { name: "Composite FOREIGN KEY", sql: "CREATE TABLE v19_p (a INTEGER, b INTEGER, PRIMARY KEY (a, b));\nCREATE TABLE v19_c (id INTEGER, pa INTEGER, pb INTEGER, FOREIGN KEY (pa, pb) REFERENCES v19_p(a, b) ON DELETE CASCADE)" },
-        { name: "ALTER ADD composite FOREIGN KEY", sql: "ALTER TABLE v19_c ADD CONSTRAINT fk_pair FOREIGN KEY (pa, pb) REFERENCES v19_p(a, b)" },
-        { name: "DROP composite FOREIGN KEY", sql: "ALTER TABLE v19_c DROP FOREIGN KEY (pa, pb)" },
-        { name: "CREATE SEQUENCE with range", sql: "CREATE SEQUENCE v19_seq START WITH 100 INCREMENT BY 10 MINVALUE 1 MAXVALUE 999 CYCLE" },
-        { name: "ALTER SEQUENCE RESTART", sql: "ALTER SEQUENCE v19_seq RESTART WITH 500" },
+        { name: "Composite FOREIGN KEY", sql: "CREATE TABLE pair_parent (a INTEGER, b INTEGER, PRIMARY KEY (a, b));\nCREATE TABLE pair_child (id INTEGER, pa INTEGER, pb INTEGER, FOREIGN KEY (pa, pb) REFERENCES pair_parent(a, b) ON DELETE CASCADE)" },
+        { name: "ALTER ADD composite FOREIGN KEY", sql: "ALTER TABLE pair_child ADD CONSTRAINT fk_pair FOREIGN KEY (pa, pb) REFERENCES pair_parent(a, b)" },
+        { name: "DROP composite FOREIGN KEY", sql: "ALTER TABLE pair_child DROP FOREIGN KEY (pa, pb)" },
+        { name: "CREATE SEQUENCE with range", sql: "CREATE SEQUENCE ticket_seq START WITH 100 INCREMENT BY 10 MINVALUE 1 MAXVALUE 999 CYCLE" },
+        { name: "ALTER SEQUENCE RESTART", sql: "ALTER SEQUENCE ticket_seq RESTART WITH 500" },
         { name: "Sequence metadata", sql: "SELECT sequence_name, minimum_value, maximum_value, cycle_option FROM information_schema.sequences" },
-        { name: "DEFAULT NEXTVAL", sql: "CREATE TABLE v19_t (id INTEGER DEFAULT NEXTVAL('v19_seq'), v TEXT)" },
-        { name: "DEFAULT with an expression", sql: "CREATE TABLE v19_e (a INTEGER, u TEXT DEFAULT UUID(), n INTEGER DEFAULT (1 + 2))" }
+        { name: "DEFAULT NEXTVAL", sql: "CREATE TABLE ticket_tbl (id INTEGER DEFAULT NEXTVAL('ticket_seq'), v TEXT)" },
+        { name: "DEFAULT with an expression", sql: "CREATE TABLE default_demo (a INTEGER, u TEXT DEFAULT UUID(), n INTEGER DEFAULT (1 + 2))" }
       ]},
       { cat: "MERGE & Upsert", cmds: [
         { name: "MERGE with a condition", sql: "MERGE INTO {table} t USING (SELECT 1 AS id, 'x' AS nm) s ON t.id = s.id\n  WHEN MATCHED AND t.name <> s.nm THEN UPDATE SET name = s.nm\n  WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.nm)" },
@@ -505,19 +526,23 @@
         { name: "ON CONFLICT ... DO UPDATE ... WHERE", sql: "INSERT INTO {table} (id, age) VALUES (1, 40) ON CONFLICT (id) DO UPDATE SET age = EXCLUDED.age WHERE {table}.age < EXCLUDED.age" }
       ]},
       { cat: "Views, Indexes & Catalog", cmds: [
-        { name: "CREATE VIEW with a column list", sql: "CREATE VIEW v19_v (uid, uname) AS SELECT id, name FROM {table}" },
+        { name: "CREATE VIEW with a column list", sql: "CREATE VIEW user_view (uid, uname) AS SELECT id, name FROM {table}" },
         { name: "ALTER INDEX RENAME", sql: "ALTER INDEX ix_old RENAME TO ix_new" },
         { name: "SHOW TABLE STATUS", sql: "SHOW TABLE STATUS" },
         { name: "SHOW TABLE STATUS LIKE", sql: "SHOW TABLE STATUS LIKE 'user%'" },
-        { name: "CREATE TABLE AS ... WITH NO DATA", sql: "CREATE TABLE v19_shape AS SELECT * FROM {table} WITH NO DATA" },
-        { name: "CREATE GLOBAL TEMPORARY TABLE", sql: "CREATE GLOBAL TEMPORARY TABLE v19_scratch (a INTEGER)" }
+        { name: "CREATE TABLE AS ... WITH NO DATA", sql: "CREATE TABLE shape_only AS SELECT * FROM {table} WITH NO DATA" },
+        { name: "CREATE GLOBAL TEMPORARY TABLE", sql: "CREATE GLOBAL TEMPORARY TABLE scratch_tbl (a INTEGER)" },
+        { name: "Alter View", sql: "CREATE VIEW v_tmp AS SELECT id FROM {table}; ALTER VIEW v_tmp AS SELECT id, name FROM {table}" },
+        { name: "Temporary View", sql: "-- 保存・書き出しの対象外（セッション限り）\nCREATE TEMPORARY VIEW v_session AS SELECT id FROM {table}" }
       ]},
       { cat: "Date Arithmetic", cmds: [
         { name: "日付 + 日数", sql: "SELECT DATE '2026-01-01' + 30 AS due" },
         { name: "日付 - 日数", sql: "SELECT CURRENT_DATE - 7 AS week_ago" },
         { name: "日付 - 日付（日数差）", sql: "SELECT DATE '2026-03-01' - DATE '2026-01-01' AS days" },
         { name: "日付列の演算", sql: "-- 日付型の列にもそのまま効く\n-- SELECT nm, hire + 90 AS probation_end FROM emp" },
-        { name: "INTERVAL 版（従来どおり）", sql: "SELECT DATE '2026-01-31' + INTERVAL 1 MONTH AS d" }
+        { name: "INTERVAL 版（従来どおり）", sql: "SELECT DATE '2026-01-31' + INTERVAL 1 MONTH AS d" },
+        { name: "Period Add / Diff", sql: "-- 期間は YYYYMM（または YYMM）\nSELECT PERIOD_ADD(202401, 3) AS moved, PERIOD_DIFF(202406, 202401) AS months" },
+        { name: "Convert Timezone", sql: "-- 'UTC' / 'JST' / '+09:00' 形式（IANA 名は非対応）\nSELECT CONVERT_TZ('2026-01-01 12:00:00', 'UTC', '+09:00') AS jst" }
       ]},
       { cat: "Hierarchical Queries (Oracle)", cmds: [
         { name: "START WITH ... CONNECT BY", sql: "-- 組織図をたどる\n-- SELECT nm, LEVEL FROM emp START WITH mgr IS NULL CONNECT BY PRIOR id = mgr" },
@@ -558,9 +583,9 @@
         { name: "Partitioned rank over groups", sql: "SELECT age, COUNT(*) AS n, ROW_NUMBER() OVER (PARTITION BY age % 2 ORDER BY age) AS rn FROM {table} GROUP BY age" }
       ]},
       { cat: "Collation, ORDER BY ALL & GROUPING_ID", cmds: [
-        { name: "Column-level COLLATE NOCASE", sql: "CREATE TABLE v21_ci (id INTEGER PRIMARY KEY, nm TEXT COLLATE NOCASE UNIQUE)" },
-        { name: "Case-insensitive lookup", sql: "-- 'Apple' も 'APPLE' も一致する\n-- SELECT * FROM v21_ci WHERE nm = 'APPLE'" },
-        { name: "COLLATE NUMERIC (自然順)", sql: "CREATE TABLE v21_nat (v TEXT COLLATE NUMERIC)" },
+        { name: "Column-level COLLATE NOCASE", sql: "CREATE TABLE ci_names (id INTEGER PRIMARY KEY, nm TEXT COLLATE NOCASE UNIQUE)" },
+        { name: "Case-insensitive lookup", sql: "-- 'Apple' も 'APPLE' も一致する\n-- SELECT * FROM ci_names WHERE nm = 'APPLE'" },
+        { name: "COLLATE NUMERIC (自然順)", sql: "CREATE TABLE natural_order (v TEXT COLLATE NUMERIC)" },
         { name: "ORDER BY ALL", sql: "SELECT name, age FROM {table} ORDER BY ALL" },
         { name: "ORDER BY ALL DESC", sql: "SELECT name, age FROM {table} ORDER BY ALL DESC" },
         { name: "GROUPING_ID over CUBE", sql: "SELECT age, id, COUNT(*) AS n, GROUPING_ID(age, id) AS gid FROM {table} GROUP BY CUBE(age, id)" }
@@ -597,13 +622,13 @@
         { name: "STRING_SPLIT in the SELECT list", sql: "SELECT STRING_SPLIT('a,b,c', ',') AS part" }
       ]},
       { cat: "Domains, Types & Roles", cmds: [
-        { name: "CREATE DOMAIN with a CHECK", sql: "CREATE DOMAIN v20_pos AS INTEGER CHECK (VALUE > 0)" },
-        { name: "CREATE TYPE ... AS ENUM", sql: "CREATE TYPE v20_mood AS ENUM ('sad', 'ok', 'happy')" },
-        { name: "Use a domain as a column type", sql: "CREATE TABLE v20_survey (id INTEGER, score v20_pos, m v20_mood)" },
+        { name: "CREATE DOMAIN with a CHECK", sql: "CREATE DOMAIN positive_int AS INTEGER CHECK (VALUE > 0)" },
+        { name: "CREATE TYPE ... AS ENUM", sql: "CREATE TYPE mood_enum AS ENUM ('sad', 'ok', 'happy')" },
+        { name: "Use a domain as a column type", sql: "CREATE TABLE survey_tbl (id INTEGER, score positive_int, m mood_enum)" },
         { name: "SHOW DOMAINS", sql: "SHOW DOMAINS" },
-        { name: "CREATE ROLE / USER", sql: "CREATE ROLE v20_reporting" },
+        { name: "CREATE ROLE / USER", sql: "CREATE ROLE reporting_role" },
         { name: "SHOW GRANTS", sql: "SHOW GRANTS" },
-        { name: "TRUNCATE ... CONTINUE IDENTITY", sql: "TRUNCATE TABLE v20_survey CONTINUE IDENTITY" }
+        { name: "TRUNCATE ... CONTINUE IDENTITY", sql: "TRUNCATE TABLE survey_tbl CONTINUE IDENTITY" }
       ]},
       { cat: "Recursive SEARCH & CYCLE", cmds: [
         { name: "SEARCH DEPTH FIRST", sql: "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 5)\n  SEARCH DEPTH FIRST BY n SET ord\nSELECT n, ord FROM t ORDER BY ord" },
@@ -667,35 +692,6 @@
         { name: "Composite UNIQUE index", sql: "-- 「組が一意」であって「各列が一意」ではない\nCREATE UNIQUE INDEX ux_pair ON {table} (id, name)" },
         { name: "INSERT OR <action>", sql: "-- REPLACE / IGNORE / ABORT / FAIL / ROLLBACK\nINSERT OR REPLACE INTO {table} (id, name) VALUES (1, 'X')" },
         { name: "Rename keeps constraints", sql: "-- 生成列・CHECK・索引名・列順すべて追随する\nALTER TABLE {table} RENAME COLUMN name TO nm" }
-      ]},
-      { cat: "v1.33 Functions", cmds: [
-        { name: "Btrim / Encode", sql: "SELECT BTRIM('xxhixx', 'x') AS trimmed, ENCODE('abc', 'base64') AS b64, ENCODE('abc', 'hex') AS hx" },
-        { name: "Ord / Unistr / Contains", sql: "SELECT ORD('あ') AS code, UNISTR(CONCAT(CHAR(92), '0041')) AS ch, CONTAINS(name, 'a') AS has_a FROM {table}" },
-        { name: "Timediff", sql: "SELECT TIMEDIFF('2026-01-02 03:04:05', '2026-01-01 01:00:00') AS gap" },
-        { name: "Yearweek / Julian Day", sql: "SELECT YEARWEEK(NOW()) AS yw, JULIAN_DAY(NOW()) AS jd" },
-        { name: "Period Add / Diff", sql: "-- 期間は YYYYMM（または YYMM）\nSELECT PERIOD_ADD(202401, 3) AS moved, PERIOD_DIFF(202406, 202401) AS months" },
-        { name: "Convert Timezone", sql: "-- 'UTC' / 'JST' / '+09:00' 形式（IANA 名は非対応）\nSELECT CONVERT_TZ('2026-01-01 12:00:00', 'UTC', '+09:00') AS jst" },
-        { name: "Localtime", sql: "-- MySQL と同じく NOW() と同義\nSELECT LOCALTIME AS a, LOCALTIMESTAMP AS b" },
-        { name: "JSON Search", sql: `SELECT JSON_SEARCH('{"a": "x", "b": "xy"}', 'all', 'x%') AS paths` },
-        { name: "JSON Merge Preserve", sql: `-- 同キーは配列へまとめる（MERGE_PATCH は上書き）\nSELECT JSON_MERGE_PRESERVE('{"a": 1}', '{"a": 2, "b": 3}')` },
-        { name: "Array Distinct / Cat / Reverse", sql: "SELECT ARRAY_DISTINCT(ARRAY[1, 2, 2]) AS d, ARRAY_CAT(ARRAY[1], ARRAY[2]) AS c, ARRAY_REVERSE(ARRAY[1, 2, 3]) AS r" },
-        { name: "Every / Product / Approx Count", sql: "SELECT EVERY(age > 18) AS all_adult, PRODUCT(id) AS prod, APPROX_COUNT_DISTINCT(name) AS names FROM {table}" }
-      ]},
-      { cat: "v1.33 Commands", cmds: [
-        { name: "Database & Use", sql: "-- 単一スキーマなので名前を記録するだけ\nCREATE DATABASE shop; USE shop; USE main; DROP DATABASE shop" },
-        { name: "Alter View", sql: "CREATE VIEW v_tmp AS SELECT id FROM {table}; ALTER VIEW v_tmp AS SELECT id, name FROM {table}" },
-        { name: "Temporary View", sql: "-- 保存・書き出しの対象外（セッション限り）\nCREATE TEMPORARY VIEW v_session AS SELECT id FROM {table}" },
-        { name: "Order By Using", sql: "-- USING > は DESC、USING < は ASC\nSELECT id, age FROM {table} ORDER BY age USING >, id" },
-        { name: "Do (evaluate & discard)", sql: "DO 1 + 1" },
-        { name: "Execute Immediate", sql: "EXECUTE IMMEDIATE 'SELECT ? AS answer' USING 42" },
-        { name: "Reset session vars", sql: "SET statement_timeout = 500; RESET statement_timeout; RESET ALL" },
-        { name: "Set @@var", sql: "SET @@session.sql_mode = 'strict'" },
-        { name: "Pragma foreign_keys", sql: "PRAGMA foreign_keys" },
-        { name: "Checksum / Repair Table", sql: "CHECKSUM TABLE {table}" },
-        { name: "Show Columns Like", sql: "SHOW COLUMNS FROM {table} LIKE '%name%'" },
-        { name: "Describe one column", sql: "DESCRIBE {table} name" },
-        { name: "Show Engines / Create Index", sql: "SHOW ENGINES" },
-        { name: "Explain Verbose", sql: "EXPLAIN VERBOSE SELECT * FROM {table}" }
       ]},
       { cat: "External API", cmds: [
         { name: "JS API", sql: "// JSコンソールから: LuminaDB.query('SELECT * FROM users WHERE id = ?', [1])" },
@@ -802,8 +798,6 @@
         "Aliases, Stars & Set Operations": "別名・アスタリスク・集合演算",
         "SHA-2 & Regexp Options": "SHA-2・正規表現オプション",
         "Schema Changes": "スキーマの変更",
-        "v1.33 Functions": "v1.33 で足した関数",
-        "v1.33 Commands": "v1.33 で足した命令",
         "External API": "外部 API（JS から使う）",
     };
     const HELP_SYNONYMS = {

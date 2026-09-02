@@ -608,8 +608,8 @@
             '-- empty every listed table\n-- TRUNCATE TABLE t1, t2',
         '-- 実際に書き込んだ行だけが返る\n-- INSERT INTO t (id, nm) VALUES (1, \'a\') ON CONFLICT (id) DO NOTHING RETURNING id':
             '-- only the rows actually written come back\n-- INSERT INTO t (id, nm) VALUES (1, \'a\') ON CONFLICT (id) DO NOTHING RETURNING id',
-        '-- \'Apple\' も \'APPLE\' も一致する\n-- SELECT * FROM v21_ci WHERE nm = \'APPLE\'':
-            '-- matches both \'Apple\' and \'APPLE\'\n-- SELECT * FROM v21_ci WHERE nm = \'APPLE\'',
+        '-- \'Apple\' も \'APPLE\' も一致する\n-- SELECT * FROM ci_names WHERE nm = \'APPLE\'':
+            '-- matches both \'Apple\' and \'APPLE\'\n-- SELECT * FROM ci_names WHERE nm = \'APPLE\'',
         '-- 識別列に与えた値をそのまま使う\n-- INSERT INTO t (id, nm) OVERRIDING SYSTEM VALUE VALUES (99, \'a\')':
             '-- use the value given for the identity column as-is\n-- INSERT INTO t (id, nm) OVERRIDING SYSTEM VALUE VALUES (99, \'a\')',
         '-- 与えた値を捨てて自動採番させる\n-- INSERT INTO t (id, nm) OVERRIDING USER VALUE VALUES (99, \'b\')':
